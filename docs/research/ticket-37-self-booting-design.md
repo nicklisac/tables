@@ -41,9 +41,13 @@ in the standalone host (T36 non-goals unchanged).
    (`tests/specs/t33b-staged-import.spec.mjs:129`) — adding a new manifest key is safe for
    T36 (it reads named keys) and does not break the freeze. The freeze meant "T36 consumes
    it unchanged," not "no future ticket may add a key."
-4. **`system_files` is already protected by T21's boundary**: `isProtectedTable` refuses any
-   name starting with `_` (`src/schema.js:1238`) — same convention that already protects
-   `_manifest`. No capture triggers, DDL refused, excluded from user-data reporting.
+4. **AGY finding F-01 (verified): `system_files` was NOT protected by T21's boundary** —
+   the underscore rule (`isProtectedTable`, `src/schema.js`) covers `_manifest` but not
+   `system_files` (starts with 's'). Left unfixed it would have counted as a user data
+   table in import reports, grown capture triggers at boot, and accepted scratchpad DDL.
+   **Fixed:** added to `INTERNAL_TABLES` — same treatment as `dashboard_cards`/`documents`
+   (no capture triggers, DDL refused, invisible to user-data counts). Lesson: verify
+   boundary claims against the actual classifier, not the naming convention.
 5. **Researcher findings on trust patterns** (subagent report 2026-08-24): SHA-256 pinning
    is cheap and detects corruption/drift but an attacker with write access updates both hash
    and code (it is *integrity*, not *authenticity*); keyed Ed25519 is the practical crypto
@@ -71,8 +75,8 @@ CREATE TABLE IF NOT EXISTS system_files (
   into the live DB (it's just data there — inert in the web tier). The next export
   **upserts** it with the current build's host, so the embedded host always converges to the
   newest engine that exported the file.
-- Protected by T21 for free (underscore prefix) — scratchpad `!!DROP TABLE system_files`
-  is refused; no capture triggers; invisible to user-data counts.
+- Protected via `INTERNAL_TABLES` membership (schema.js) — scratchpad
+  `!!DROP TABLE system_files` is refused; no capture triggers; invisible to user-data counts.
 
 ### 3.2 Export-time stamping (`src/cartridge.js`)
 
@@ -174,8 +178,9 @@ already signing-ready: a v2 signature would be a new manifest key over exactly t
 
 - **D1 Stamp at export only; single source of truth = `host/host.py` via Vite `?raw`.**
   Live web DB never carries the table until a stamped file is imported back. *(lean: yes)*
-- **D2 `system_files(name, mime, body, sha256)` shape; protected by T21's underscore rule for free.**
-  *(lean: yes)*
+- **D2 `system_files(name, mime, body, sha256)` shape; protected via `INTERNAL_TABLES`
+  membership** (AGY F-01 corrected the original "underscore rule" claim — that covers
+  `_manifest`, not `system_files`). *(lean: yes)*
 - **D3 Additive manifest key `host_sha256`** (freeze-safe per §2.3; T36 ignores unknown keys).
   *(lean: yes)*
 - **D4 Trust model v1 = L0+L1+L2+L3, no cryptographic signing in v1** — signing is fog/v2,
