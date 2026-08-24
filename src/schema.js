@@ -85,16 +85,51 @@ not gone. If it's missing something you need, query \`messages\`.
 If asked who you are, answer plainly: "I'm Tables. I live in the SQLite database in this browser tab."`;
 
 /**
- * Install the current SYSTEM_PROMPT into system_config and every session's
- * system message row, version-gated by `prompt_version`.
+ * Install/refresh the engine prompt bundle, version-gated by `prompt_version`
+ * — with the T33b (D1) ownership rule: a CUSTOMIZED identity is never
+ * clobbered.
  *
- * Must run AFTER SCHEMA_SQL (system_config must exist). No-op when the
- * stored version already matches — so the prompt text stays byte-stable
- * across boots (it is the KV-cache prefix; T2).
+ * Must run AFTER SCHEMA_SQL (system_config must exist). No-op when the stored
+ * version already matches — so the prompt text stays byte-stable across boots
+ * (it is the KV-cache prefix; T2).
+ *
+ * D1 states:
+ *  - fresh DB (seed placeholder, no version key) → install the engine bundle;
+ *  - unmodified stock at an old/missing version → refresh to the current
+ *    bundle (byte-identical for databases that never touched it);
+ *  - a real prompt text at a foreign version → we cannot tell "user edited"
+ *    from "older build's stock" (the ambiguity D1 locks), so resolve toward
+ *    the cartridge: KEEP it, flag `prompt_customized = 1`, and let the
+ *    post-import report surface the mismatch. Never clobber silently.
+ *  - `prompt_customized = 1` → always a no-op here; the cartridge wins.
+ *
+ * Storage invariant (AGY review): whatever the split evolves into, boot keeps
+ * the ASSEMBLED prompt in `messages WHERE role='system'` (id=0) — that row is
+ * what v_active_context feeds the LLM. An imported DB's system rows already
+ * agree with its own system_config (the exporting build kept them in sync),
+ * so the keep-paths need no rewrite.
  */
 export async function migrateSystemPrompt(sqlite3, db) {
   const stored = await queryValue(sqlite3, db, `SELECT value FROM system_config WHERE key = 'prompt_version'`);
+  const customized = (await queryValue(sqlite3, db, `SELECT value FROM system_config WHERE key = 'prompt_customized'`)) === '1';
+
+  if (customized) return; // D1: customized identity — the cartridge always wins.
   if (stored === String(SYSTEM_PROMPT_VERSION)) return;
+
+  const storedPrompt = await queryValue(sqlite3, db, `SELECT value FROM system_config WHERE key = 'system_prompt'`);
+  const looksStock = !storedPrompt
+    || storedPrompt.includes('Prompt placeholder')
+    || storedPrompt === SYSTEM_PROMPT;
+  if (!looksStock) {
+    // Foreign-version prompt that is not provably stock — flag it customized
+    // and keep it (never clobber identity we can't prove is the engine's).
+    await execParams(sqlite3, db,
+      `INSERT INTO system_config (key, value) VALUES ('prompt_customized', '1')
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+    console.warn(`[schema] System prompt at version ${stored ?? '(none)'} is not the engine v${SYSTEM_PROMPT_VERSION} bundle — keeping it and flagging prompt_customized (D1)`);
+    return;
+  }
+
   await execParams(sqlite3, db,
     `UPDATE system_config SET value = ? WHERE key = 'system_prompt'`,
     [SYSTEM_PROMPT]);
@@ -111,11 +146,41 @@ export async function migrateSystemPrompt(sqlite3, db) {
     [SYSTEM_PROMPT]);
 }
 
+/**
+ * T33b: stable per-Tables-database identity for the _manifest (cartridge_id).
+ * Seeded once at boot; travels in every export. INSERT OR IGNORE — an imported
+ * database keeps its own id (the id IS that database's identity).
+ */
+export async function seedCartridgeId(sqlite3, db) {
+  await execParams(sqlite3, db,
+    `INSERT OR IGNORE INTO system_config (key, value) VALUES ('cartridge_id', ?)`,
+    [crypto.randomUUID()]);
+}
+
 // T35c: single source of truth for the fetch_url tool schema. Used both by the
 // fresh-DB seed (below) and migrateToolsTable (existing-DB upsert), so the two
 // never drift. Must contain NO single quotes — it is inlined into a
 // single-quoted SQL string in the seed (SQLite escapes quotes with '', not \').
 const FETCH_URL_TOOL_SCHEMA = '{"type":"function","function":{"name":"fetch_url","description":"Fetch a web URL and return a text preview of the page (the first 8000 characters). The ENTIRE page is also stored in the document corpus; when truncated is true the result includes doc_id and a full_doc_hint explaining how to read the rest WITHOUT re-fetching: run SELECT SUBSTR(content, <offset>, <len>) FROM documents WHERE id = <doc_id>; (offset is 1-based) or use the search_documents tool with your search terms. Prefer pulling from the stored document over re-calling fetch_url.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"The absolute HTTP/HTTPS URL to fetch"}},"required":["url"]}}}';
+
+// T33b: engine format epoch — written to _manifest.engine_min_version at export.
+// Bump when a change lands that older engines cannot boot (new required UDF,
+// trigger-contract change). Import refuses cartridges above the current epoch
+// (DCSS major-tag semantics: refuse loudly, never silently corrupt).
+export const ENGINE_MIN_VERSION = 1;
+
+// T33b (D4): single source of truth for the engine built-in tool schemas —
+// used by BOTH the fresh-DB seed (SCHEMA_SQL) and migrateToolsTable's
+// "refresh built-ins" upsert, so the two never drift. Must contain NO
+// single quotes: each schema is inlined into a single-quoted SQL string.
+export const BUILTIN_TOOLS = [
+  { name: 'execute_sql', schema: '{"type":"function","function":{"name":"execute_sql","description":"Execute a read-only SQL query against the SQLite database. Returns JSON-formatted rows.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"The SQL SELECT query to execute"}},"required":["query"]}}}' },
+  { name: 'search_web', schema: '{"type":"function","function":{"name":"search_web","description":"Search the web for relevant information. Returns titles, URLs, and snippets.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"The search query string"}},"required":["query"]}}}' },
+  { name: 'fetch_url', schema: `${FETCH_URL_TOOL_SCHEMA}` },
+  { name: 'materialize', schema: '{"type":"function","function":{"name":"materialize","description":"Materialize raw JSON output from a prior tool call into a permanent, queryable SQLite table. Useful for storing web search results, fetched web page data, or external API responses so they can be queried with SQL.","parameters":{"type":"object","properties":{"table_name":{"type":"string","description":"The name for the new SQLite table to create (must be a valid identifier that does not already exist)"},"tool_call_id":{"type":"string","description":"Optional: the specific tool_call_id whose result should be materialized. If omitted, uses the most recent tool output in the session."}},"required":["table_name"]}}}' },
+  { name: 'search_documents', schema: '{"type":"function","function":{"name":"search_documents","description":"Full-text keyword search (BM25 ranking) over the document corpus: fetched web pages, web search results, and any text stored via ingest_document. Returns ranked matches with highlighted snippets. Use this to recall previously fetched or stored content.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"FTS5 query: plain words (implicit AND), phrases in double quotes, AND/OR/NOT operators, and prefix* terms"},"limit":{"type":"integer","description":"Maximum number of results (default 10, max 50)"}},"required":["query"]}}}' },
+  { name: 'ingest_document', schema: '{"type":"function","function":{"name":"ingest_document","description":"Store a text document in the searchable corpus (indexed with FTS5 full-text search). Re-ingesting the same source_ref updates the existing document instead of duplicating it.","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Short title for the document"},"content":{"type":"string","description":"The full text content to index"},"source":{"type":"string","description":"Optional origin label (defaults to user)"},"source_ref":{"type":"string","description":"Optional dedup key (e.g. a URL). Re-ingesting the same source+source_ref updates the document."}},"required":["title","content"]}}}' },
+];
 
 export const SCHEMA_SQL = `
 -- Enable foreign keys
@@ -143,35 +208,33 @@ INSERT OR IGNORE INTO system_config (key, value) VALUES
   -- The LIVE window resolves as: user override (settings field, written to this
   -- same key) -> cloud model-name lookup -> this fallback. The 85% compaction
   -- threshold and the tail formula are code constants (compaction.js), not stored.
-  ('effective_context_window', '128000');
+  ('effective_context_window', '128000'),
+  -- T33b (D1): the persona slot — endemic agent identity that travels in the
+  -- cartridge (empty until a persona editor ships; assembly = engine bundle +
+  -- persona overlay). prompt_customized is what lets boot tell "the user's
+  -- identity" from "engine bundle": a customized prompt is NEVER clobbered.
+  ('persona', ''),
+  ('prompt_customized', '0');
 
 -- =====================================================================
 -- 2. Tool Definitions
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS tools (
-    name   TEXT PRIMARY KEY,
-    schema TEXT NOT NULL
+    name       TEXT PRIMARY KEY,
+    schema     TEXT NOT NULL,
+    -- T33b (D4): provenance split. 1 = engine-managed built-in — refreshed to
+    -- the running build's schema at every boot; 0 = user/cartridge-defined
+    -- tool — travels untouched, never clobbered.
+    is_builtin INTEGER NOT NULL DEFAULT 0
 );
 
-INSERT OR IGNORE INTO tools (name, schema) VALUES
-  ('execute_sql',
-    '{"type":"function","function":{"name":"execute_sql","description":"Execute a read-only SQL query against the SQLite database. Returns JSON-formatted rows.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"The SQL SELECT query to execute"}},"required":["query"]}}}'
-  ),
-  ('search_web',
-    '{"type":"function","function":{"name":"search_web","description":"Search the web for relevant information. Returns titles, URLs, and snippets.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"The search query string"}},"required":["query"]}}}'
-  ),
-  ('fetch_url',
-    '${FETCH_URL_TOOL_SCHEMA}'
-  ),
-  ('materialize',
-    '{"type":"function","function":{"name":"materialize","description":"Materialize raw JSON output from a prior tool call into a permanent, queryable SQLite table. Useful for storing web search results, fetched web page data, or external API responses so they can be queried with SQL.","parameters":{"type":"object","properties":{"table_name":{"type":"string","description":"The name for the new SQLite table to create (must be a valid identifier that does not already exist)"},"tool_call_id":{"type":"string","description":"Optional: the specific tool_call_id whose result should be materialized. If omitted, uses the most recent tool output in the session."}},"required":["table_name"]}}}'
-  ),
-  ('search_documents',
-    '{"type":"function","function":{"name":"search_documents","description":"Full-text keyword search (BM25 ranking) over the document corpus: fetched web pages, web search results, and any text stored via ingest_document. Returns ranked matches with highlighted snippets. Use this to recall previously fetched or stored content.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"FTS5 query: plain words (implicit AND), phrases in double quotes, AND/OR/NOT operators, and prefix* terms"},"limit":{"type":"integer","description":"Maximum number of results (default 10, max 50)"}},"required":["query"]}}}'
-  ),
-  ('ingest_document',
-    '{"type":"function","function":{"name":"ingest_document","description":"Store a text document in the searchable corpus (indexed with FTS5 full-text search). Re-ingesting the same source_ref updates the existing document instead of duplicating it.","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Short title for the document"},"content":{"type":"string","description":"The full text content to index"},"source":{"type":"string","description":"Optional origin label (defaults to user)"},"source_ref":{"type":"string","description":"Optional dedup key (e.g. a URL). Re-ingesting the same source+source_ref updates the document."}},"required":["title","content"]}}}'
-  );
+INSERT OR IGNORE INTO tools (name, schema, is_builtin) VALUES
+  ('execute_sql', '{"type":"function","function":{"name":"execute_sql","description":"Execute a read-only SQL query against the SQLite database. Returns JSON-formatted rows.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"The SQL SELECT query to execute"}},"required":["query"]}}}', 1),
+  ('search_web', '{"type":"function","function":{"name":"search_web","description":"Search the web for relevant information. Returns titles, URLs, and snippets.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"The search query string"}},"required":["query"]}}}', 1),
+  ('fetch_url', '{"type":"function","function":{"name":"fetch_url","description":"Fetch a web URL and return a text preview of the page (the first 8000 characters). The ENTIRE page is also stored in the document corpus; when truncated is true the result includes doc_id and a full_doc_hint explaining how to read the rest WITHOUT re-fetching: run SELECT SUBSTR(content, <offset>, <len>) FROM documents WHERE id = <doc_id>; (offset is 1-based) or use the search_documents tool with your search terms. Prefer pulling from the stored document over re-calling fetch_url.","parameters":{"type":"object","properties":{"url":{"type":"string","description":"The absolute HTTP/HTTPS URL to fetch"}},"required":["url"]}}}', 1),
+  ('materialize', '{"type":"function","function":{"name":"materialize","description":"Materialize raw JSON output from a prior tool call into a permanent, queryable SQLite table. Useful for storing web search results, fetched web page data, or external API responses so they can be queried with SQL.","parameters":{"type":"object","properties":{"table_name":{"type":"string","description":"The name for the new SQLite table to create (must be a valid identifier that does not already exist)"},"tool_call_id":{"type":"string","description":"Optional: the specific tool_call_id whose result should be materialized. If omitted, uses the most recent tool output in the session."}},"required":["table_name"]}}}', 1),
+  ('search_documents', '{"type":"function","function":{"name":"search_documents","description":"Full-text keyword search (BM25 ranking) over the document corpus: fetched web pages, web search results, and any text stored via ingest_document. Returns ranked matches with highlighted snippets. Use this to recall previously fetched or stored content.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"FTS5 query: plain words (implicit AND), phrases in double quotes, AND/OR/NOT operators, and prefix* terms"},"limit":{"type":"integer","description":"Maximum number of results (default 10, max 50)"}},"required":["query"]}}}', 1),
+  ('ingest_document', '{"type":"function","function":{"name":"ingest_document","description":"Store a text document in the searchable corpus (indexed with FTS5 full-text search). Re-ingesting the same source_ref updates the existing document instead of duplicating it.","parameters":{"type":"object","properties":{"title":{"type":"string","description":"Short title for the document"},"content":{"type":"string","description":"The full text content to index"},"source":{"type":"string","description":"Optional origin label (defaults to user)"},"source_ref":{"type":"string","description":"Optional dedup key (e.g. a URL). Re-ingesting the same source+source_ref updates the document."}},"required":["title","content"]}}}', 1);
 
 -- =====================================================================
 -- 3. Session Management
@@ -1679,33 +1742,40 @@ export async function migrateDocumentsTable(sqlite3, db) {
 }
 
 /**
- * Migration (T16 repair): delete tools rows whose schema is not a valid JSON
- * object. The agent_think trigger runs json_group_array(json(schema)) FROM
- * tools on EVERY turn, so one corrupted row throws "malformed JSON" and
- * breaks every turn in every session, regardless of LLM provider. An old
- * boot can persist such a row (the T16 template-literal escaping hazard
- * wrote unescaped quotes into a description), and the seed is INSERT OR
- * IGNORE — it never repairs an existing row. Deleting the bad rows lets
- * SCHEMA_SQL re-seed the canonical schemas. MUST run before SCHEMA_SQL.
- * Rows with valid object JSON (including user-customized tools) are kept.
+ * Tools migration — T16 repair + T33b (D4) provenance split.
+ *
+ * MUST run before SCHEMA_SQL (it repairs rows the seed will re-create).
+ *  1. is_builtin column: added for pre-T33b databases (ALTER TABLE ADD
+ *     COLUMN); fresh databases get it from CREATE TABLE.
+ *  2. T16 repair (kept): a corrupted tools row (malformed schema JSON) breaks
+ *     EVERY turn — agent_think runs json(schema) on all rows — so delete the
+ *     bad rows and let SCHEMA_SQL re-seed the canonical schemas.
+ *  3. D4: refresh the ENGINE BUILT-INS to the running build's schemas
+ *     (generalizes T35c's ad-hoc fetch_url upsert into a principled rule).
+ *     User/cartridge-defined tools (is_builtin = 0) travel untouched and are
+ *     never clobbered.
  */
 export async function migrateToolsTable(sqlite3, db) {
   const rows = await queryAll(sqlite3, db, `PRAGMA table_info(tools)`);
   if (!rows.length) return; // fresh database — SCHEMA_SQL creates + seeds it
+  const cols = new Set(rows.map(([, name]) => name));
+  if (!cols.has('is_builtin')) {
+    await execParams(sqlite3, db, `ALTER TABLE tools ADD COLUMN is_builtin INTEGER NOT NULL DEFAULT 0`);
+  }
   const bad = await queryAll(sqlite3, db,
     `SELECT name FROM tools WHERE json_valid(schema) = 0 OR json_type(schema) != 'object'`);
   for (const [name] of bad) {
     console.warn(`[schema] Malformed tools row '${name}' — deleting so boot re-seeds it (T16 repair)`);
     await execParams(sqlite3, db, `DELETE FROM tools WHERE name = ?`, [name]);
   }
-  // T35c: the fetch_url tool now returns a fixed preview + a full-document
-  // pointer (pull-the-rest-from-the-corpus). Existing brains keep the old
-  // description because the seed is INSERT OR IGNORE — refresh it here so the
-  // agent in a returning visitor's brain learns the new pattern.
-  await execParams(sqlite3, db,
-    `INSERT INTO tools (name, schema) VALUES ('fetch_url', ?)
-     ON CONFLICT(name) DO UPDATE SET schema = excluded.schema`,
-    [FETCH_URL_TOOL_SCHEMA]);
+  // D4: engine-managed built-ins track the running build; everything else is
+  // cartridge data and stays as-is.
+  for (const t of BUILTIN_TOOLS) {
+    await execParams(sqlite3, db,
+      `INSERT INTO tools (name, schema, is_builtin) VALUES (?, ?, 1)
+       ON CONFLICT(name) DO UPDATE SET schema = excluded.schema, is_builtin = 1`,
+      [t.name, t.schema]);
+  }
 }
 
 export async function migrateDashboardCardsTable(sqlite3, db) {

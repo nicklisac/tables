@@ -34,11 +34,8 @@
  */
 
 // T26.3: shared result codes + query/ident helpers now live in src/utils.js.
-import { SQLITE_ROW, SQLITE_DONE, queryAll, quoteIdent } from './utils.js';
-import { setActiveSession, isProtectedTable, getVirtualTableParents } from './schema.js';
-import { populateSessionDropdown } from './sessions-ui.js';
-import { renderMessages } from './chat-render.js';
-import { rebuildGrid } from './grid-ui.js';
+import { SQLITE_ROW, SQLITE_DONE, queryAll, quoteIdent, execParams } from './utils.js';
+import { isProtectedTable, getVirtualTableParents, ENGINE_MIN_VERSION, SYSTEM_PROMPT_VERSION } from './schema.js';
 
 const SQLITE_OK = 0;
 const SQLITE_SERIALIZE_NORMAL = 0;
@@ -121,11 +118,18 @@ export async function exportCartridge(sqlite3, module, db, filename = 'tables-ca
   try {
     await backupFull(module, pMemDb, db);
 
+    // T33b (Phase 3): stamp _manifest v1 into the staging copy before serialize
+    // — the exported file is self-consistent by construction.
+    await writeManifest(sqlite3, pMemDb);
+
     // 2. Serialize the in-memory DB into a malloc'd buffer
-    const zSchema = toCString(module, 'main');
-    const pSize = module._malloc(8);
+    let zSchema;
+    let pSize;
     let bytes;
     try {
+      zSchema = toCString(module, 'main'); // inside the try: a throw must not leak pSize
+      pSize = module._malloc(8);
+      if (!pSize) throw new Error('sqlite3_malloc failed');
       const pBuf = await module._sqlite3_serialize(pMemDb, zSchema, pSize, SQLITE_SERIALIZE_NORMAL);
       if (!pBuf) throw new Error('sqlite3_serialize returned NULL');
       const size = readI64(module, pSize);
@@ -133,8 +137,8 @@ export async function exportCartridge(sqlite3, module, db, filename = 'tables-ca
       bytes.set(module.HEAPU8.subarray(pBuf, pBuf + size));
       module._sqlite3_free(pBuf);
     } finally {
-      freeCString(module, zSchema);
-      module._free(pSize);
+      freeCString(module, zSchema); // null-safe
+      if (pSize) module._free(pSize);
     }
 
     // 3. Trigger download
@@ -149,14 +153,59 @@ export async function exportCartridge(sqlite3, module, db, filename = 'tables-ca
 }
 
 /**
- * Import a .sqlite3 cartridge file, replacing the current database contents.
- * The live DB handle is preserved — UDFs, update hooks, and connection-level
- * pragmas survive, so no re-registration is needed by the caller.
- * @param {object} sqlite3 - wa-sqlite SQLiteAPI instance
- * @param {object} module  - raw WASM module (bootSqliteAgent return value)
- * @param {number} db      - Live database handle pointer
- * @returns {Promise<number>} The same database handle
+ * T33b (Phase 3): _manifest v1 — the compatibility contract (research doc §6).
+ * Export is the consistency point: the running engine derives required_udfs
+ * from the tools table and stamps its own version/identity, so the file is
+ * self-consistent by construction.
+ *
+ * The shape FREEZES at this ticket: T36 (bootstrap engine) consumes it
+ * unchanged — a missing field found by T36 is a bug to fix here, not a silent v2.
  */
+/**
+ * T33b (D4): tool name → the UDF that executes it on this host. The
+ * execute_tool trigger dispatches by tool name; `execute_sql` is the one tool
+ * whose UDF has a different name (run_dynamic_sql) — everything else maps 1:1.
+ * This is the web engine's capability declaration: required_udfs in the
+ * manifest and the import-time check both resolve through it.
+ */
+const TOOL_UDF_MAP = { execute_sql: 'run_dynamic_sql' };
+
+export async function writeManifest(sqlite3, stagingDb) {
+  await sqlite3.exec(stagingDb, `CREATE TABLE IF NOT EXISTS _manifest (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  const q = async (sql) => {
+    const rows = await queryAll(sqlite3, stagingDb, sql);
+    return rows.length ? rows[0][0] : null;
+  };
+  const toolNames = (await queryAll(sqlite3, stagingDb, 'SELECT name FROM tools ORDER BY name')).map((r) => r[0]);
+  // The manifest declares the UDFs a host must REGISTER — resolve tool names
+  // through the dispatch map (execute_sql runs via run_dynamic_sql).
+  const requiredUdfs = [...new Set(toolNames.map((n) => TOOL_UDF_MAP[n] ?? n))].sort();
+  const entries = [
+    ['format_version', '1'],
+    ['engine_min_version', String(ENGINE_MIN_VERSION)],
+    // Stable per-Tables-database identity (seeded at boot; travels in exports).
+    ['cartridge_id', (await q(`SELECT value FROM system_config WHERE key = 'cartridge_id'`)) ?? 'unknown'],
+    ['created_at', new Date().toISOString()],
+    ['exported_by', 'tables-web-engine'],
+    // Class-4 dependencies declared for the host: a tool row is a schema —
+    // execution needs a UDF of the same name registered by whatever boots it.
+    ['required_udfs', JSON.stringify(requiredUdfs)],
+    // Host capabilities this engine implements; a host without one degrades
+    // silently (cards become inert data) and says so in its report.
+    ['optional_features', JSON.stringify(['dashboard_html'])],
+    // Host-facing metadata: the prompt bundle version + the exporting host's
+    // model (advisory — D5: a hint about the other side, never config).
+    ['prompt_version', String(SYSTEM_PROMPT_VERSION)],
+    ['recommended_model', (await q(`SELECT value FROM system_config WHERE key = 'llm_model'`)) ?? ''],
+  ];
+  for (const [key, value] of entries) {
+    await execParams(sqlite3, stagingDb,
+      `INSERT INTO _manifest (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [key, value]);
+  }
+}
+
 /**
  * T33a (BUG-021/H3): reject files that are not binary SQLite cartridges
  * BEFORE any engine call. A .sql text dump deserializes "successfully" into a
@@ -180,7 +229,20 @@ export function validateCartridgeHeader(bytes) {
     : 'the file does not start with the SQLite header — it is not a .sqlite3 cartridge');
 }
 
-export async function importCartridge(sqlite3, module, db) {
+/**
+ * T33b (Phase 1): staged, validated import. The bytes deserialize into a
+ * STAGING :memory: DB and are verified BEFORE anything touches the live
+ * database — a bad file can never reach the swap, and no backup ever runs over
+ * a handle with unvalidated pages (AGY H6/H7 eliminated structurally).
+ *
+ * Pipeline: pick → header guard (T33a) → deserialize to staging → quick_check
+ * → Tables-database shape check → _manifest validation (v0 = back-compat)
+ * → host-UDF capability check (D4) → capture pre-swap facts → swap staged→live.
+ *
+ * The live DB handle is preserved — UDFs, update hooks, and connection-level
+ * pragmas survive; the caller then performs the canonical re-boot.
+ */
+export async function importCartridge(sqlite3, module, db, registeredUdfs = null) {
   // 1. Prompt user to select a .sqlite3 file
   const fileBytes = await pickFile();
   if (!fileBytes) return { cancelled: true };
@@ -188,43 +250,106 @@ export async function importCartridge(sqlite3, module, db) {
   // T33a (H3): header guard — clear error before any engine call.
   validateCartridgeHeader(fileBytes);
 
-  // 2. Load the bytes into an in-memory DB
-  const pMemDb = await openMemoryDb(sqlite3);
+  // 2. Deserialize into the staging DB (never the live one).
+  const pStaging = await openMemoryDb(sqlite3);
   const size = fileBytes.length;
   const pBuf = module._sqlite3_malloc(size);
   if (!pBuf) {
-    await sqlite3.close(pMemDb);
+    await sqlite3.close(pStaging);
     throw new Error('sqlite3_malloc failed');
   }
   module.HEAPU8.set(fileBytes, pBuf);
-  const zSchema = toCString(module, 'main');
+  let zSchema;
   try {
+    zSchema = toCString(module, 'main'); // inside the try: a throw must not leak pStaging/pBuf
     // raw signature: (db, zSchema, pData, szDataLo, szDataHi, szBufLo, szBufHi, mFlags)
     //
     // CRITICAL: sqlite3_deserialize references pBuf LAZILY — the page data is
     // only read out of pBuf on first access to the deserialized DB. pBuf must
-    // therefore stay allocated through the backup below AND until the in-memory
+    // therefore stay allocated through the backup below AND until the staging
     // DB is closed. Freeing it early corrupts the DB ("file is not a database").
     const rc = await module._sqlite3_deserialize(
-      pMemDb, zSchema, pBuf,
+      pStaging, zSchema, pBuf,
       size & 0xffffffff, Math.floor(size / 4294967296), // szData (lo, hi)
       size & 0xffffffff, Math.floor(size / 4294967296), // szBuf  (lo, hi)
       SQLITE_DESERIALIZE_DEFAULT
     );
     if (rc !== SQLITE_OK) {
-      throw new Error(`sqlite3_deserialize failed: ${errname(module, rc)}`);
+      throw new Error(`the file is not a readable SQLite database (${errname(module, rc)})`);
     }
 
-    // 3. Full replacement: back the imported DB over the live DB.
-    //    This is the first access to the deserialized pages — pBuf is still alive.
-    await backupFull(module, db, pMemDb);
+    // 3. Integrity — quick_check on the staging copy.
+    const qc = await queryAll(sqlite3, pStaging, 'PRAGMA quick_check');
+    if (!qc.length || qc[0][0] !== 'ok') {
+      throw new Error(`cartridge failed integrity check: ${qc.length ? qc[0][0] : 'no result'}`);
+    }
+
+    // 4. Shape — it must be a Tables database, not just any SQLite file.
+    const shapes = await queryAll(sqlite3, pStaging,
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sessions', 'messages', 'system_config', 'tools')`);
+    if (shapes.length < 4) {
+      throw new Error('not a Tables database — the sessions/messages/system_config/tools tables are missing');
+    }
+
+    // 5. _manifest — missing = format v0 (pre-manifest cartridge): proceed and
+    //    note it in the report (back-compat). Present: hard checks, refuse-loud.
+    const manifest = await readManifest(sqlite3, pStaging);
+    if (manifest) {
+      const minVersion = parseInt(manifest.engine_min_version ?? '0', 10);
+      if (Number.isFinite(minVersion) && minVersion > ENGINE_MIN_VERSION) {
+        throw new Error(`this cartridge needs engine version ${minVersion} or newer — this engine is v${ENGINE_MIN_VERSION}. Update Tables and retry.`);
+      }
+    }
+
+    // 6. Capability (D4): every tool the cartridge carries must be executable
+    //    on this host, or the cascade would explode at execution time.
+    //    Checking the imported tools table covers v0 cartridges too.
+    if (registeredUdfs && registeredUdfs.size) {
+      const toolRows = await queryAll(sqlite3, pStaging, 'SELECT name FROM tools');
+      const missing = toolRows.map((r) => r[0]).filter((n) => !registeredUdfs.has(TOOL_UDF_MAP[n] ?? n));
+      if (missing.length) {
+        throw new Error(`this cartridge uses tools this engine does not implement: ${missing.join(', ')}`);
+      }
+    }
+
+    // 7. Capture pre-swap facts for the post-reboot report (D1/D2/D5 lines).
+    const preSwap = await capturePreSwapFacts(sqlite3, pStaging, manifest);
+
+    // 8. Swap staged → live — the only point of no return; every check above
+    //    ran on the staging copy.
+    await backupFull(module, db, pStaging);
+
+    return { swapped: true, preSwap };
   } finally {
     freeCString(module, zSchema);
-    await sqlite3.close(pMemDb);
+    await sqlite3.close(pStaging);
     module._sqlite3_free(pBuf); // safe only after the DB no longer references it
   }
+}
 
-  return db;
+/** Read _manifest from a (staging) DB. null = table absent = format v0. */
+async function readManifest(sqlite3, db) {
+  const present = await queryAll(sqlite3, db, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_manifest'`);
+  if (!present.length) return null;
+  const manifest = {};
+  for (const [k, v] of await queryAll(sqlite3, db, 'SELECT key, value FROM _manifest')) manifest[k] = v;
+  return manifest;
+}
+
+/** Pre-swap facts the post-reboot report needs but that boot overwrites. */
+async function capturePreSwapFacts(sqlite3, db, manifest) {
+  const q = async (sql) => {
+    const rows = await queryAll(sqlite3, db, sql);
+    return rows.length ? rows[0][0] : null;
+  };
+  return {
+    activeSessionId: await q(`SELECT value FROM session_context WHERE key = 'active_session_id'`),
+    contextWindow: await q(`SELECT value FROM system_config WHERE key = 'effective_context_window'`),
+    llmModel: await q(`SELECT value FROM system_config WHERE key = 'llm_model'`),
+    promptVersion: await q(`SELECT value FROM system_config WHERE key = 'prompt_version'`),
+    promptCustomized: (await q(`SELECT value FROM system_config WHERE key = 'prompt_customized'`)) === '1',
+    manifest, // null for v0 cartridges
+  };
 }
 
 /**
@@ -398,6 +523,145 @@ async function withCartridgeButtonsLocked(fn) {
   }
 }
 
+// ── T33b: the last-import record (survives the canonical re-boot reload) ──
+// A successful import ends in location.reload(); the report it must show is
+// rendered AT BOOT from this record (showStoredImportReport), then cleared on
+// dismiss. localStorage — host-side state, never travels in a cartridge.
+
+const LAST_IMPORT_KEY = 'sql-agent-last-import';
+
+function writeLastImportRecord(record) {
+  try { localStorage.setItem(LAST_IMPORT_KEY, JSON.stringify(record)); }
+  catch (e) { console.warn('[cartridge] last-import record write failed:', e); }
+}
+
+function readLastImportRecord() {
+  try {
+    const raw = localStorage.getItem(LAST_IMPORT_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+
+function clearLastImportRecord() {
+  try { localStorage.removeItem(LAST_IMPORT_KEY); } catch { /* ignore */ }
+}
+
+/**
+ * T33a (H4) / T33b: the durable, dismissible post-import report — replaces
+ * the 3s status flash. Data-driven shape ({title, lines: [[k,v]…], banner}).
+ */
+function showImportReport(kind, { title, lines = [], banner = null }) {
+  // The panel is the durable outcome — sync the status bar to ready now,
+  // not only on dismiss (AGY review).
+  cartridgeCtx.updateReadyStatus();
+  document.getElementById('import-report-title').textContent =
+    (kind === 'success' ? '✓ ' : '⚠ ') + title;
+  const ul = document.getElementById('import-report-lines');
+  ul.replaceChildren(...lines.map(([k, v]) => {
+    const li = document.createElement('li');
+    li.className = 'import-report-line';
+    const spanK = document.createElement('span');
+    spanK.className = 'k';
+    spanK.textContent = k;
+    const spanV = document.createElement('span');
+    spanV.className = 'v';
+    spanV.textContent = v;
+    li.append(spanK, spanV);
+    return li;
+  }));
+  const bannerEl = document.getElementById('import-report-banner');
+  if (banner) {
+    bannerEl.textContent = banner.text;
+    bannerEl.className = `import-report-banner ${banner.kind}`;
+  } else {
+    bannerEl.className = 'import-report-banner hidden';
+  }
+  document.getElementById('import-report-modal').classList.remove('hidden');
+  document.getElementById('import-report-dismiss').focus(); // a11y: land on the dismiss action
+}
+
+/**
+ * Report content, queried from the live DB. `preSwap` (the post-boot path)
+ * carries facts boot overwrites — the D1/D2/D5 report lines come from it.
+ */
+async function buildImportReport(agent, preSwap) {
+  const q1 = async (sql) => {
+    const rows = await queryAll(agent.sqlite3, agent.db, sql);
+    return rows.length ? rows[0][0] : null;
+  };
+  // T21's classifier is the single source of truth for "user data table" —
+  // a raw NOT-IN list would miscount FTS5/vec0 shadow tables as user data.
+  const virtualParents = await getVirtualTableParents(agent.sqlite3, agent.db);
+  const allTables = await queryAll(agent.sqlite3, agent.db, "SELECT name FROM sqlite_master WHERE type='table'");
+  const userTables = allTables.map(([n]) => n).filter((n) => !isProtectedTable(n, virtualParents));
+  const lines = [
+    ['Sessions', String(await q1('SELECT COUNT(*) FROM sessions') ?? 0)],
+    ['Messages', String(await q1('SELECT COUNT(*) FROM messages') ?? 0)],
+    ['User data tables', userTables.length ? `${userTables.length} (${userTables.join(', ')})` : '0'],
+    ['Dashboard cards', String(await q1('SELECT COUNT(*) FROM dashboard_cards') ?? 0)],
+    // D3: the session boot restored via the BUG-017 chain (the cartridge's own
+    // pointer, with fallbacks) — read live, post-boot.
+    ['Active session', String((await q1(`SELECT value FROM session_context WHERE key = 'active_session_id'`)) ?? 'default')],
+  ];
+  if (preSwap) {
+    // D2: host-owned runtime cache — boot just replaced the cartridge's value
+    // with the host's resolution; say so instead of silently discarding it.
+    const nowWindow = await q1(`SELECT value FROM system_config WHERE key = 'effective_context_window'`);
+    if (preSwap.contextWindow && nowWindow && preSwap.contextWindow !== nowWindow) {
+      lines.push(['Context window', `${nowWindow} (host model) — the cartridge's ${preSwap.contextWindow} belonged to its own host`]);
+    }
+    // D1: identity preserved; a bundle mismatch is surfaced, never clobbered.
+    // Also check the LIVE flag: boot migration may have flagged a v0 custom
+    // prompt AFTER preSwap was captured (the report renders post-boot).
+    const nowCustomized = (await q1(`SELECT value FROM system_config WHERE key = 'prompt_customized'`)) === '1';
+    if (preSwap.promptCustomized || nowCustomized || (preSwap.promptVersion && preSwap.promptVersion !== String(SYSTEM_PROMPT_VERSION))) {
+      lines.push(['Agent identity', `custom (v${preSwap.promptVersion ?? '?'}) — engine is v${SYSTEM_PROMPT_VERSION}; kept, not overwritten`]);
+    }
+    // D5: advisory hint about the exporting host's model — never config.
+    if (preSwap.llmModel) {
+      const provider = typeof cartridgeCtx.providerStatus === 'function' ? cartridgeCtx.providerStatus() : null;
+      lines.push(['Exported with model', preSwap.llmModel
+        + (provider?.configured && provider.model && provider.model !== preSwap.llmModel ? ` — current profile: ${provider.model}` : '')]);
+    }
+    // _manifest: the compatibility contract this import validated against.
+    if (preSwap.manifest) {
+      const cid = (preSwap.manifest.cartridge_id ?? '').slice(0, 8);
+      lines.push(['Cartridge', `${cid} · exported ${preSwap.manifest.created_at ?? '?'} · format v${preSwap.manifest.format_version}`]);
+    } else {
+      lines.push(['Cartridge', 'pre-manifest (format v0) — imported without version checks']);
+    }
+  }
+  let banner = null;
+  if (typeof cartridgeCtx.providerStatus === 'function') {
+    const provider = cartridgeCtx.providerStatus();
+    if (!provider.configured) {
+      // H2 half: a fresh profile has no credentials — the imported agent can't
+      // chat. Say so loudly instead of letting the user stare at a blank pane.
+      banner = { kind: 'warn', text: 'No provider is configured on this machine — the imported agent cannot chat until a provider is set up.' };
+    } else {
+      lines.push(['Provider', provider.label]);
+    }
+  }
+  return { title: 'Cartridge imported', lines, banner };
+}
+
+/**
+ * T33b: a successful import ends in location.reload(); main.js calls this at
+ * boot to render that import's durable report (no-op on a normal page load).
+ */
+export async function showStoredImportReport(agent) {
+  const record = readLastImportRecord();
+  if (!record || record.kind !== 'success' || !cartridgeCtx) return;
+  let report;
+  try {
+    report = await buildImportReport(agent, record.preSwap);
+  } catch (e) {
+    console.warn('[import] stored report build failed:', e);
+    report = { title: 'Cartridge imported' };
+  }
+  showImportReport('success', report);
+}
+
 /**
  * @param {object} context
  * @param {() => object} context.getAgent - live agent handle (null pre-boot)
@@ -489,116 +753,42 @@ export function initCartridgeUi(context) {
 
   function closeImportReport() {
     reportModal.classList.add('hidden');
+    clearLastImportRecord(); // a dismissed stored report won't re-render next boot
     // The panel WAS the durable outcome — the status bar returns to ready.
     cartridgeCtx.updateReadyStatus();
   }
 
-  /**
-   * T33a (H4): the durable, dismissible post-import report — replaces the 3s
-   * status flash. Data-driven shape ({title, lines: [[k,v]…], banner}) is the
-   * extension point for T33b's staged import states.
-   */
-  function showImportReport(kind, { title, lines = [], banner = null }) {
-    // The panel is the durable outcome — sync the status bar to ready now,
-    // not only on dismiss (AGY review).
-    cartridgeCtx.updateReadyStatus();
-    document.getElementById('import-report-title').textContent =
-      (kind === 'success' ? '✓ ' : '⚠ ') + title;
-    const ul = document.getElementById('import-report-lines');
-    ul.replaceChildren(...lines.map(([k, v]) => {
-      const li = document.createElement('li');
-      li.className = 'import-report-line';
-      const spanK = document.createElement('span');
-      spanK.className = 'k';
-      spanK.textContent = k;
-      const spanV = document.createElement('span');
-      spanV.className = 'v';
-      spanV.textContent = v;
-      li.append(spanK, spanV);
-      return li;
-    }));
-    const bannerEl = document.getElementById('import-report-banner');
-    if (banner) {
-      bannerEl.textContent = banner.text;
-      bannerEl.className = `import-report-banner ${banner.kind}`;
-    } else {
-      bannerEl.className = 'import-report-banner hidden';
-    }
-    reportModal.classList.remove('hidden');
-    document.getElementById('import-report-dismiss').focus(); // a11y: land on the dismiss action
-  }
-
-  /** Snapshot of what the import brought over (queried from the live DB post-swap). */
-  async function buildImportReport(agent) {
-    const count = async (sql) => {
-      const rows = await queryAll(agent.sqlite3, agent.db, sql);
-      return rows.length ? rows[0][0] : 0;
-    };
-    // T21's classifier is the single source of truth for "user data table" —
-    // a raw NOT-IN list would miscount FTS5/vec0 shadow tables as user data.
-    const virtualParents = await getVirtualTableParents(agent.sqlite3, agent.db);
-    const allTables = await queryAll(agent.sqlite3, agent.db, "SELECT name FROM sqlite_master WHERE type='table'");
-    const userTables = allTables.map(([n]) => n).filter((n) => !isProtectedTable(n, virtualParents));
-    const lines = [
-      ['Sessions', String(await count('SELECT COUNT(*) FROM sessions'))],
-      ['Messages', String(await count('SELECT COUNT(*) FROM messages'))],
-      ['User data tables', userTables.length ? `${userTables.length} (${userTables.join(', ')})` : '0'],
-      ['Dashboard cards', String(await count('SELECT COUNT(*) FROM dashboard_cards'))],
-      // T33a keeps the historical behavior (land on 'default'); D3 restores the
-      // cartridge's own active session in T33b.
-      ['Active session', 'default'],
-    ];
-    let banner = null;
-    if (typeof cartridgeCtx.providerStatus === 'function') {
-      const provider = cartridgeCtx.providerStatus();
-      if (!provider.configured) {
-        // H2 half: a fresh profile has no credentials — the imported agent can't
-        // chat. Say so loudly instead of letting the user stare at a blank pane.
-        banner = { kind: 'warn', text: 'No provider is configured on this machine — the imported agent cannot chat until a provider is set up.' };
-      } else {
-        lines.push(['Provider', provider.label]);
-      }
-    }
-    return { title: 'Cartridge imported', lines, banner };
-  }
-
-  /** The import itself, post-consent: pick → header guard → swap → report. */
+  /** The import itself, post-consent: quiesce → validate → swap → re-boot. */
   async function runImport() {
     const agent = cartridgeCtx.getAgent();
     try {
-      setCartridgeStatus('Importing cartridge…', '#d29922');
-      // Same DB handle is preserved by importCartridge — UDFs, the update hook,
-      // and connection-level pragmas all survive, so nothing to re-register.
-      const result = await importCartridge(agent.sqlite3, agent.module, agent.db);
+      // T33b: never swap the DB under an in-flight turn — quiesce first
+      // (graceful stop; completed work is kept).
+      if (typeof cartridgeCtx.quiesceIfBusy === 'function') await cartridgeCtx.quiesceIfBusy();
+
+      setCartridgeStatus('Validating cartridge…', '#d29922');
+      const result = await importCartridge(agent.sqlite3, agent.module, agent.db, agent.getRegisteredUdfs?.());
       if (result?.cancelled) {
         cartridgeCtx.updateReadyStatus(); // picker canceled → quiet reset, no fake error
         return;
       }
 
-      cartridgeCtx.setSessionId('default');
-      await setActiveSession(agent.sqlite3, agent.db, 'default');
-      await populateSessionDropdown();
-      await renderMessages();
-      // T11: the whole DB was replaced — rebuild the dashboard grid + explorer
-      // from the imported cartridge (cards referencing dropped tables show errors).
-      try { await rebuildGrid(); } catch (e) { console.warn('[main] grid rebuild failed (non-fatal):', e); }
-
-      let report;
-      try {
-        report = await buildImportReport(agent);
-      } catch (e) {
-        // The import itself succeeded — a report-query failure must not read as one.
-        console.warn('[import] report build failed:', e);
-        report = { title: 'Cartridge imported' };
-      }
-      showImportReport('success', report);
+      // T33b: canonical re-boot — post-import state == what a reload would show.
+      // Migrations, trigger/view recreation, the D1/D2 boundary rules, and the
+      // capture-trigger sweep all run at boot; the mixed-build staleness window
+      // is gone. The durable report survives the reload via a localStorage
+      // record rendered at boot (showStoredImportReport).
+      setCartridgeStatus('Replacing database… reloading', '#d29922');
+      writeLastImportRecord({ kind: 'success', preSwap: result.preSwap, at: Date.now() });
+      await new Promise((r) => setTimeout(r, 150)); // let the status paint before the reload
+      location.reload();
     } catch (e) {
       if (e.name === 'AbortError') {
         cartridgeCtx.updateReadyStatus();
         return;
       }
       console.error('[import]', e);
-      // Durable error report (was: persistent status-bar text — the H4 asymmetry).
+      // Durable error report — validation failed pre-swap, so nothing changed.
       showImportReport('error', { title: 'Import failed', banner: { kind: 'err', text: e.message } });
     }
   }

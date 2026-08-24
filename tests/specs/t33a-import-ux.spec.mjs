@@ -24,7 +24,12 @@ const FSA_STUB = `
     window.__fsa.exportName = opts && opts.suggestedName;
     return {
       createWritable: async () => ({
-        write: async (d) => { window.__fsa.exportData = d; },
+        write: async (d) => {
+          window.__fsa.exportData = d;
+          // Persist the capture across reloads (a successful import ends in
+          // location.reload(), which wipes window state but not localStorage).
+          try { localStorage.setItem('__fsa_export_meta', JSON.stringify({ name: (opts && opts.suggestedName) || '', size: d.byteLength })); } catch {}
+        },
         close: async () => {},
       }),
     };
@@ -65,7 +70,23 @@ async function importViaConsent(page) {
   await expect(page.locator('#import-warning-modal')).toBeVisible();
   await page.click('#import-warn-skip');
   await expect(page.locator('#import-warning-step2')).toBeVisible();
+  // Mark the OLD document so waitForReboot can't resolve against it: a
+  // ready-poll alone would pass on the dying pre-reload context.
+  await page.evaluate(() => { window.__preReload = true; });
   await page.click('#import-warn-overwrite');
+}
+
+/**
+ * T33b: a successful import ends in a canonical re-boot (location.reload).
+ * Wait for the fresh document's boot to complete.
+ */
+async function waitForReboot(page, timeout = 45_000) {
+  // The reloaded document has no __preReload and a freshly booted agent.
+  await page.waitForFunction(
+    () => window.__preReload === undefined && !!(window.__agent && window.__agent.db && window.__agent.ready),
+    null,
+    { timeout },
+  );
 }
 
 test.describe('T33a — BUG-021 import UX contract', () => {
@@ -107,9 +128,11 @@ test.describe('T33a — BUG-021 import UX contract', () => {
     await expect(page.locator('#import-warning-step1')).toBeVisible();
     await expect(page.locator('#import-warning-step2')).toBeHidden();
 
-    // The confirmed path completes the import with a durable report.
+    // The confirmed path completes the import — T33b: it ends in a canonical
+    // re-boot, and the durable report renders at boot from the stored record.
     await page.click('#import-warn-skip');
     await page.click('#import-warn-overwrite');
+    await waitForReboot(page);
     await expect(page.locator('#import-report-modal')).toBeVisible();
     await expect(page.locator('#import-report-title')).toContainText('Cartridge imported');
   });
@@ -122,15 +145,21 @@ test.describe('T33a — BUG-021 import UX contract', () => {
 
     await page.click('#btn-import');
     await expect(page.locator('#import-warning-modal')).toBeVisible();
+    // Mark the OLD document (export-first also ends in the canonical re-boot).
+    await page.evaluate(() => { window.__preReload = true; });
     await page.click('#import-warn-export-first');
 
-    // The backup download started (stub re-captured bytes under a backup name)
-    // and the flow proceeded to the import report.
+    // The backup download started and the flow proceeded to the import, which
+    // ends in a canonical re-boot (window state is wiped — the stub persists
+    // the capture to localStorage for post-reboot assertions).
+    await waitForReboot(page);
     await expect(page.locator('#import-report-modal')).toBeVisible();
-    const exported = await page.evaluate(() => window.__fsa.exportData);
-    expect(exported, 'backup export ran').not.toBeNull();
-    expect(await page.evaluate(() => window.__fsa.exportName))
-      .toMatch(/^tables-backup-\d{4}-\d{2}-\d{2}\.sqlite3$/);
+    const meta = await page.evaluate(() => {
+      try { return JSON.parse(localStorage.getItem('__fsa_export_meta')); } catch { return null; }
+    });
+    expect(meta, 'backup export ran').not.toBeNull();
+    expect(meta.size).toBeGreaterThan(0);
+    expect(meta.name).toMatch(/^tables-backup-\d{4}-\d{2}-\d{2}\.sqlite3$/);
   });
 
   test('H3: .sql dump and random bytes → clear error, no destructive replace', async ({ page }) => {
@@ -182,6 +211,7 @@ test.describe('T33a — BUG-021 import UX contract', () => {
     await bootWithFsa(pageB);
     await stageImportFile(pageB, bytes);
     await importViaConsent(pageB);
+    await waitForReboot(pageB);
 
     await expect(pageB.locator('#import-report-modal')).toBeVisible();
     // Read the report as [label, value] pairs (the spans carry no whitespace between them).

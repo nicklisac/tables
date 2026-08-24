@@ -18,7 +18,7 @@ import { SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE, SQLITE_UTF8, SQLITE_INSERT, 
 import { SQLITE_ROW } from './utils.js';
 import { IDBBatchAtomicVFS } from '../vendor/wa-sqlite-jspi/IDBBatchAtomicVFS.js';
 import { MemoryVFS } from '../vendor/wa-sqlite-jspi/MemoryVFS.js';
-import { SCHEMA_SQL, SYSTEM_PROMPT, migrateSystemPrompt, migrateTurnTables, migrateMessagesTable, migrateDashboardCardsTable, migrateDocumentsTable, migrateToolsTable, queryAll, isInternalTable, isProtectedObject, logDDL, sweepCaptureTriggers, extractTargetTables, extractDdlTableName, captureDropPreImage } from './schema.js';
+import { SCHEMA_SQL, SYSTEM_PROMPT, migrateSystemPrompt, migrateTurnTables, migrateMessagesTable, migrateDashboardCardsTable, migrateDocumentsTable, migrateToolsTable, seedCartridgeId, queryAll, isInternalTable, isProtectedObject, logDDL, sweepCaptureTriggers, extractTargetTables, extractDdlTableName, captureDropPreImage } from './schema.js';
 import { runCompaction, queryActiveContextJson, resolveContextWindow } from './compaction.js';
 import { getProvider, defaultMaxTokens } from './llm-provider.js';
 import { materializeToolResult } from './materialize.js';
@@ -395,6 +395,7 @@ export async function bootSqliteAgent(config = {}) {
     let finalizeDrain = Promise.resolve(); // in-flight finalize teardowns
     let entryQueue = Promise.resolve();    // serializes INDEPENDENT top-level queries
     let udfDepth = 0;                      // in-progress UDF executions (nested signal)
+    const registeredUdfs = new Set();      // T33b: UDF names this host implements
     // Manual nested scope: top-level code (e.g. the scratchpad's execScratchSql)
     // that issues inner queries (logDDL, drop pre-image) WHILE its own
     // statements generator holds the entry slot. Without this, the inner
@@ -409,6 +410,10 @@ export async function bootSqliteAgent(config = {}) {
 
     agentApi.beginNestedScope = () => { manualDepth++; };
     agentApi.endNestedScope = () => { manualDepth = Math.max(0, manualDepth - 1); };
+    // T33b: the host's capability set — import validates a cartridge's tools
+    // against this before swapping (a tool row without a UDF would explode
+    // mid-cascade at execution time).
+    agentApi.getRegisteredUdfs = () => new Set(registeredUdfs);
 
     // Wrap create_function to track UDF-execution depth. The callback is always
     // the last argument. A query is NESTED iff it is issued while a UDF is
@@ -419,6 +424,8 @@ export async function bootSqliteAgent(config = {}) {
     // starts, which misclassifies it as nested and lets it slip through
     // unserialized -> C-state clobber. (BUG-008 residual.)
     sqlite3.create_function = function(...args) {
+      // wa-sqlite signature: create_function(db, name, nArgs, encoding, ...)
+      if (typeof args[1] === 'string') registeredUdfs.add(args[1]);
       const fn = args[args.length - 1];
       if (typeof fn === 'function') {
         // Async wrapper so udfDepth spans the UDF's FULL execution (including
@@ -1476,6 +1483,14 @@ export async function bootSqliteAgent(config = {}) {
 
   // 9c. Initialize schema
   await sqlite3.exec(db, SCHEMA_SQL);
+
+  // 9c-2. T33b: stable per-database identity for the _manifest (INSERT OR
+  // IGNORE — an imported database keeps its own cartridge_id).
+  try {
+    await seedCartridgeId(sqlite3, db);
+  } catch (e) {
+    console.warn('[harness] seedCartridgeId failed (non-fatal):', e.message);
+  }
 
   // 9d. System prompt: install the current SYSTEM_PROMPT (version-gated by
   // prompt_version — no-op on databases already at the current version, so

@@ -21,7 +21,7 @@ import {
   COMPACTION_THRESHOLD, FALLBACK_WINDOW,
 } from './compaction.js';
 import { rewindToBefore, initRewindUi } from './rewind.js';
-import { initCartridgeUi, enableCartridgeButtons } from './cartridge.js';
+import { initCartridgeUi, enableCartridgeButtons, showStoredImportReport } from './cartridge.js';
 import { initCsvUi } from './csv-ingestion.js';
 import * as gridUi from './grid-ui.js';
 import * as gridEngine from './grid.js';
@@ -701,6 +701,8 @@ async function bootAgent() {
     updateReadyStatus();
     window.__agent.ready = true;
     enableCartridgeButtons(); // T33a (H1): [import]/[export] are boot-gated
+    // T33b: a successful import ends in THIS reload — render its durable report.
+    await showStoredImportReport(agent);
     inputEl.disabled = false;
     sendBtn.disabled = false;
     inputEl.focus();
@@ -1100,9 +1102,25 @@ initCartridgeUi({
   // profile has no API key, so the imported agent can't chat until one is set).
   providerStatus: () => {
     const cfg = loadConfig();
-    if (!isProviderConfigured(cfg)) return { configured: false, label: '' };
+    if (!isProviderConfigured(cfg)) return { configured: false, label: '', model: '' };
     const provider = getProvider(cfg.provider || 'gemini');
-    return { configured: true, label: `${provider.label} (${cfg.model || provider.modelPlaceholder || 'model'})` };
+    return {
+      configured: true,
+      label: `${provider.label} (${cfg.model || provider.modelPlaceholder || 'model'})`,
+      model: cfg.model || '',
+    };
+  },
+  // T33b: never swap the DB under an in-flight turn — graceful stop (the
+  // in-flight UDF returns the sentinel, completed work is kept), then await
+  // quiescence. If the turn is still live after the bounded wait, ABORT the
+  // import: swapping under a suspended cascade would re-introduce the exact
+  // hazard the staged pipeline exists to eliminate.
+  quiesceIfBusy: async () => {
+    if (!isBusy()) return;
+    requestStop();
+    const deadline = Date.now() + 20_000;
+    while (isBusy() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    if (isBusy()) throw new Error('a turn is still in flight and would not stop — the import was cancelled; try again');
   },
 });
 initCsvUi({
