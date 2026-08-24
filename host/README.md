@@ -1,0 +1,150 @@
+# Tables standalone host (v1)
+
+A thin, stdlib-only Python host that boots a **Tables cartridge** — an exported
+`.sqlite3` file whose entire agent state and ReAct trigger cascade live in the
+file itself. No web engine, no WASM, no dependencies: CPython's built-in
+`sqlite3` module is the whole runtime.
+
+The host does **not** re-implement the agent loop. It opens the file, checks
+the compatibility contract (`_manifest`), registers the UDFs the cartridge's
+triggers call, and then lets the file's **own triggers** drive the
+conversation:
+
+```
+you> how many sessions are there?
+  ⚙ (the cascade runs inside one INSERT)
+    agent_turn_init → agent_think (ask_llm) → execute_tool (execute_sql)
+      → agent_llm again → final answer
+tables> There is 1 session in this database.
+```
+
+In a CLI there is no JSPI / UI-thread: a blocking UDF callback is just a
+function call, so the pure-SQL flagship loop runs natively.
+
+## Requirements
+
+- Python 3.10+ (stdlib only — `sqlite3`, `urllib`, `json`, `re`)
+- A Tables cartridge (the **[export]** button in the web engine produces one)
+- An OpenAI-compatible chat-completions endpoint + API key (Gemini's
+  OpenAI-compatible endpoint, Ollama, LM Studio, OpenAI, …)
+
+## Usage
+
+```sh
+# One-shot: boot the cartridge, send one message, print the answer, exit.
+python3 host/host.py my-agent.sqlite3 "What tables do I have?"
+
+# Interactive REPL (omit the message).
+python3 host/host.py my-agent.sqlite3
+
+# Piped input is treated as a single message (scripting-friendly).
+echo "Summarize my data" | python3 host/host.py my-agent.sqlite3
+```
+
+### Configuration (the keychain split)
+
+The cartridge carries the agent's **identity + data**; credentials and model
+config are supplied at boot and never travel in the file.
+
+| Setting    | Flag        | Env var(s)                                        | Default |
+|------------|-------------|---------------------------------------------------|---------|
+| Endpoint   | `--llm-url` | `TABLES_LLM_URL`                                  | *(required)* |
+| Model      | `--model`   | `TABLES_LLM_MODEL`                                | the manifest's `recommended_model`, else `gemini-2.5-flash` |
+| API key    | `--api-key` | `TABLES_LLM_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY` | *(none)* |
+
+Example with Gemini's OpenAI-compatible endpoint:
+
+```sh
+export TABLES_LLM_URL="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+python3 host/host.py my-agent.sqlite3 --model gemini-2.5-flash "Hello?"
+```
+
+## What the host checks at boot
+
+1. **Shape** — the file must be a Tables database (`sessions`, `messages`,
+   `system_config`, `tools` present).
+2. **`_manifest` v1** (stamped by the web engine's export):
+   - `format_version` must be `1`;
+   - `engine_min_version` must be ≤ the host version — a newer cartridge is
+     **refused loudly** (DCSS major-tag semantics: never silently corrupt);
+   - `required_udfs` — every UDF the cartridge declares must be registered by
+     this host, or boot is refused (the cascade would explode mid-turn).
+   - A missing `_manifest` means a pre-manifest **v0** cartridge: it boots
+     with a note, and the required-UDF set is derived from the `tools` table
+     (exactly as the web engine's import check does).
+3. **Active session restore** (the BUG-017 chain): the stored
+   `active_session_id` if it still exists, else the most recent session, else
+   `default`. The context view only serves the active session, so this must
+   match where user rows are inserted.
+4. **Stuck-flag clear** — a crashed run can leave `suppress_cascade` /
+   `suppress_capture` at `'1'`, which would silently kill the cascade; boot
+   resets both.
+
+The host prints a boot report (cartridge id, format, active session, model,
+masked key, identity/prompt version, tool matrix) before the first turn.
+
+## v1 tool matrix
+
+| Tool               | Status      | Notes |
+|--------------------|-------------|-------|
+| `ask_llm`          | full        | OpenAI-compatible chat completions; JSON-in-content protocol (no native function-calling required — works with any compatible endpoint) |
+| `execute_sql`      | **read-only** | `SELECT` / `WITH` / `EXPLAIN` / `PRAGMA`. Writes are refused with a clear error envelope (the loop survives; the agent adapts). |
+| `fetch_url`        | full        | HTTP(S) fetch + HTML→text, SSRF-blocked (loopback/private ranges), 8k-char preview |
+| `search_web`       | stub        | registered; returns a clear "not in v1" error envelope |
+| `materialize`      | stub        | registered; returns a clear "not in v1" error envelope |
+| `search_documents` | stub        | registered; returns a clear "not in v1" error envelope |
+| `ingest_document`  | stub        | registered; returns a clear "not in v1" error envelope |
+
+A stubbed tool never breaks the cascade: its error lands as a normal `tool`
+row and the agent sees it and adapts (the same contract the web engine uses
+for failed tools).
+
+**Dashboard cards are inert by design** — the optional `dashboard_html`
+feature is unimplemented in v1. The card rows travel in the cartridge and work
+again when the file is imported back into the web engine.
+
+## Error semantics (T3 parity)
+
+Each turn runs inside a `SAVEPOINT`. If the LLM call fails mid-turn (network
+error, HTTP 5xx, …), the host rolls the whole turn back — including the user
+row and any partial cascade work — then re-inserts the user row with the
+cascade suppressed and appends an assistant error note, so the next turn's
+context is honest about what happened. This mirrors the web engine's
+hard-error path; a failed turn never poisons the conversation or leaves a
+stuck suppression flag.
+
+## Non-goals for v1 (deliberate)
+
+- **Writes** (`execute_sql` DML/DDL, `materialize`) — read-only by design in
+  v1; the rewind/approval machinery is web-engine territory for now.
+- **Compaction** — long conversations will eventually exceed the model's
+  context window and surface a provider error; run `/compact` in the web
+  engine to summarize, then re-export.
+- **Streaming output** — turns are blocking; the final answer prints when the
+  cascade completes (tool activity prints to stderr as it happens).
+- **Bang commands** (`!SQL`, `!!SQL`, `/compact`) — chat-input interception is
+  a web-engine concern; in the REPL, ask the agent to run SQL instead.
+
+## Testing
+
+`tests/specs/t36-bootstrap-host.spec.mjs` (Playwright) exports a **real**
+cartridge through the web engine's [export] path and drives the host against
+a fake OpenAI-compatible LLM server — no API key needed:
+
+```sh
+npx playwright test tests/specs/t36-bootstrap-host.spec.mjs
+```
+
+Covered: multi-turn tool round-trip, identity/persona fidelity,
+`engine_min_version` refusal, UDF capability-gap refusal (D4), v0
+back-compat, LLM transport-error rollback + next-boot survival, read-only
+gating. A live Gemini probe is included but gated behind
+`RUN_LIVE_PROBE=1` + `GEMINI_API_KEY`.
+
+## Relationship to the web engine and T37
+
+This loader is deliberately thin and readable: **T37 (self-booting
+cartridges) lifts it into the file itself** — the same boot sequence, with the
+host source stored in a `system_files` table, so a `.sqlite3` literally
+contains its own engine ("agent on a keychain"). Keep new host logic
+self-contained and stdlib-only so that lift stays mechanical.
