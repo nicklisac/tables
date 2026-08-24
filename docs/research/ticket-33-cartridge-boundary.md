@@ -1,6 +1,6 @@
 # T33 Research: Cartridge Import (BUG-021) + Engine/Cartridge Boundary
 
-**Date:** 2026-08-23 · **Branch:** `t33-cartridge-boundary` · **Status:** research complete + **decisions locked with user (2026-08-24)**
+**Date:** 2026-08-23 · **Branch:** `t33-cartridge-boundary` · **Status:** ✅ **implemented + merged to main (2026-08-24)** — T33a `cde229d` (Phase 0 UX contract), T33b `ca2560d` (staged import + re-boot + D1–D5 + `_manifest` v1, shape frozen for T36); real-browser smoke verified. This document is the design record; the code in `src/cartridge.js` / `src/schema.js` is the source of truth.
 **Inputs:** empirical probe (`docs/prototypes/ticket-33-import-probe.mjs`), code inventory at HEAD (`9bd415a`), AGY design review (job `agy-1787544284-2302950`, Gemini 3.7 Flash High), external pattern research (sources in §5), and a second AGY review of this document (job `agy-1787571972-124690`) — verdict FIX-FIRST; all required fixes applied (see Appendix A).
 
 ---
