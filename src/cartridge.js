@@ -36,6 +36,9 @@
 // T26.3: shared result codes + query/ident helpers now live in src/utils.js.
 import { SQLITE_ROW, SQLITE_DONE, queryAll, quoteIdent, execParams } from './utils.js';
 import { isProtectedTable, getVirtualTableParents, ENGINE_MIN_VERSION, SYSTEM_PROMPT_VERSION } from './schema.js';
+// T37: the standalone host source — single source of truth = host/host.py (D1).
+// Vite's ?raw transform inlines the file as a string; stamped into every export.
+import hostPySource from '../host/host.py?raw';
 
 const SQLITE_OK = 0;
 const SQLITE_SERIALIZE_NORMAL = 0;
@@ -122,6 +125,10 @@ export async function exportCartridge(sqlite3, module, db, filename = 'tables-ca
     // — the exported file is self-consistent by construction.
     await writeManifest(sqlite3, pMemDb);
 
+    // T37: stamp the in-file host (system_files + host_sha256 manifest key) —
+    // the export carries its own engine ("agent on a keychain").
+    await stampHost(sqlite3, pMemDb);
+
     // 2. Serialize the in-memory DB into a malloc'd buffer
     let zSchema;
     let pSize;
@@ -204,6 +211,70 @@ export async function writeManifest(sqlite3, stagingDb) {
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       [key, value]);
   }
+}
+
+/**
+ * T37: SHA-256 hex of a UTF-8 string (WebCrypto). The standalone host computes
+ * the same digest in Python (hashlib over body.encode('utf-8')) — same bytes,
+ * same hash, so the two sides agree without any shared code.
+ */
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// The hash of the host source THIS build ships — the L2 drift anchor (D7):
+// an imported cartridge's embedded host is compared against it. Cached: one
+// digest per page load, not per export/import.
+let buildHostHashPromise = null;
+function buildHostSha256() {
+  buildHostHashPromise ??= sha256Hex(hostPySource);
+  return buildHostHashPromise;
+}
+
+/**
+ * T37 (D1/D2/D3): embed the standalone host into the export staging copy.
+ * The live web DB stays lean — self-containment is a property of the artifact,
+ * not the working database. Creates system_files (protected via INTERNAL_TABLES
+ * membership in schema.js), upserts the row, and adds the additive `host_sha256`
+ * manifest key (freeze-safe: the frozen-shape test asserts per-field). A
+ * re-export of an imported stamped cartridge converges to this build's host.
+ * @returns {Promise<string>} the stamped sha256
+ */
+export async function stampHost(sqlite3, stagingDb) {
+  const sha = await buildHostSha256();
+  await sqlite3.exec(stagingDb, `CREATE TABLE IF NOT EXISTS system_files (
+    name TEXT PRIMARY KEY,
+    mime TEXT NOT NULL,
+    body TEXT NOT NULL,
+    sha256 TEXT NOT NULL
+  )`);
+  await execParams(sqlite3, stagingDb,
+    `INSERT INTO system_files (name, mime, body, sha256) VALUES ('host.py', 'text/x-python', ?, ?)
+     ON CONFLICT(name) DO UPDATE SET mime = excluded.mime, body = excluded.body, sha256 = excluded.sha256`,
+    [hostPySource, sha]);
+  await execParams(sqlite3, stagingDb,
+    `INSERT INTO _manifest (key, value) VALUES ('host_sha256', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    [sha]);
+  return sha;
+}
+
+/**
+ * T37 (D7): read the embedded host from a staging DB for the import report.
+ * null = pre-T37 export (no system_files table). Otherwise the stored hash +
+ * the ACTUAL hash of the body — the two values behind the two-tier check:
+ *   stored ≠ actual → internal inconsistency (tamper/corruption) — strong warning
+ *   actual ≠ build  → drift vs this build (version skew or modification) — soft note
+ */
+async function captureEmbeddedHost(sqlite3, db) {
+  const present = await queryAll(sqlite3, db,
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'system_files'`);
+  if (!present.length) return null;
+  const row = (await queryAll(sqlite3, db,
+    `SELECT body, sha256 FROM system_files WHERE name = 'host.py'`))[0];
+  if (!row) return { present: true, storedSha256: null, actualSha256: null };
+  return { present: true, storedSha256: row[1], actualSha256: await sha256Hex(row[0]) };
 }
 
 /**
@@ -349,6 +420,7 @@ async function capturePreSwapFacts(sqlite3, db, manifest) {
     promptVersion: await q(`SELECT value FROM system_config WHERE key = 'prompt_version'`),
     promptCustomized: (await q(`SELECT value FROM system_config WHERE key = 'prompt_customized'`)) === '1',
     manifest, // null for v0 cartridges
+    embeddedHost: await captureEmbeddedHost(sqlite3, db), // T37 (D7): null = pre-T37 export
   };
 }
 
@@ -640,6 +712,31 @@ async function buildImportReport(agent, preSwap) {
       banner = { kind: 'warn', text: 'No provider is configured on this machine — the imported agent cannot chat until a provider is set up.' };
     } else {
       lines.push(['Provider', provider.label]);
+    }
+  }
+  // T37 (D7): embedded-host trust status — warn, never refuse. The web tier
+  // never executes the embedded host; the signal matters if the user later
+  // runs this file in a CLI. Two tiers: internal inconsistency (stored hash ≠
+  // body hash) is unambiguous tamper → strong banner; drift vs this build is
+  // usually just version skew → soft line only.
+  if (preSwap) {
+    const eh = preSwap.embeddedHost;
+    const shortHash = (h) => (h || '?').slice(0, 8);
+    // F-02: a table without a host.py row (foreign/empty system_files) has no
+    // embedded host to speak of — report it as none, not as drift.
+    if (eh === null || !eh.actualSha256) {
+      lines.push(['Embedded host', eh === null ? 'none (pre-T37 export)' : 'none (no host.py in system_files)']);
+    } else if (eh.storedSha256 !== eh.actualSha256) {
+      // Overrides the provider banner — a tamper warning outranks config.
+      banner = { kind: 'warn', text: 'The embedded host does not match its own recorded hash — this file was modified after export. Review it before running it in a CLI.' };
+      lines.push(['Embedded host', `INCONSISTENT (body: ${shortHash(eh.actualSha256)}, recorded: ${shortHash(eh.storedSha256)})`]);
+    } else {
+      const buildHash = await buildHostSha256();
+      if (eh.actualSha256 === buildHash) {
+        lines.push(['Embedded host', `matches this build (sha256 ${shortHash(eh.actualSha256)})`]);
+      } else {
+        lines.push(['Embedded host', `differs from this build (file: ${shortHash(eh.actualSha256)} · build: ${shortHash(buildHash)}) — another Tables version or modified; review before CLI use`]);
+      }
     }
   }
   return { title: 'Cartridge imported', lines, banner };

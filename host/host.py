@@ -23,11 +23,21 @@ Keychain split (the file = the agent; the key = where you plug it in):
 v1 tool matrix (thin on purpose — T37 lifts this loader into an in-file host):
   ask_llm            full   OpenAI-compatible chat completions, JSON-in-content
   execute_sql        read-only SELECT / WITH / EXPLAIN / PRAGMA
-  fetch_url          full   HTTP(S) fetch + HTML->text (SSRF-blocked)
+  fetch_url          gated  HTTP(S) fetch + HTML->text (SSRF-blocked); every call
+                            asks for interactive approval (y/N/a). Set
+                            TABLES_ALLOW_FETCH=1 to disable the approval layer
+                            (free fetches — unattended runs).
   search_web         stub   registered, returns a clear "not in v1" error
   materialize        stub   registered, returns a clear "not in v1" error
   search_documents   stub   registered, returns a clear "not in v1" error
   ingest_document    stub   registered, returns a clear "not in v1" error
+
+Trust model (T37, layered — no crypto in v1):
+  L0 consent at boot: the report below states host hash + fetch mode before any turn.
+  L1 integrity: if the cartridge embeds its own host (system_files), the stored
+     sha256 is verified against the body BEFORE anything runs; mismatch = refuse.
+  L3 capability: fetch_url approval layer (above) — per-action consent, the one
+     UDF whose egress destination is chosen by the model at runtime.
 Dashboard cards are inert by design (the optional `dashboard_html` feature is
 unimplemented here — not a bug).
 
@@ -40,12 +50,18 @@ Usage:
       --api-key KEY     bearer key (env TABLES_LLM_API_KEY / OPENAI_API_KEY /
                         GEMINI_API_KEY)
 
+Environment:
+  TABLES_ALLOW_FETCH=1  disable the fetch_url approval layer (free fetches).
+                        Default: every fetch prompts [y]es/[N]o/[a]ll-for-run;
+                        without a TTY, fetches fail closed with this hint.
+
 If `message` is omitted and stdin is a pipe, stdin is used as the message;
 otherwise an interactive REPL starts.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -224,6 +240,11 @@ class Host:
         self.tool_schemas = []
         self.real_udfs = set()
         self.stub_udfs = set()
+        # T37 (L3/D5): the fetch approval layer. Off only via env — per-action
+        # consent is the default, free fetches are the explicit opt-out.
+        self.allow_fetch = os.environ.get("TABLES_ALLOW_FETCH", "") == "1"
+        # T37 (L1): the embedded host's recorded hash (None = not embedded).
+        self.embedded_host_sha256 = None
         # CPython's sqlite3 swallows a UDF's exception into a generic
         # OperationalError("user-defined function raised exception") — the
         # original message cannot propagate through the C API. The UDF stashes
@@ -246,6 +267,11 @@ class Host:
         if not self._is_tables_database():
             raise HostError("not a Tables database — the sessions/messages/"
                             "system_config/tools tables are missing")
+
+        # T37 (L1): integrity self-check BEFORE any DML below — a cartridge
+        # whose embedded host doesn't match its own recorded hash is corrupt
+        # or tampered, and refuses to boot.
+        self._check_embedded_host()
 
         self.manifest = self._read_manifest()
         self._check_manifest()
@@ -273,6 +299,39 @@ class Host:
         row = self.conn.execute(
             "SELECT value FROM system_config WHERE key=?", (key,)).fetchone()
         return row[0] if row else default
+
+    # ── T37 trust layers ────────────────────────────────────────────────────
+    def _check_embedded_host(self):
+        """L1 integrity: verify the embedded host's recorded sha256 against its
+        body. Runs before session restore / flag clears (the first DML) so a
+        tampered file can't mutate anything. Absent table = pre-T37 export:
+        boot as today, note it in the report."""
+        row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='system_files'"
+        ).fetchone()
+        if not row:
+            return  # pre-T37 export — nothing embedded to check
+        rec = self.conn.execute(
+            "SELECT body, sha256 FROM system_files WHERE name='host.py'"
+        ).fetchone()
+        if not rec:
+            print(f"[{HOST_NAME}] note: system_files present but no host.py row",
+                  file=sys.stderr)
+            return
+        body, stored = rec
+        # F-03: a corrupt/tampered row with NULL columns must refuse cleanly,
+        # not traceback out of boot() (only HostError is caught in main()).
+        if not isinstance(body, str) or not isinstance(stored, str):
+            raise HostError("corrupt system_files table (body or sha256 is not "
+                            "text) — refusing to boot.")
+        actual = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        self.embedded_host_sha256 = stored
+        if stored != actual:
+            raise HostError(
+                "the embedded host does not match its own recorded hash — "
+                f"recorded sha256 {stored[:16]}…, body hashes to {actual[:16]}…. "
+                "This file was modified after export; refusing to boot. "
+                "Re-export it from a trusted Tables build or obtain a clean copy.")
 
     def _read_manifest(self):
         row = self.conn.execute(
@@ -502,6 +561,37 @@ class Host:
             return json.dumps({"error": str(e)})
 
     # ── UDF: fetch_url ──────────────────────────────────────────────────────
+    def _approve_fetch(self, url):
+        """L3 (D5): per-fetch consent — the keychain permission prompt.
+
+        Returns None to proceed, or an error string to decline. 'a' escalates
+        to free fetches for the rest of this run (self.allow_fetch). Without a
+        TTY there is no one to ask, so fetches fail closed with an actionable
+        error naming the env var — returned as an error envelope (not raised)
+        so the agent can relay it and the loop survives."""
+        if self.allow_fetch:
+            return None  # approval layer disabled (TABLES_ALLOW_FETCH=1)
+        if not sys.stdin.isatty():
+            return ("fetch_url requires interactive approval in this run — no TTY "
+                    "available. Re-run attached to a terminal, or set "
+                    "TABLES_ALLOW_FETCH=1 for unattended fetches.")
+        try:
+            ans = input(f"  ⚠ fetch_url wants to fetch: {url}\n"
+                        f"  [y]es / [N]o / [a]ll for this run: ").strip().lower()
+        except EOFError:
+            return "Fetch declined (no answer)."
+        # F-04: Ctrl+C at the prompt would otherwise be swallowed by CPython's
+        # UDF exception handling into a generic OperationalError — treat it as
+        # an explicit decline so the loop survives and the agent adapts.
+        except KeyboardInterrupt:
+            return "Fetch declined (interrupted by user)."
+        if ans in ("y", "yes"):
+            return None
+        if ans in ("a", "all"):
+            self.allow_fetch = True  # escalate: free fetches for the rest of this run
+            return None
+        return "Fetch declined by the user."
+
     def udf_fetch_url(self, url):
         if not url or not url.strip():
             return json.dumps({"error": "Empty URL"})
@@ -511,6 +601,11 @@ class Host:
             return json.dumps({"error": "Invalid URL"})
         if parsed.scheme not in ("http", "https"):
             return json.dumps({"error": "Only HTTP/HTTPS allowed"})
+        # L3: approval BEFORE the SSRF gate — a garbage URL shouldn't cost a
+        # prompt, and an unapproved good one shouldn't reach the network.
+        declined = self._approve_fetch(url)
+        if declined is not None:
+            return json.dumps({"error": declined})
         host = parsed.hostname or ""
         for pat in _FETCH_BLOCKED:
             if pat.search(host):
@@ -615,6 +710,28 @@ class Host:
             f"  api key       {masked}",
             f"  identity      {identity}",
         ]
+        # T37 (L0/L1): the trust surface — what will execute, and with what egress.
+        if self.embedded_host_sha256:
+            lines.append(f"  host source   embedded, sha256 {self.embedded_host_sha256[:16]}… "
+                         f"(verified against its recorded hash)")
+            # L2 for the CLI: when running from a real file (not exec'd out of
+            # the cartridge), say whether it matches the embedded one.
+            # F-05: binary read — text mode's universal-newline translation would
+            # desync the digest on CRLF checkouts; guard __file__ being None.
+            try:
+                if __file__:
+                    with open(os.path.abspath(__file__), "rb") as f:
+                        disk_sha = hashlib.sha256(f.read()).hexdigest()
+                    if disk_sha != self.embedded_host_sha256:
+                        lines.append(f"  note          running host ({disk_sha[:16]}…) differs from the "
+                                     f"embedded one — exported by another build or modified")
+            except (OSError, NameError, TypeError):
+                pass  # exec'd out of the file (keychain one-liner) — nothing to compare
+        else:
+            lines.append("  host source   not embedded (pre-T37 export)")
+        lines.append(f"  fetch         " + ("approval layer OFF — free fetches (TABLES_ALLOW_FETCH=1)"
+                         if self.allow_fetch
+                         else "approval per fetch [y/N/a] (set TABLES_ALLOW_FETCH=1 for free fetches)"))
         if m.get("recommended_model") and m["recommended_model"] != (self.llm_model or DEFAULT_MODEL):
             lines.append(f"  note          cartridge was exported with model "
                          f"{m['recommended_model']!r} (advisory)")

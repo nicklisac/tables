@@ -23,7 +23,7 @@ function call, so the pure-SQL flagship loop runs natively.
 
 ## Requirements
 
-- Python 3.10+ (stdlib only — `sqlite3`, `urllib`, `json`, `re`)
+- Python 3.10+ (stdlib only — `sqlite3`, `urllib`, `json`, `re`, `hashlib`)
 - A Tables cartridge (the **[export]** button in the web engine produces one)
 - An OpenAI-compatible chat-completions endpoint + API key (Gemini's
   OpenAI-compatible endpoint, Ollama, LM Studio, OpenAI, …)
@@ -51,6 +51,7 @@ config are supplied at boot and never travel in the file.
 | Endpoint   | `--llm-url` | `TABLES_LLM_URL`                                  | *(required)* |
 | Model      | `--model`   | `TABLES_LLM_MODEL`                                | the manifest's `recommended_model`, else `gemini-2.5-flash` |
 | API key    | `--api-key` | `TABLES_LLM_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY` | *(none)* |
+| Fetch      | —           | `TABLES_ALLOW_FETCH=1`                                    | approval per fetch `[y/N/a]` (T37 L3) |
 
 Example with Gemini's OpenAI-compatible endpoint:
 
@@ -63,7 +64,11 @@ python3 host/host.py my-agent.sqlite3 --model gemini-2.5-flash "Hello?"
 
 1. **Shape** — the file must be a Tables database (`sessions`, `messages`,
    `system_config`, `tools` present).
-2. **`_manifest` v1** (stamped by the web engine's export):
+2. **Embedded-host integrity (T37 L1)** — if the cartridge embeds its own
+   host (`system_files.host.py`), the stored sha256 is verified against the
+   body **before any DML runs**; a mismatch (corruption or post-export
+   tamper) refuses boot loudly. Pre-T37 exports (no table) boot with a note.
+3. **`_manifest` v1** (stamped by the web engine's export):
    - `format_version` must be `1`;
    - `engine_min_version` must be ≤ the host version — a newer cartridge is
      **refused loudly** (DCSS major-tag semantics: never silently corrupt);
@@ -72,11 +77,11 @@ python3 host/host.py my-agent.sqlite3 --model gemini-2.5-flash "Hello?"
    - A missing `_manifest` means a pre-manifest **v0** cartridge: it boots
      with a note, and the required-UDF set is derived from the `tools` table
      (exactly as the web engine's import check does).
-3. **Active session restore** (the BUG-017 chain): the stored
+4. **Active session restore** (the BUG-017 chain): the stored
    `active_session_id` if it still exists, else the most recent session, else
    `default`. The context view only serves the active session, so this must
    match where user rows are inserted.
-4. **Stuck-flag clear** — a crashed run can leave `suppress_cascade` /
+5. **Stuck-flag clear** — a crashed run can leave `suppress_cascade` /
    `suppress_capture` at `'1'`, which would silently kill the cascade; boot
    resets both.
 
@@ -89,7 +94,7 @@ masked key, identity/prompt version, tool matrix) before the first turn.
 |--------------------|-------------|-------|
 | `ask_llm`          | full        | OpenAI-compatible chat completions; JSON-in-content protocol (no native function-calling required — works with any compatible endpoint) |
 | `execute_sql`      | **read-only** | `SELECT` / `WITH` / `EXPLAIN` / `PRAGMA`. Writes are refused with a clear error envelope (the loop survives; the agent adapts). |
-| `fetch_url`        | full        | HTTP(S) fetch + HTML→text, SSRF-blocked (loopback/private ranges), 8k-char preview |
+| `fetch_url`        | **gated**   | HTTP(S) fetch + HTML→text, SSRF-blocked (loopback/private ranges), 8k-char preview. **Every call asks for interactive approval** `[y]es/[N]o/[a]ll-for-run` (T37 L3 — the one UDF whose egress destination is model-chosen at runtime). `TABLES_ALLOW_FETCH=1` disables the approval layer; without a TTY, fetches fail closed with an actionable error naming the env var. |
 | `search_web`       | stub        | registered; returns a clear "not in v1" error envelope |
 | `materialize`      | stub        | registered; returns a clear "not in v1" error envelope |
 | `search_documents` | stub        | registered; returns a clear "not in v1" error envelope |
@@ -141,10 +146,23 @@ back-compat, LLM transport-error rollback + next-boot survival, read-only
 gating. A live Gemini probe is included but gated behind
 `RUN_LIVE_PROBE=1` + `GEMINI_API_KEY`.
 
-## Relationship to the web engine and T37
+## Self-booting cartridges (T37)
 
-This loader is deliberately thin and readable: **T37 (self-booting
-cartridges) lifts it into the file itself** — the same boot sequence, with the
-host source stored in a `system_files` table, so a `.sqlite3` literally
-contains its own engine ("agent on a keychain"). Keep new host logic
-self-contained and stdlib-only so that lift stays mechanical.
+The web engine stamps this loader into every export: the source lives in a
+`system_files(name, mime, body, sha256)` table inside the cartridge, with its
+sha256 also published as the additive `_manifest.host_sha256` key — so a
+`.sqlite3` literally contains its own engine ("agent on a keychain"):
+
+```sh
+python3 -c "import sqlite3;exec(sqlite3.connect('C').execute(\"select body from system_files where name='host.py'\").fetchone()[0])" C [message]
+```
+
+The trust model is layered (no crypto in v1 — signing is the follow-up):
+**L0** consent at boot (the report states host hash + fetch mode before any
+turn) · **L1** integrity self-check (step 2 above) · **L3** the per-fetch
+approval layer. Running a cartridge = adopting it: turns write in-place to the
+file you point the host at.
+
+Keep new host logic self-contained and stdlib-only — the in-file copy is
+regenerated from this file at every export, so it must stay exec-clean
+(`__future__` imports after the docstring, `__main__` guard, argv passthrough).

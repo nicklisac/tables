@@ -1178,6 +1178,8 @@ export const INTERNAL_TABLES = new Set([
   'sessions',
   'session_context',
   'system_config',
+  'system_files', // T37: in-file standalone host (class-4 scaffolding — no capture
+                  // triggers, DDL refused, invisible to user-data counts)
   'tools',
   'turn_changesets',
   'turn_ddl_log',
