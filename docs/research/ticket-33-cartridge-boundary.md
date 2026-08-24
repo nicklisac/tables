@@ -1,6 +1,6 @@
 # T33 Research: Cartridge Import (BUG-021) + Engine/Cartridge Boundary
 
-**Date:** 2026-08-23 · **Branch:** `t33-cartridge-boundary` · **Status:** research complete — decisions proposed, pending user lock
+**Date:** 2026-08-23 · **Branch:** `t33-cartridge-boundary` · **Status:** research complete + **decisions locked with user (2026-08-24)**
 **Inputs:** empirical probe (`docs/prototypes/ticket-33-import-probe.mjs`), code inventory at HEAD (`9bd415a`), AGY design review (job `agy-1787544284-2302950`, Gemini 3.7 Flash High), external pattern research (sources in §5), and a second AGY review of this document (job `agy-1787571972-124690`) — verdict FIX-FIRST; all required fixes applied (see Appendix A).
 
 ---
@@ -25,10 +25,12 @@ cartridge state on next boot (agent identity via `prompt_version` mismatch; cont
 boot), and one write path was added after the 2026-08-20 investigation without updating the boundary
 (`fetch_url` tool schema upsert, T35c).
 
-**Proposed direction** (§6–7): lock explicit ownership per surface (cartridge = identity + data;
-host = credentials + model/runtime config), make import a *staged, validated, re-booted* operation
-with a **durable post-import report**, and write a minimal `_manifest` at export time that is cheap
-now and becomes the compatibility contract for the self-booting-cartridge fog item.
+**Locked direction** (§6–9, user-confirmed 2026-08-24): a four-class ownership split (endemic
+data / identity / boot caches / host capabilities) from which D1–D5 are derived; import becomes a
+*staged, validated, re-booted* operation gated by an **export-first warning modal** and ending in a
+**durable post-import report**; export writes the full `_manifest` v1 — the compatibility contract
+that freezes at T33b and is consumed unchanged by the bootstrap engine (T36) and the
+self-booting-cartridge work (T37).
 
 ---
 
@@ -36,9 +38,9 @@ now and becomes the compatibility contract for the self-booting-cartridge fog it
 
 > Probe: fresh browser context per scenario (= fresh IndexedDB + localStorage = "incognito").
 > File System Access API stubbed so the probe controls exactly which bytes the pickers return.
-> CTX-A builds an **"old-build brain"**: a non-default active session (`research-notes`, 3 messages),
+> CTX-A builds an **"old-build Tables database"**: a non-default active session (`research-notes`, 3 messages),
 > custom agent identity (`prompt_version=2`, "You are Rex, a grumpy data butler"), context window
-> `8192`, a dropped engine view (`v_turn_boundaries`), and a user table (`probe_marker`). That brain
+> `8192`, a dropped engine view (`v_turn_boundaries`), and a user table (`probe_marker`). That database
 > is exported via the real [export] button and imported into fresh profiles via the real [import].
 
 ### 2.1 H1 — pre-boot click (CONFIRMED)
@@ -51,11 +53,11 @@ is in flight; `window.__agent` does not exist yet). Clicking [import] in that wi
   the click: `Initializing wa-sqlite JSPI…` — boot's own text, untouched.)
 - Control: the *same click after boot* opens the picker, shows `Importing cartridge…`, and completes
   with `✓ Cartridge imported` in ~100ms.
-- The pre-boot window spans the entire WASM fetch + instantiate + brain-creation phase — on a cold
+- The pre-boot window spans the entire WASM fetch + instantiate + database-creation phase — on a cold
   profile that is many seconds (the probe's gated click landed mid-WASM-fetch; real users clicking
   "as soon as the page looks ready" land somewhere in this window).
 
-**Conclusion:** on a fresh profile (slowest boot: WASM fetch + instantiate + brain creation + all
+**Conclusion:** on a fresh profile (slowest boot: WASM fetch + instantiate + database creation + all
 migrations), any [import] click within the first several seconds is silently discarded. The button
 is never disabled during boot, so there is no affordance telling the user to wait.
 
@@ -129,8 +131,8 @@ re-boot (§7).
 | `tools` rows | seed INSERT OR IGNORE, **but** `migrateToolsTable`: (a) DELETEs malformed-schema rows so boot re-seeds them, (b) **unconditionally upserts the `fetch_url` schema every boot** | **Hybrid** — cartridge wins for user/other tools; engine clobbers `fetch_url` + repairs malformed | `schema.js:1692–1708` | **YES — T35c added the unconditional `fetch_url` upsert** (the 2026-08-20 table said "cartridge wins") |
 | System prompt (`system_config.system_prompt` + `messages` id=0) | `migrateSystemPrompt`: no-op iff `prompt_version == 3`; else overwrites with engine prompt + bumps version | **Hybrid** — same version → cartridge; different → **engine overwrites the agent's identity** | `schema.js:95–112`, `SYSTEM_PROMPT_VERSION = 3` (`schema.js:47`); called at `harness.js:1486` | version bumped 2→3 by T35c (more cartridges will now mismatch) |
 | `effective_context_window` | boot writes the **active profile's** `contextWindow` (or `128000` fallback when unset/invalid) with ON CONFLICT DO UPDATE — every boot | **Local profile clobbers cartridge** (fresh profile → always 128000) | `main.js:630–640`; `loadConfig()` = active profile or `{}` (`main.js:155–157`); seed `schema.js:146` | **YES — T31 changed the source** (flat config → active profile store); fresh-profile behavior unchanged (128000 clobber) |
-| Provider credentials | never written to the brain; localStorage only (`sql-agent-providers`) | **Host** (cartridge-leak invariant) | `provider-store.js` header + no brain writes in `src/` | no |
-| `llm_model` (`system_config`) | seeded at brain creation (`'gemini-2.5-flash'`); **no reader anywhere in `src/`** | **Dead config** — travels in the cartridge, ignored by the engine | seed `schema.js:140`; grep across `src/` shows zero readers | no |
+| Provider credentials | never written to the Tables database; localStorage only (`sql-agent-providers`) | **Host** (cartridge-leak invariant) | `provider-store.js` header + no Tables-database writes in `src/` | no |
+| `llm_model` (`system_config`) | seeded at database creation (`'gemini-2.5-flash'`); **no reader anywhere in `src/`** | **Dead config** — travels in the cartridge, ignored by the engine | seed `schema.js:140`; grep across `src/` shows zero readers | no |
 | Active session on import | import hardcodes `'default'` (`setSessionId` + `setActiveSession` → **DB write**); boot restores stored value via BUG-017 chain (stored → exists? → most recent → default) | **Neither — bug**: the clobber persists, so even the boot-time restore can never recover the cartridge's session | `cartridge.js` `initCartridgeUi`; `main.js:585–607` | no |
 | `documents_fts` virtual table + sync triggers | `CREATE VIRTUAL TABLE IF NOT EXISTS` (stale shape survives if present) + triggers DROP/CREATE | **Engine** for triggers; fts table shape only-if-missing | `schema.js:459–480` | no |
 | `turn_changesets` / `turn_ddl_log` / `compactions` / `tool_approvals` / `dashboard_cards` data | no boot-time writes (only the cards CHECK-constraint migration) | **Cartridge** | — | no |
@@ -184,109 +186,157 @@ the file's engine and whatever runtime boots it.
 
 ---
 
-## 6. Proposed Resolutions for D1–D5 (pending user lock)
+## 6. Ownership Split and D1–D5 Resolutions (locked 2026-08-24)
 
-Framing rule (from §5 + the keychain fog): **cartridge = identity + data (guest); host =
-credentials + model/runtime config.** In the self-booting future the cartridge *is* the agent, so
-its identity must travel with it; the host supplies what only a machine/user can supply.
+The user's three-target constraint — (T1) any export must import into any other web Tables
+session; (T2) any export must boot standalone via a wrapper defined from the cartridge's own
+tables; all targets mutually compatible — forces every surface in the Tables database into
+exactly one of four classes. Each class has one ownership rule, and D1–D5 are *derivations*
+from the split, not independent judgments.
+
+| Class | Surfaces | Rule |
+|---|---|---|
+| **1. Agent state/data — endemic** | user tables, documents + FTS, sessions/messages, turn history/changesets/DDL log/compactions/approvals, dashboard cards (as data), cartridge-defined tools, active-session pointer | Travels complete; **never clobbered** by any host |
+| **2. Agent identity — endemic** | the persona (who the agent is, standing instructions) | Travels; in the standalone future this *is* the agent's self |
+| **3. Boot caches — host-owned** | assembled system-prompt row, `effective_context_window`, built-in tool rows | Host rewrites on every boot from its own parts + config; the stored value is a snapshot of the *exporting* host, never authoritative |
+| **4. Host capabilities — never in the file** | credentials/model config, UDF implementations, agent-loop driver, renderers (dashboard HTML interpreter) | Supplied at boot by whatever machine hosts it; declared as dependencies in `_manifest` |
+
+Two observations that make the split cleaner than it looks:
+
+1. **The trigger architecture already puts most of the "engine" inside the file.** Triggers,
+   views, and FTS sync are self-executing SQL — they travel and run on any SQLite host
+   (Datasette included). So class 4 is narrower than it sounds: a standalone host really only
+   has to supply UDF implementations + a loop driver + credentials.
+2. **Export is the consistency point.** At export, the running engine assembles the prompt (its
+   current scaffolding + the cartridge's persona), snapshots built-in tools, derives
+   `required_udfs` from the tools table, and writes `_manifest`. The file is self-consistent
+   *by construction* — any host honoring the manifest gets a coherent agent. Import into a newer
+   web engine re-derives class 3; standalone uses the exported assembly as-is (validity
+   guaranteed by `engine_min_version`).
 
 ### D1 — System prompt / agent identity → **split scaffolding from persona**
-- **Decision:** separate *runtime scaffolding* (tool-call JSON protocol, trigger-interaction rules,
-  environment notes — engine-owned, always current) from *agent persona* (identity + standing
-  instructions — cartridge-owned). Track customization explicitly (`system_config.prompt_customized`
-  flag or a `persona_prompt` key; AGY's suggestion).
-- **Behavior:** fresh brain → engine installs scaffolding + default persona. Cartridge with
-  unmodified prompt → engine may refresh (scaffolding drift is safe when the user never touched it).
-  Cartridge with **customized** prompt → **cartridge always wins**; on `prompt_version` mismatch the
-  post-import report says so ("Agent identity: custom (v2) — engine is v3; [view] [replace]") and
-  nothing is overwritten silently.
+- **Derivation:** persona = class 2 (endemic); scaffolding = class 3 (engine-owned). The
+  *assembled* prompt — the single string the LLM API takes — is a composition of the two, and
+  the DB row holding it (`messages` role='system', id=0) is a **boot cache**, exactly like D2.
+- **The split in this codebase** (`schema.js:49–93`): persona = the "You are Tables…" identity +
+  Voice section; scaffolding = lines naming engine mechanisms/UDFs (`search_documents`,
+  `ingest_document`, auto-stored documents, turn rewind, compaction summary). A host that hasn't
+  implemented a named UDF must not be told to use it — so scaffolding is *derived per host*
+  (web: from the running build at boot; standalone: frozen at export, validated by
+  `engine_min_version` + `required_udfs`).
+- **Pragmatic v1 cut (byte-stability constraint):** the prompt is kept byte-stable across boots
+  because it is the KV-cache prefix (`schema.js:90–94`, T2). So v1 does *not* re-carve the stock
+  string: keep the stock prompt as the engine's bundle (byte-identical for unmodified databases),
+  add a separate **persona slot** + `prompt_customized` flag on top. Assembly = engine bundle
+  (+ persona overlay when customized). The semantic line between scaffolding and persona inside
+  the stock bundle is deferred until a persona editor ships; until then "customized" means the
+  explicit flag, not fuzzy diffing against stock — the ambiguity today's `prompt_version`
+  mismatch check can't resolve (it can't tell "user edited it" from "exported by an older build").
+- **Behavior:** fresh database → engine installs bundle + empty persona slot. Unmodified →
+  engine may refresh the bundle on version bump. **Customized → cartridge always wins**; on
+  bundle-version mismatch the post-import report says so ("Agent identity: custom (v2) — engine
+  is v3; [view] [replace]") and nothing is overwritten silently.
 - **Storage invariant (AGY review):** whatever shape persona/scaffolding take in `system_config`,
-  boot must keep the *assembled* prompt in `messages WHERE role='system'` (id=0) across all sessions —
-  that row is what `v_active_context` actually feeds the LLM (`schema.js:549–566`). The split is a
-  storage/ownership concern; the view's input stays one assembled string.
-- **Why not keep the current hybrid:** it overwrites a user's agent identity with no notice whenever
-  *any* prompt change ships — the exact surprise that motivated this ticket. T35c just bumped the
-  version (2→3), so every pre-T35c cartridge now hits the clobber path.
+  boot must keep the *assembled* prompt in `messages WHERE role='system'` (id=0) across all
+  sessions — that row is what `v_active_context` actually feeds the LLM (`schema.js:353–387`).
+  The split is a storage/ownership concern; the view's input stays one assembled string.
+- **Why not keep the current hybrid:** it overwrites a user's agent identity with no notice
+  whenever *any* prompt change ships — the exact surprise that motivated this ticket. T35c just
+  bumped the version (2→3), so every pre-T35c cartridge now hits the clobber path.
 
 ### D2 — `effective_context_window` → **host owns; the key is a pure runtime cache**
-- **Decision:** it is a property of the host's chosen model/endpoint, not portable agent data. The
-  stored value is a **non-authoritative runtime cache** written by boot on every load from the host
-  profile (or fallback) — and it stays that way: boot keeps overwriting it (no behavior change).
-- **Correction of my earlier lean (caught in AGY review):** I originally proposed "stop clobbering
-  with the 128000 fallback; let the cartridge's value serve as the working default." That is wrong:
-  `resolveContextWindow` (`compaction.js:72–79`) treats any stored value ≠ 128000 as an explicit user
-  override that beats the cloud-model lookup — so a cartridge exported from an 8k local model would
-  silently force a host's Gemini to compact at 8,192 tokens. The cartridge's window value is a
-  property of *its* host; on import it is simply replaced by the host's resolution, and the
-  post-import report says so ("Context window: 128000 (host model) — the cartridge's 8192 belonged
-  to its own host"). No `resolveContextWindow` change needed for v1 as long as boot keeps writing.
-- **Fog alignment:** unchanged in the keychain future — credentials + model config are host-side on
-  every tier (web/WASM, Node, Python, Datasette).
+- **Derivation:** class 3/4 boundary case — a property of the host's chosen model/endpoint, not
+  portable agent data. A standalone host brings its own model config at boot (the keychain split:
+  file = agent, key = where you plug it in); same rule on every tier.
+- Boot keeps overwriting it from the host profile (or fallback) on every load — and *must*:
+  `resolveContextWindow` (`compaction.js:72–79`) treats any stored value ≠ 128000 as an explicit
+  user override that beats the cloud-model lookup, so a cartridge exported from an 8k local model
+  would silently force a host's Gemini to compact at 8,192 tokens. On import it is simply replaced
+  by the host's resolution, and the post-import report says so ("Context window: 128000 (host
+  model) — the cartridge's 8192 belonged to its own host"). No `resolveContextWindow` change
+  needed for v1 as long as boot keeps writing.
 
 ### D3 — Active session on import → **restore via BUG-017 chain**
-- **Decision:** no controversy. Import restores the cartridge's `active_session_id` with the same
-  fallback chain boot uses (stored → exists? → most recent → `default`). The hardcoded `'default'`
-  goes away.
+- **Derivation:** class 1 — it's the agent's state ("where I was"), not host config.
+- Import restores the cartridge's `active_session_id` with the same fallback chain boot uses
+  (stored → exists? → most recent → `default`). The hardcoded `'default'` goes away.
 
 ### D4 — Tool versioning → **provenance split, not one version key**
-- **Decision:** add `is_builtin` to `tools`. Engine-managed built-ins: migrated/refreshed by the
-  running build (generalizes today's ad-hoc `fetch_url` upsert into a principled rule). User/
-  cartridge-defined tools (`is_builtin = 0`): travel untouched, never clobbered. In the keychain
-  future, missing host capabilities are checked against `_manifest.required_udfs`, not by mutating
-  the tool table.
-- **Import-time capability check (AGY review):** tool rows are *schemas only* — execution depends on
-  JS UDFs registered by the host (`harness.js:870–1445`). A cartridge can carry a tool whose UDF the
-  importing host doesn't implement → cascade failure at execution time. Import must validate
-  `tools` against `_manifest.required_udfs` (or, v1-lite: against the host's registered-UDF set)
-  and surface gaps in the report rather than letting them explode mid-cascade.
+- **Derivation:** tool rows are class 1 *spec* (the agent's capability contract); UDF
+  implementations are class 4.
+- Add `is_builtin` to `tools`. Engine-managed built-ins: migrated/refreshed by the running build
+  (generalizes today's ad-hoc `fetch_url` upsert into a principled rule). User/cartridge-defined
+  tools (`is_builtin = 0`): travel untouched, never clobbered.
+- **Import-time capability check (AGY review):** tool rows are *schemas only* — execution depends
+  on JS UDFs registered by the host (`harness.js:870–1445`). A cartridge can carry a tool whose
+  UDF the importing host doesn't implement → cascade failure at execution time. Import must
+  validate `tools` against `_manifest.required_udfs` (or, v1-lite: against the host's
+  registered-UDF set) and surface gaps in the report rather than letting them explode mid-cascade.
 - **Also:** keep the T16 malformed-row repair (it's a safety fix, and it only touches rows that
   would break every turn).
 
 ### D5 — `llm_model` → **advisory hint**
-- **Decision:** stop treating it as config. Surface it in the post-import report ("Exported with
-  model: X — current profile: Y") and keep writing it at export (cheap, useful metadata); never
-  auto-switch host profiles on its account. (OCI-Cmd precedent: a default the runtime may ignore.)
+- **Derivation:** provenance metadata about the exporting host — same class as D2 but weaker: not
+  even a cache, just "what the other side was using."
+- Stop treating it as config. Surface it in the post-import report ("Exported with model: X —
+  current profile: Y") and keep writing it at export (cheap, useful metadata); never auto-switch
+  host profiles on its account. (OCI-Cmd precedent: a default the runtime may ignore.)
 
-### Cross-cutting: `_manifest` (cheap now, contract later)
-- **Decision:** write a `_manifest` table at **export** time: `format_version`, `engine_min_version`,
-  `cartridge_id` (stable per brain), `created_at`, plus JSON blobs for `required_udfs` and
-  host-facing metadata (prompt version, recommended model = today's `llm_model`). Import reads it:
+### Cross-cutting: `_manifest` — **the compatibility contract (load-bearing for T36)**
+- **Derivation:** class 4 dependencies must be *declared* somewhere a host can read before it
+  commits to booting. That's the manifest.
+- Written at **export** time: `format_version`, `engine_min_version`, `cartridge_id` (stable per
+  Tables database), `created_at`/`exported_by`, JSON blobs for `required_udfs` (derived from the
+  tools table) and `optional_features` (e.g. `dashboard_html` — the dashboard renderer is a host
+  capability; hosts that don't implement it treat cards as inert data), plus host-facing metadata
+  (prompt version, recommended model = today's `llm_model`).
+- Import reads it:
   - missing table → treat as `format_version 0` (pre-manifest cartridge): import proceeds with a
     note in the report (back-compat);
-  - `engine_min_version` above current engine → **refuse loudly** (DCSS-major-tag semantics) with an
-    explanation, no partial state;
-  - below/equal → proceed; future migrations key off `format_version`.
-- This is the same table the self-booting hosts will read — building it now means the fog item
-  starts from a working contract instead of inventing one under time pressure.
+  - `engine_min_version` above current engine **or** a missing *required* UDF → **refuse loudly**
+    (DCSS-major-tag semantics) with an explanation, no partial state;
+  - below/equal + required satisfied → proceed; missing *optional* features degrade silently
+    (surfaced in the report).
+- **The shape freezes at T33b.** The bootstrap engine (T36) consumes this contract without
+  changing it — if T36 finds a missing field, that's a T33b bug to fix before T36 starts, not a
+  silent v2. Building it now means the self-booting-cartridge fog item (T37) starts from a working
+  contract instead of inventing one under time pressure.
 
 ---
 
-## 7. Proposed Implementation Plan (phased — no code shipped yet)
+## 7. Implementation Plan (locked 2026-08-24; phased — no code shipped yet)
 
-> Constraint honored: every phase is compatible with the §6 decisions *as proposed*; if the user
-> locks different decisions, only Phase 2's clobber rules change shape. Nothing here depends on the
-> keychain fog landing first, and nothing blocks it.
+> Constraint honored: every phase implements the §6 decisions as locked (2026-08-24). Nothing
+> here depends on T36/T37 landing first, and nothing blocks them.
 >
 > **Ordering constraint (AGY):** D1/D2 must be locked *before* Phase 1 ships end-to-end — once
 > import ends in a canonical boot, the clobber rules fire immediately at import time, so shipping
 > Phase 1 with today's hybrid clobber would make identity/window overwrites happen on every import
-> of an older-build brain. (Not worse than today's reload-after-import behavior — but it should be
+> of an older-build Tables database. (Not worse than today's reload-after-import behavior — but it should be
 > the *new* rules that users first see.)
 
-**Phase 0 — Stop the bleeding (UX contract; no boundary changes)**
-1. Boot-gate [import]/[export]: disabled until `window.__agent.ready` (or a click before ready
+**Phase 0 — Stop the bleeding (ticket T33a; UX contract, no boundary changes)**
+1. **Import warning modal with export-first offer (user decision 2026-08-24):** when a cartridge
+   file is picked for import, before anything runs: warn that import replaces the entire current
+   Tables database (all conversations, tables, and dashboards overwritten). Options:
+   **[Export current Tables, then import]** — triggers existing `exportCartridge()`
+   (`cartridge.js:118`), download starts, then proceeds; **[Import without exporting]** — second
+   explicit overwrite confirmation, then proceeds; **[Cancel]**. The backup is itself a
+   re-importable cartridge — "undo" = re-import my backup; zero new storage or restore code.
+   Reused at the staged-flow entry point in T33b (same component, different call site).
+2. Boot-gate [import]/[export]: disabled until `window.__agent.ready` (or a click before ready
    queues + tells the user "engine is initializing…"). Kills H1.
-2. File-header guard: first 16 bytes ≠ `SQLite format 3\0` → immediate clear error ("this is a
+3. File-header guard: first 16 bytes ≠ `SQLite format 3\0` → immediate clear error ("this is a
    .sql text export / not a cartridge"), no 3s flash. Kills H3's confusion.
-3. Durable outcomes: replace the 3s status flash with a dismissible **post-import report** panel
+4. Durable outcomes: replace the 3s status flash with a dismissible **post-import report** panel
    (what came over: sessions/messages/cards/tables; what the engine redefined; credential state).
    Cancel = quiet reset (no fake error). Every path produces a visible, persistent-or-dismissed
-   outcome.
+   outcome. Status model must be extensible — T33b adds staged states on top.
 
 **Phase 1 — Staged, validated import + canonical re-boot**
 4. Import pipeline (AGY's flow): deserialize to `:memory:` staging DB → `PRAGMA quick_check` →
-   brain-shape check (`sessions`+`messages`+`system_config` present; read `_manifest`) → optional
-   pre-import snapshot of the live brain (IDB sidecar, enables "undo import") → backup staged→live →
+   Tables-database shape check (`sessions`+`messages`+`system_config` present; read `_manifest`) →
+   swap staged→live →
    **canonical boot** on the result. Kills the staleness window + AGY H6/H7 structurally.
 5. D3: restore active session via BUG-017 chain (inside the re-boot).
 
@@ -326,7 +376,28 @@ its identity must travel with it; the host supplies what only a machine/user can
 10. Export writes `_manifest`; import validates per §6 (refuse-loud on hard mismatch); report shows
     manifest fields. (Back-compat: no table = v0, proceed.)
 
-**Explicitly deferred (fog items, not T33):** cartridge identity/isolation as a *guest namespace*
+**Ticket sequence (locked 2026-08-24 — sequential, each designed with the next in mind):**
+- **T33a = Phase 0.** Ships alone. Verifiable: every BUG-021 failure mode from the probe
+  (H1/H2/H3/H4) becomes loud + durable UX; overwrite requires explicit consent. Forward
+  constraint: status model extensible — T33b adds staged states on top.
+- **T33b = Phases 1–3, coupled.** Verifiable: importing an older-build Tables database ends in a
+  canonical boot under the new rules; identity never silently clobbered; report surfaces every
+  replace/refuse. Forward constraint: `_manifest` v1 shape freezes here (export = consistency
+  point); T36 must consume it unchanged — a missing field found by T36 is a T33b bug fixed before
+  T36 starts, not a silent v2.
+- **T36 — Bootstrap engine v1 (Python-first, user decision 2026-08-24):** thin standalone loader
+  that reads `_manifest`, checks `engine_min_version`/`required_udfs`, registers the required
+  UDFs, runs the agent loop against the cartridge file; credentials + model config supplied at
+  boot (keychain split: file = agent, key = where you plug it in). Dashboard cards inert by design
+  (optional feature unimplemented). Verifiable: a T33b export boots standalone; multi-turn
+  conversation with tool calls round-tripping through UDFs; identity matches the web session's
+  persona. The Datasette `prepare_connection` path remains the validated alternative. Forward
+  constraint: keep it thin and readable — T37 lifts it into the in-file host.
+- **T37 — Self-booting cartridge (fog item proper):** wrapper lives *in* the file
+  (`system_files`); trust model first (signing, capability negotiation, guest isolation) — design
+  doc before code. T36's loader is the reference semantics for what an in-file host does.
+
+**Explicitly deferred (fog items, not T33/T36/T37):** cartridge identity/isolation as a *guest namespace*
 (per-cartridge IDB), sandboxed boot profile / permission prompts, signing/trust model, the
 cartridge→self-contained-`.html` build step. T33's `_manifest` is designed to be their substrate.
 
@@ -334,40 +405,42 @@ cartridge→self-contained-`.html` build step. T33's `_manifest` is designed to 
 
 ## 8. Verification Plan (for when implementation starts)
 
-- **Playwright round-trip spec** (the regression guard): profile A builds a brain (custom session,
+- **Playwright round-trip spec** (the regression guard): profile A builds a Tables database (custom session,
   custom prompt, user table, card) → export → fresh profile B imports → assert: sessions/messages/
   cards present, active session restored (D3), identity preserved (D1), report panel rendered with
   correct contents, credential banner shown when unconfigured.
 - **Pre-boot click spec:** click [import] before `ready` → button is disabled or the gate message
   appears; no silent discard (H1 guard).
 - **Bad-file spec:** `.sql` dump + random bytes → immediate clear error, no destructive replace.
-- **Staleness spec:** import a brain with a mutated trigger → immediately after import, a turn runs
+- **Staleness spec:** import a Tables database with a mutated trigger → immediately after import, a turn runs
   the *current* build's cascade (re-boot happened) — mixed-build window is gone.
-- **Undo spec:** pre-import snapshot restores the prior brain on "undo import."
+- **Import-consent spec:** picking a cartridge shows the warning modal; [Export current Tables,
+  then import] triggers the download and proceeds; [Import without exporting] requires the second
+  confirmation; [Cancel] leaves state untouched.
 - **Manifest specs:** v0 (no table) imports; above-min engine refused loudly; matching proceeds.
 - Full suite green + AGY review pass (sign-off standard).
 
 ---
 
-## 9. Open Questions for the User (morning decisions)
+## 9. Decisions (locked 2026-08-24 with user)
 
-1. **D1 shape:** scaffolding/persona split with a `prompt_customized` flag — or keep one prompt and
-   just add "custom prompts are never clobbered" (simpler, but engine can't refresh scaffolding in
-   old brains)?
-2. **Pre-import snapshot + undo:** worth the IDB sidecar complexity now, or defer to a follow-up?
-   (AGY recommends it; it's the only "destructive operation with a safety net" piece.)
-3. **`_manifest` v1 scope:** full table now (§6) or just `format_version` + `engine_min_version` and
-   add the rest when the keychain ticket starts? (Recommendation: full — it's ~20 lines at export
-   time and the report UI wants the fields anyway.)
-4. **Refuse-loud threshold:** what counts as a hard mismatch for v1 — only `engine_min_version`, or
-   also "cartridge has tables the engine doesn't know how to migrate"? (Recommendation: min-version
-   only; unknown user tables are *data*, they're fine.)
-5. **T33 scope split (reframed per AGY review):** Phase 0 (UX guards: boot-gating, header check,
-   durable status) is a self-contained emergency fix that ships *without* changing any boundary
-   behavior — candidate for an immediate ticket 33a. Phases 1–3 (staged import + re-boot + D1/D2/
-   D4/D5 + `_manifest`) must ship **coupled** — Phase 1's re-boot wiring cannot land before the D1/D2
-   clobber rules, or every import of an older-build brain would immediately overwrite its identity.
-   So: **33a = Phase 0; 33b = Phases 1–3.** Agree with this split?
+1. **D1 shape:** full scaffolding/persona split, pragmatic v1 cut — stock bundle byte-stable +
+   persona slot + `prompt_customized` flag (§6/D1).
+2. **Pre-import safety:** NOT an IDB sidecar snapshot — **import warning modal with export-first
+   offer**, in T33a (user's design; the exported backup is itself a re-importable cartridge, so
+   "undo" = re-import my backup).
+3. **`_manifest` v1 scope:** full table at T33b (`required_udfs` + `optional_features` are
+   load-bearing for T36, not report cosmetics).
+4. **Refuse-loud threshold:** `engine_min_version` exceeded OR missing *required* UDF → refuse;
+   unknown user tables are fine (they're data); missing *optional* features degrade silently with
+   a report line.
+5. **Ticket split:** T33a = Phase 0 (ships alone); T33b = Phases 1–3 coupled; T36 = bootstrap
+   engine v1 (**Python-first**); T37 = self-booting cartridge (fog, design doc first). Sequential,
+   each carrying the forward constraints in §7.
+6. **Terminology:** Tables (proper noun) / Tables database — "brain" is banned from user-facing
+   surfaces (audit 2026-08-24: no user-facing occurrences exist; the persisted identifier
+   `agent_brain.sqlite3` stays — renaming would orphan existing users' data). Recorded in
+   `CONTEXT.md`.
 
 ---
 
@@ -381,7 +454,7 @@ cartridge→self-contained-`.html` build step. T33's `_manifest` is designed to 
   never fires `onchange`, so the import handler would hang on "Importing cartridge…" forever (minor,
   FSA-less browsers only).
 - "Import ends with a full re-boot: yes, but only if boot is made cartridge-aware" — the ordering
-  constraint now explicit in §7 + open question 5.
+  constraint now explicit in §7 + §9 decision 5.
 - UX contract: boot gating, header guard, no disappearing toasts for major state changes, durable
   post-import report with credential banner.
 - D4 provenance split (`is_builtin`) over a single version key; D1 scaffolding/persona split; D2
@@ -404,12 +477,12 @@ cartridge→self-contained-`.html` build step. T33's `_manifest` is designed to 
   confirmed `bootAgent()` non-re-entrancy with specific evidence (unguarded listener attachment in
   grid-ui.js:43–58 + explorer-ui.js:38–99; stale event-stream reader; unclosed handle / VFS
   contention; in-flight turn quiescence). v1 = C (`location.reload()`).
-- **Ticket split reframed (open question 5):** 33a = Phase 0 emergency UX fix (ships alone, no
+- **Ticket split reframed (§9 decision 5):** 33a = Phase 0 emergency UX fix (ships alone, no
   boundary changes); 33b = Phases 1–3 coupled (re-boot wiring cannot precede D1/D2 clobber rules).
 
 ## Appendix B — Probe assets
 
 - `docs/prototypes/ticket-33-import-probe.mjs` — the probe (rerunnable: `node docs/prototypes/ticket-33-import-probe.mjs`, dev server on :5174; ~8 min cold).
 - `test-results/t33-import-probe-report.json` — machine-readable results (gitignored; key data inlined in §2).
-- `test-results/t33-cartridge-A.sqlite3` — the exported "old-build brain" used by the probe.
+- `test-results/t33-cartridge-A.sqlite3` — the exported "old-build Tables database" used by the probe.
 - `test-results/t33-post-import.png` / `t33-post-reload.png` — visual evidence of the empty-chat symptom.
