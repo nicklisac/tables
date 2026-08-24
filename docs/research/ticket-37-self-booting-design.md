@@ -1,6 +1,6 @@
 # T37 Design: Self-Booting Cartridges — In-File Host + Trust Model
 
-**Status:** DRAFT for user decision (2026-08-24) — branch `t37-self-booting-cartridges`
+**Status:** DECISIONS LOCKED (2026-08-24, all D1–D8 confirmed by user) — Phase A ready
 **Depends on:** T36 ✅ (`485ceec`) — its committed `host/host.py` is the reference semantics
 **Source:** fog entry "Agent on a Keychain" (2026-08-20/21); four-class split research doc §6
 
@@ -17,8 +17,9 @@ python3 -c "import sqlite3;exec(sqlite3.connect('C').execute(\"select body from 
 ```
 
 This ticket makes that a **product**: the web engine stamps the host into every export,
-the host verifies itself at boot, network capability is gated, and guest cartridges run
-on working copies so the original artifact is never mutated.
+the host verifies itself at boot, and every `fetch_url` call asks for approval in the runner
+(free fetches via `TABLES_ALLOW_FETCH=1`). Running a cartridge = adopting it — in-place
+writes are the semantics (D6 dropped).
 
 **Non-goals (v1):** cryptographic author signing (→ fog/v2, §7); Node `host.cjs` dual-host
 and Datasette tier (validated alternatives, stay documented — §6); writes/rewind/compaction
@@ -100,17 +101,19 @@ All additive to T36's boot sequence:
 1. **Self-check (§5, L1):** after opening, if `system_files` exists, verify
    `sha256(body of 'host.py') == stored sha256`. Mismatch → refuse to exec (corruption or
    tamper); print both hashes. Absent table → pre-T37 export, boot as today with a note.
-2. **Capability gate (§5, L3):** `fetch_url` registers as a **stub by default**; the real
-   implementation activates only with `--allow-fetch` (flag) or `TABLES_ALLOW_FETCH=1`
-   (env). The boot report says which mode is active. This is the "keychain permission
-   prompt" — the one capability that reaches beyond the LLM endpoint itself.
-3. **Guest mode (§4):** new `--copy [PATH]` flag → open original `?mode=ro`,
-   `VACUUM INTO` a working copy (default path: `<name>.work.sqlite3` beside the original),
-   run all turns against the copy, and say so in the boot report + exit summary. Default
-   (no flag) stays in-place — your own cartridge on your machine.
-4. **Provenance report (§5, L0):** the existing `report()` gains the host sha256 line and
-   the fetch-mode line; it is printed before any turn runs (already true — formalized as the
-   consent surface).
+2. **Fetch approval layer (§5, L3 — user-locked 2026-08-24):** every `fetch_url` call
+   prompts in the runner: `⚠ fetch_url wants to fetch: <url>  [y]es / [N]o / [a]ll for this run`
+   (default N — fail-closed on Enter; `a` escalates to free fetches for the rest of the run,
+   npm-style). No TTY (single-message / piped runs) → fail-closed with an actionable error
+   naming the env var. **`TABLES_ALLOW_FETCH=1` disables the approval layer entirely**
+   (free fetches — unattended/batch use; user-locked: "an approve layer in the runner for
+   fetch that can be turned off for free fetches whenever, in env"). The boot report states
+   which mode is active. Rationale over a boot-time flag: per-action consent matches T17's
+   human-in-the-loop pattern (the web engine already approves writes this way) and keeps the
+   capability visible per use instead of granted once at boot.
+3. **Provenance report (§5, L0):** the existing `report()` gains the host sha256 line and
+   the fetch-approval-mode line; it is printed before any turn runs (already true —
+   formalized as the consent surface).
 
 ### 3.4 Web import trust surface (`src/cartridge.js` + report)
 
@@ -125,19 +128,16 @@ report gains one line:
 
 Warning banner on mismatch; **not** a refusal (D7).
 
-## 4. Guest isolation — working-copy semantics
+## 4. Guest isolation — DROPPED (user decision, 2026-08-24)
 
-The T36 demo wrote the turn into the ORIGINAL file: fine for your own cartridge, wrong for a
-guest's artifact. Decision shape:
-
-- **CLI:** `--copy [PATH]` (opt-in; default in-place). Mechanism verified (§2.2):
-  `sqlite3.connect('file:C?mode=ro', uri=True)` → `VACUUM INTO 'C.work.sqlite3'` → close RO
-  handle → open the copy read-write and proceed with T36's boot unchanged. The original is
-  opened read-only for its entire life in guest mode; no sidecar files touch it.
-- **Web:** already guest-safe by construction — import deserializes into a staging `:memory:`
-  DB and swaps into IDB; the file on disk is never written. Nothing to do.
-- **Export convergence:** re-exporting a working copy through the web engine produces a clean
-  artifact again (staging stamp refreshes host + manifest) — the loop closes.
+No working-copy mode, no `--copy` flag: **running a cartridge = adopting it.** User's words:
+"if a user is using the agent then it is their agent. open it and run it. close it. put it in
+another harness. shouldn't matter." In-place writes are the semantics, full stop — the file you
+point the host at is yours to mutate from that moment on (the natural move is to copy the file
+*before* running if you want a pristine original; that's an OS-level choice, not a host
+feature). The §2.2 `mode=ro` + `VACUUM INTO` probe stays in this doc as a verified fact for
+the fog (isolation becomes meaningful again once v2 signing distinguishes authorship), but no
+code ships for it in v1.
 
 ## 5. Trust model (v1) — layered, no crypto
 
@@ -150,7 +150,7 @@ with an explicit job:
 | **L0 Consent at boot** | Provenance report printed before any turn: host version + sha256, cartridge id, tools real/stubbed, fetch mode, LLM endpoint | Human sees exactly what will execute and with what capability | ~free (report exists) |
 | **L1 Integrity self-check** | `sha256` column on `system_files`; host verifies its own body before exec; refuse-loud on mismatch | Accidental corruption; casual tamper (hash not recomputed) | stdlib `hashlib`, trivial |
 | **L2 Drift vs known-good anchor** | Web import compares embedded hash to the build-bundled host's hash → report line + banner; CLI prints its hash for manual comparison, optional `--verify-host <sha256>` pin | "This file changed after export" — the anchor lives in *your engine*, not the file (non-circular) | one compare per import |
-| **L3 Capability gating** | `fetch_url` stub-by-default; `--allow-fetch` / env to enable; report states the mode | Prompt-injected local-network probing; unexpected egress from a guest cartridge | one flag |
+| **L3 Fetch approval layer** | per-fetch interactive consent (`y/N/a`), fail-closed without TTY; `TABLES_ALLOW_FETCH=1` = free fetches; report states the mode | Prompt-injected local-network probing; unexpected egress from a guest cartridge — each exfil attempt is a visible prompt the user can deny | one input() in the UDF |
 
 **What v1 does NOT catch (stated, not hidden):** an attacker with write access to the file
 can replace `body` *and* recompute `sha256` — L1/L2 then pass. That is the malware case, and
@@ -179,15 +179,17 @@ already signing-ready: a v2 signature would be a new manifest key over exactly t
 - **D3 Additive manifest key `host_sha256`** (freeze-safe per §2.3; T36 ignores unknown keys).
   *(lean: yes)*
 - **D4 Trust model v1 = L0+L1+L2+L3, no cryptographic signing in v1** — signing is fog/v2,
-  contract made signing-ready by `host_sha256` + `system_files`. **← confirm**
-- **D5 `fetch_url` off-by-default in the standalone host** (`--allow-fetch` / env to enable).
-  This changes T36's shipped behavior (it was on) — framed as the trust fix this ticket is
-  scoped to make. **← confirm**
-- **D6 Guest isolation = opt-in `--copy [PATH]` working copy; default in-place.** Alternative:
-  always-copy (safer, slower for big files, and it breaks the "run my own cartridge" keychain
-  UX). **← confirm**
-- **D7 Web import surfaces drift as a report line + warning banner, never a refusal** (the web
-  tier doesn't execute the embedded host). **← confirm**
+  contract made signing-ready by `host_sha256` + `system_files`. ✅ LOCKED (user, 2026-08-24)
+- **D5 Fetch approval layer in the runner** (per-fetch `y/N/a`, fail-closed without TTY;
+  `TABLES_ALLOW_FETCH=1` = free fetches). Replaces the original off-by-default flag proposal
+  at the user's revision — per-action consent over boot-time capability grant. ✅ LOCKED (user, 2026-08-24)
+- **D6 Guest isolation: DROPPED** — running a cartridge = adopting it; in-place always.
+  The `mode=ro` + `VACUUM INTO` mechanism stays documented (§2.2/§4) for the fog. ✅ LOCKED (user, 2026-08-24)
+- **D7 Web import surfaces drift as a report line + warning banner, never a refusal** —
+  two-tier check: (a) embedded hash vs build hash = drift → soft warning (version skew is the
+  common harmless case; the web tier never executes the embedded host); (b) stored sha256 vs
+  computed hash of the body = internal inconsistency → strong warning (unambiguous
+  tamper/corruption). Re-export self-heals drift (staging stamp refreshes). ✅ LOCKED (user deferred to lead, 2026-08-24)
 - **D8 v1 embeds Python only; Node/Datasette stay fog.** *(lean: yes)*
 
 ## 8. Implementation plan (after decisions lock)
@@ -196,10 +198,11 @@ already signing-ready: a v2 signature would be a new manifest key over exactly t
 manifest key + report line (§3.4). Tests: stamped export carries a valid `system_files` row
 whose sha256 matches the build source; manifest key present; pre-T37 imports still work.
 
-**Phase B — host (CLI):** self-check, fetch gate, `--copy`, report lines (§3.3). Tests via
-the T36 spec pattern (Node spawns `python3`): corrupted body → refuse; clean body → boots;
-fetch stubbed without flag / real with flag; `--copy` leaves original byte-identical
-(hash-compare) and the copy carries the new turn.
+**Phase B — host (CLI):** self-check, fetch approval layer (`y/N/a`, fail-closed no-TTY,
+`TABLES_ALLOW_FETCH=1` bypass), report lines (§3.3). Tests via the T36 spec pattern (Node
+spawns `python3`): corrupted body → refuse; clean body → boots; piped run + fetch attempt →
+fail-closed error naming the env var; `TABLES_ALLOW_FETCH=1` → fetch succeeds; TTY run with
+`y` → fetch proceeds, `N` → refused (piped stdin can simulate the prompt).
 
 **Phase C — verification + sign-off:** keychain one-liner on a freshly stamped export (the
 headline demo); guest-mode probe (original untouched, turn lands in copy); full suite green;
