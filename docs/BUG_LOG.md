@@ -203,7 +203,7 @@ This document tracks known issues, edge cases, and improvements to be addressed 
 ---
 
 ### BUG-021: Cartridge Import Appears to Do Nothing (Fresh / Incognito Profile)
-- **Status**: **Open / Under investigation — spec written (2026-08-20), fix not started.** Full investigation + boundary analysis: `docs/WAYFINDER_MAP.md` ("Ticket 33: Cartridge Import Does Nothing (BUG-021) + Engine/Cartridge Boundary Hardening").
+- **Status**: **Being worked as Ticket 33a (2026-08-24)** — Phase 0 UX contract implemented on `t33a-import-ux` (H1 boot-gate, H2 credential banner, H3 header guard, H4 durable post-import report, consent modal with export-first offer); full suite green. Remaining boundary work (D1–D5, staged import + re-boot, `_manifest`) is T33b. Full investigation + boundary analysis: `docs/WAYFINDER_MAP.md` ("Ticket 33") and `docs/research/ticket-33-cartridge-boundary.md`.
 - **Reported**: User feedback (2026-08-20) — exported a cartridge in a normal window, imported it in an incognito window (fresh profile): "basically nothing happened."
 - **Component**: `src/cartridge.js` (import handler + `importCartridge`), `src/main.js` (boot-time config overrides), `src/schema.js` (`migrateSystemPrompt`)
 - **Description**: Export a cartridge from a normal window; in a fresh incognito profile, click [import] and pick the exported file. No visible change, no obvious error.

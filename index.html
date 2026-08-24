@@ -31,14 +31,15 @@
             <circle cx="12" cy="12" r="3"></circle>
           </svg><span class="btn-label">config</span><span class="btn-bracket">]</span>
         </button>
-        <button type="button" id="btn-export" class="btn-header" title="Export database as .sqlite3 cartridge">
+        <!-- T33a (BUG-021/H1): boot-gated — disabled until the engine is ready (enableCartridgeButtons in main.js). -->
+        <button type="button" id="btn-export" class="btn-header" title="Export database as .sqlite3 cartridge" disabled>
           <span class="btn-bracket">[</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon-header">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
             <polyline points="7 10 12 15 17 10"></polyline>
             <line x1="12" y1="15" x2="12" y2="3"></line>
           </svg><span class="btn-label">export</span><span class="btn-bracket">]</span>
         </button>
-        <button type="button" id="btn-import" class="btn-header" title="Import a .sqlite3 cartridge">
+        <button type="button" id="btn-import" class="btn-header" title="Import a .sqlite3 cartridge" disabled>
           <span class="btn-bracket">[</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon-header">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
             <polyline points="17 8 12 3 7 8"></polyline>
@@ -500,6 +501,62 @@
             <button type="submit" id="table-create-submit" class="btn-primary">[Create Table]</button>
           </div>
         </form>
+      </div>
+    </div>
+
+    <!-- T33a (BUG-021): import consent — warning + export-first offer, then overwrite confirmation. -->
+    <div id="import-warning-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="import-warning-title">
+      <div class="modal-card modal-card-medium">
+        <div class="modal-header">
+          <h3 id="import-warning-title">Import cartridge?</h3>
+          <button type="button" class="modal-close-btn" id="import-warning-close" title="Cancel import">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div id="import-warning-step1">
+            <p>Importing replaces the <strong>entire current Tables database</strong> — all conversations, data tables, and dashboards will be overwritten.</p>
+            <p class="import-warning-sub">A backup export is itself a re-importable cartridge: re-import it later to undo.</p>
+          </div>
+          <div id="import-warning-step2" hidden>
+            <p><strong>No backup was exported.</strong> Importing will permanently overwrite your current Tables database.</p>
+          </div>
+        </div>
+        <div class="modal-actions" id="import-warning-actions1">
+          <button type="button" id="import-warn-export-first" class="btn-primary">[Export current Tables, then import]</button>
+          <button type="button" id="import-warn-skip" class="btn-secondary">[Import without exporting]</button>
+          <button type="button" id="import-warn-cancel" class="btn-secondary">[Cancel]</button>
+        </div>
+        <div class="modal-actions hidden" id="import-warning-actions2">
+          <button type="button" id="import-warn-overwrite" class="btn-primary">[Overwrite anyway]</button>
+          <button type="button" id="import-warn-back" class="btn-secondary">[Back]</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- T33a (BUG-021/H4): durable post-import report — replaces the 3s status flash.
+         Data-driven shape ({title, lines, banner}) is the extension point for T33b's staged states. -->
+    <div id="import-report-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="import-report-title">
+      <div class="modal-card modal-card-medium">
+        <div class="modal-header">
+          <h3 id="import-report-title">Cartridge imported</h3>
+          <button type="button" class="modal-close-btn" id="import-report-close" title="Dismiss report">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <ul id="import-report-lines" class="import-report-lines"></ul>
+          <div id="import-report-banner" class="import-report-banner hidden"></div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="import-report-dismiss" class="btn-primary">[Dismiss]</button>
+        </div>
       </div>
     </div>
 

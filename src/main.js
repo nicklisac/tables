@@ -21,7 +21,7 @@ import {
   COMPACTION_THRESHOLD, FALLBACK_WINDOW,
 } from './compaction.js';
 import { rewindToBefore, initRewindUi } from './rewind.js';
-import { initCartridgeUi } from './cartridge.js';
+import { initCartridgeUi, enableCartridgeButtons } from './cartridge.js';
 import { initCsvUi } from './csv-ingestion.js';
 import * as gridUi from './grid-ui.js';
 import * as gridEngine from './grid.js';
@@ -700,6 +700,7 @@ async function bootAgent() {
 
     updateReadyStatus();
     window.__agent.ready = true;
+    enableCartridgeButtons(); // T33a (H1): [import]/[export] are boot-gated
     inputEl.disabled = false;
     sendBtn.disabled = false;
     inputEl.focus();
@@ -1095,6 +1096,14 @@ initCartridgeUi({
   getAgent: () => agent,
   setSessionId: (id) => { activeSessionId = id; },
   updateReadyStatus,
+  // T33a: the post-import report surfaces host credential state (H2 — a fresh
+  // profile has no API key, so the imported agent can't chat until one is set).
+  providerStatus: () => {
+    const cfg = loadConfig();
+    if (!isProviderConfigured(cfg)) return { configured: false, label: '' };
+    const provider = getProvider(cfg.provider || 'gemini');
+    return { configured: true, label: `${provider.label} (${cfg.model || provider.modelPlaceholder || 'model'})` };
+  },
 });
 initCsvUi({
   getAgent: () => agent,
