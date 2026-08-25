@@ -157,8 +157,8 @@ export async function exportCartridge(sqlite3, module, db, filename = 'tables-ca
       if (pSize) module._free(pSize);
     }
 
-    // 3. Trigger download
-    step('save-dialog');
+    // 3. Trigger download (plain blob — no native picker, see saveFile)
+    step('download');
     const saveResult = await saveFile(bytes, filename);
     if (saveResult?.cancelled) {
       return { cancelled: true };
@@ -491,56 +491,18 @@ function sqlLiteral(v) {
 }
 
 // ── File I/O Helpers ────────────────────────────────────────────────
-
-// Field bug (2026-08-24): on at least one machine/Chrome build the native
-// save picker neither surfaces a dialog nor settles — export wedged forever
-// at 'save-dialog' with no error (the whole browser appeared frozen). A
-// picker that cannot produce a dialog must not be allowed to wedge the
-// export: race it against a watchdog and fall back to a plain blob download.
-// Once FSA has failed this way, remember it (per machine, in localStorage)
-// so we never make the user wait out the watchdog again — clear the key
-// `sql-agent-fsa-save-broken` to re-enable the native picker.
-const FSA_BROKEN_KEY = 'sql-agent-fsa-save-broken';
-let fsaSaveBroken = (() => {
-  try { return localStorage.getItem(FSA_BROKEN_KEY) === '1'; } catch { return false; }
-})();
-function markFsaSaveBroken() {
-  fsaSaveBroken = true;
-  try { localStorage.setItem(FSA_BROKEN_KEY, '1'); } catch { /* ignore */ }
-}
-const PICKER_TIMEOUT_MS = 10_000;
+//
+// 2026-08-24 (field bug): on at least one machine/Chrome build, CALLING
+// showSaveFilePicker() wedged the browser UI — no dialog surfaced, the
+// promise never settled, and the tab stayed frozen even after a watchdog
+// fallback produced the download (the pending picker request lives on). The
+// File System Access pickers are therefore GONE: export is a plain blob
+// download, import uses a hidden <input type=file> (the classic dialog).
+// Both work in every browser with zero FSA dependency. If the FSA save-as UX
+// is ever wanted back, it must be opt-in behind a setting — never the
+// default path.
 
 async function saveFile(data, suggestedName) {
-  // Try File System Access API first (watchdog-guarded — see above)
-  if ('showSaveFilePicker' in window && !fsaSaveBroken) {
-    let pickerTimedOut = false;
-    try {
-      const handle = await Promise.race([
-        window.showSaveFilePicker({
-          suggestedName,
-          types: [{
-            description: 'SQLite 3 Database',
-            accept: { 'application/x-sqlite3': ['.sqlite3', '.db', '.sqlite'] },
-          }],
-        }),
-        new Promise((resolve) => setTimeout(
-          () => { pickerTimedOut = true; resolve(null); }, PICKER_TIMEOUT_MS)),
-      ]);
-      if (!handle) {
-        throw new Error(`save picker produced no dialog within ${PICKER_TIMEOUT_MS}ms`);
-      }
-      const writable = await handle.createWritable();
-      await writable.write(data);
-      await writable.close();
-      return { success: true };
-    } catch (err) {
-      if (err.name === 'AbortError') return { cancelled: true };
-      if (pickerTimedOut) markFsaSaveBroken();
-      console.warn('[cartridge] showSaveFilePicker failed, falling back to blob download', err);
-    }
-  }
-
-  // Fallback: blob download
   const blob = new Blob([data], { type: 'application/x-sqlite3' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -549,41 +511,40 @@ async function saveFile(data, suggestedName) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // Revoke after the download has started — revoking synchronously can race
+  // the async download start in some browsers.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return { success: true };
 }
 
 async function pickFile() {
-  // Try File System Access API first
-  if ('showOpenFilePicker' in window) {
-    try {
-      const [handle] = await window.showOpenFilePicker({
-        types: [{
-          description: 'SQLite 3 Database',
-          accept: { 'application/x-sqlite3': ['.sqlite3', '.db', '.sqlite'] },
-        }],
-        multiple: false,
-      });
-      const file = await handle.getFile();
-      return new Uint8Array(await file.arrayBuffer());
-    } catch (err) {
-      if (err.name === 'AbortError') return null;
-      console.warn('[cartridge] showOpenFilePicker failed, falling back', err);
-    }
-  }
-
-  // Fallback: hidden file input
+  // Hidden file input (classic dialog) — no FSA, see note above.
+  // Cancel detection: the browser fires no 'change' when the dialog is
+  // dismissed, so also watch for window focus returning with an empty file
+  // list (the standard heuristic for this platform gap).
   return new Promise((resolve) => {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.sqlite3,.db,.sqlite,application/x-sqlite3';
+    let settled = false;
+    const settle = (v) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('focus', onFocus);
+      resolve(v);
+    };
     input.onchange = async () => {
       if (input.files?.[0]) {
         const buf = await input.files[0].arrayBuffer();
-        resolve(new Uint8Array(buf));
+        settle(new Uint8Array(buf));
       } else {
-        resolve(null);
+        settle(null);
       }
     };
+    const onFocus = () => setTimeout(() => {
+      if (!input.files?.length) settle(null); // dialog dismissed without a file
+    }, 150);
+    window.addEventListener('focus', onFocus);
     input.click();
   });
 }

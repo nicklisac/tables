@@ -14,31 +14,29 @@
 import { test, expect } from '@playwright/test';
 import { waitAgent, queryAll, queryValue } from '../helpers.mjs';
 
-const FSA_STUB = `
-  window.__fsa = { importFile: null, exportData: null, exportName: null };
-  window.showOpenFilePicker = async () => {
-    if (!window.__fsa.importFile) throw new DOMException('no file staged', 'AbortError');
-    return [{ getFile: async () => window.__fsa.importFile }];
+// ── Download capture + file-chooser staging (no FSA — field freeze, 2026-08-24) ──
+const CAPTURE_STUB = `
+  window.__fsa = { exportBlob: null, exportName: null };
+  const _coURL = URL.createObjectURL.bind(URL);
+  URL.createObjectURL = (blob) => {
+    if (blob && blob.type === 'application/x-sqlite3') window.__fsa.exportBlob = blob;
+    return _coURL(blob);
   };
-  window.showSaveFilePicker = async (opts) => {
-    window.__fsa.exportName = opts && opts.suggestedName;
-    return {
-      createWritable: async () => ({
-        write: async (d) => {
-          window.__fsa.exportData = d;
-          // Persist the capture across reloads (a successful import ends in
-          // location.reload(), which wipes window state but not localStorage).
-          try { localStorage.setItem('__fsa_export_meta', JSON.stringify({ name: (opts && opts.suggestedName) || '', size: d.byteLength })); } catch {}
-        },
-        close: async () => {},
-      }),
-    };
-  };
+  // Persist the capture across reloads (a successful import ends in
+  // location.reload(), which wipes window state but not localStorage).
+  document.addEventListener('click', (e) => {
+    const t = e.target;
+    const a = (t instanceof Element && t.closest) ? t.closest('a[download]') : null;
+    if (!a || !window.__fsa.exportBlob) return;
+    window.__fsa.exportName = a.download;
+    try { localStorage.setItem('__fsa_export_meta', JSON.stringify({ name: a.download, size: window.__fsa.exportBlob.size })); } catch {}
+  }, true);
 `;
 
-/** Boot with FSA stubs, asserting the T33a boot-gate transition (H1). */
+/** Boot with download capture, asserting the T33a boot-gate transition (H1). */
 async function bootWithFsa(page) {
-  await page.addInitScript(FSA_STUB);
+  await page.addInitScript(CAPTURE_STUB);
+  page.on('filechooser', (fc) => { if (page.__stagedFile) fc.setFiles(page.__stagedFile); });
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   // Disabled in the HTML from first paint; stays disabled until end of boot.
   await expect(page.locator('#btn-import')).toBeDisabled();
@@ -48,19 +46,20 @@ async function bootWithFsa(page) {
   await expect(page.locator('#btn-export')).toBeEnabled();
 }
 
-/** Stage bytes as the File the (stubbed) open-picker will return. */
-const stageImportFile = (page, bytes, name = 'cartridge.sqlite3') =>
-  page.evaluate(
-    ([b, n]) => { window.__fsa.importFile = new File([b], n, { type: 'application/x-sqlite3' }); },
-    [bytes, name],
-  );
+/** Stage bytes for the next hidden-input file chooser. */
+const stageImportFile = (page, bytes, name = 'cartridge.sqlite3') => {
+  page.__stagedFile = { name, mimeType: 'application/x-sqlite3', buffer: Buffer.from(bytes) };
+};
 
 /** Export the current DB through the real [export] button; return captured bytes. */
 async function exportCurrent(page) {
   await page.click('#btn-export');
   await expect(page.locator('#status-bar')).toContainText('Exported', { timeout: 15_000 });
-  const bytes = await page.evaluate(() => window.__fsa.exportData);
-  if (!bytes) throw new Error('save-picker stub captured no export bytes');
+  const bytes = await page.evaluate(async () => {
+    if (!window.__fsa.exportBlob) return null;
+    return Array.from(new Uint8Array(await window.__fsa.exportBlob.arrayBuffer()));
+  });
+  if (!bytes) throw new Error('blob capture got no export bytes');
   return bytes;
 }
 
@@ -107,8 +106,8 @@ test.describe('T33a — BUG-021 import UX contract', () => {
     await page.click('#import-warn-cancel');
     await expect(page.locator('#import-warning-modal')).toBeHidden();
 
-    // No picker ran, no DB change.
-    expect(await page.evaluate(() => window.__fsa.exportData)).toBeNull();
+    // No download started, no DB change.
+    expect(await page.evaluate(() => window.__fsa.exportBlob)).toBeNull();
     expect(await queryValue(page, 'SELECT COUNT(*) FROM messages')).toBe(msgsBefore);
   });
 
@@ -141,7 +140,7 @@ test.describe('T33a — BUG-021 import UX contract', () => {
     await bootWithFsa(page);
     const bytes = await exportCurrent(page); // seed a valid cartridge to stage
     await stageImportFile(page, bytes);
-    await page.evaluate(() => { window.__fsa.exportData = null; }); // clear the seed
+    await page.evaluate(() => { window.__fsa.exportBlob = null; }); // clear the seed
 
     await page.click('#btn-import');
     await expect(page.locator('#import-warning-modal')).toBeVisible();
@@ -197,7 +196,7 @@ test.describe('T33a — BUG-021 import UX contract', () => {
     // Context A: build a small Tables database (user table + marker row) and export it.
     const ctxA = await browser.newContext();
     const pageA = await ctxA.newPage();
-    await pageA.addInitScript(FSA_STUB);
+    await pageA.addInitScript(CAPTURE_STUB);
     await pageA.goto('/', { waitUntil: 'domcontentloaded' });
     await waitAgent(pageA);
     await queryAll(pageA, 'CREATE TABLE t33a_probe (id INTEGER PRIMARY KEY, note TEXT)');

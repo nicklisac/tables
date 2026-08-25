@@ -27,37 +27,40 @@ const PY = process.env.PYTHON || 'python3';
 const hostSource = fs.readFileSync(HOST_FILE, 'utf8');
 const hostSha256 = crypto.createHash('sha256').update(hostSource, 'utf8').digest('hex');
 
-// ── FSA stubs + boot (same pattern as t33b/t36) ────────────────────────────
-const FSA_STUB = `
-  window.__fsa = { importFile: null, exportData: null };
-  window.showOpenFilePicker = async () => {
-    if (!window.__fsa.importFile) throw new DOMException('no file staged', 'AbortError');
-    return [{ getFile: async () => window.__fsa.importFile }];
+// ── Download capture + file-chooser staging (no FSA — field freeze, 2026-08-24) ──
+// The app exports via blob download and imports via a hidden <input type=file>:
+// capture the export by wrapping URL.createObjectURL, serve imports through
+// Playwright's filechooser event.
+const CAPTURE_STUB = `
+  window.__fsa = { exportBlob: null };
+  const _coURL = URL.createObjectURL.bind(URL);
+  URL.createObjectURL = (blob) => {
+    if (blob && blob.type === 'application/x-sqlite3') window.__fsa.exportBlob = blob;
+    return _coURL(blob);
   };
-  window.showSaveFilePicker = async () => ({
-    createWritable: async () => ({ write: async (d) => { window.__fsa.exportData = d; }, close: async () => {} }),
-  });
 `;
 
 async function boot(page) {
-  await page.addInitScript(FSA_STUB);
+  await page.addInitScript(CAPTURE_STUB);
+  page.on('filechooser', (fc) => { if (page.__stagedFile) fc.setFiles(page.__stagedFile); });
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   await waitAgent(page, 45_000);
 }
 
-/** Stage bytes as the File the (stubbed) open-picker will return. */
-const stageImportFile = (page, bytes, name = 'cartridge.sqlite3') =>
-  page.evaluate(
-    ([b, n]) => { window.__fsa.importFile = new File([Uint8Array.from(b)], n, { type: 'application/x-sqlite3' }); },
-    [bytes, name],
-  );
+/** Stage bytes for the next hidden-input file chooser. */
+const stageImportFile = (page, bytes, name = 'cartridge.sqlite3') => {
+  page.__stagedFile = { name, mimeType: 'application/x-sqlite3', buffer: Buffer.from(bytes) };
+};
 
 /** Export the current DB through the real [export] button; return number[]. */
 async function exportCurrent(page) {
   await page.click('#btn-export');
   await expect(page.locator('#status-bar')).toContainText('Exported', { timeout: 15_000 });
-  const bytes = await page.evaluate(() => (window.__fsa.exportData ? Array.from(window.__fsa.exportData) : null));
-  if (!bytes) throw new Error('save-picker stub captured no export bytes');
+  const bytes = await page.evaluate(async () => {
+    if (!window.__fsa.exportBlob) return null;
+    return Array.from(new Uint8Array(await window.__fsa.exportBlob.arrayBuffer()));
+  });
+  if (!bytes) throw new Error('blob capture got no export bytes');
   return bytes;
 }
 
