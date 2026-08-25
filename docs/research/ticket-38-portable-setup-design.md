@@ -1,6 +1,6 @@
 # T38 Design: Portable Onboarding — `tables.py --setup`
 
-**Status:** DRAFT for user review (2026-08-24) — D1–D7 need confirmation, esp. D2 (crypto surface)
+**Status:** DRAFT for user review (2026-08-24) — D1/D7 need confirmation; **D2 resolved** (AGY `agy-1787668835-614956` + tech lead: no in-file sealing, no hand-rolled crypto — keyring + 0600 local file), pending user sign-off since it revises the original brainstorm
 **Depends on:** T36 ✅ · T37 ✅ · model tracking (`85a9580` — `llm_model` → `recommended_model` already travels in exports)
 
 ---
@@ -82,20 +82,49 @@ skip straight to step 2 for that file).
 one-line `pip install keyring` hint when the user picks this and it's absent).
 Entries under our own namespace: service `tables`, account = profile id (D6).
 Strongest option: the key never exists in any file; protected by OS login.
-Caveat to handle: on headless Linux the keyring fallback can be a plaintext
-file — detect weak backends and warn loudly before saving.
+Backend behavior (verified against keyring v25.x): Windows → Credential
+Manager (`pywin32-ctypes`), macOS → Keychain, Linux → Secret Service via
+`SecretStorage`/`jeepney`. **No recommended backend available (e.g. headless
+Linux) → `RuntimeError: No recommended backend was available`** — the
+non-recommended plaintext-file backend requires explicitly installing the
+separate `keyrings.alt` package, so there is no silent weak fallback to guard
+against; setup catches the error and offers paste / sealed-in-file instead.
 
-**Backend B — sealed in-file (portable).** New table
-`secrets(name TEXT PRIMARY KEY, salt BLOB, iterations INTEGER, nonce BLOB,
-ciphertext BLOB, mac BLOB)` (added to `INTERNAL_TABLES` — T37 F-01 lesson: the
-underscore rule does NOT protect it). Passphrase prompted once per run
-(`getpass`, never echoed); PBKDF2 → keystream; verify MAC before use.
-Keeps the "one file, any laptop" story: copy the `.sqlite3`, type the
-passphrase, done.
+**Backend B — machine-local config file (zero-dep fallback).** When `keyring`
+isn't installed, setup saves to `~/.config/tables/credentials.json` (Windows:
+`%APPDATA%\tables\`) written via `os.open(..., 0o600)` — the exact pattern
+`gh` uses (`hosts.yml` at 0600 behind the keyring). Stdlib only; no crypto.
 
 **Daily key resolution order:** `--api-key` → env (`TABLES_LLM_API_KEY` →
-`OPENAI_API_KEY` → `GEMINI_API_KEY`) → keyring(profile) → sealed (prompt) →
-paste prompt. Setup offers: `[1] OS keyring (recommended)  [2] seal in the file`.
+`OPENAI_API_KEY` → `GEMINI_API_KEY`) → keyring(profile) → local config file →
+paste prompt (which offers to save, choosing backend A or B by availability).
+
+### 4.1 Why NOT sealed-in-file (AGY input, job `agy-1787668835-614956`, 2026-08-24)
+
+The original draft offered a third backend: the key encrypted INSIDE the
+`.sqlite3` (PBKDF2 + HMAC-CTR keystream + encrypt-then-MAC, stdlib-only).
+AGY review (`gemini-3.7-flash-high`) recommended killing it; tech lead concurs.
+Decisive arguments:
+
+1. **UX contradiction:** a passphrase-sealed key requires the passphrase on
+   EVERY run — breaking the flagless daily use that is `--setup`'s whole point.
+   Caching the derived key locally makes the in-file ciphertext redundant (you'd
+   just have a machine-local key — store it as one).
+2. **Contradicts our own invariant:** the model-tracking test asserts API keys
+   never travel in exported files. Cartridges are shareable artifacts (email,
+   git, S3); a secret inside one is a leak vector even when encrypted.
+3. **No precedent:** gh / AWS / gcloud / az / docker / git / npm all keep
+   credentials machine-local; portable-artifact encryption exists only in tools
+   whose purpose IS portable config (SOPS/age, 1Password) — and they use
+   standard AEAD, not hand-rolled primitives.
+4. **Crypto surface:** PBKDF2 is not memory-hard (GPU brute-force of a weak
+   passphrase against an exfiltrated file), Python can't zero keystream
+   residue, and auditors reject custom stream ciphers on sight.
+
+Portability story under the locked model: the file carries everything EXCEPT
+identity (provider/URL/model travel; the key is paired once per machine via
+`--setup`) — the same model as `gh auth login` / `aws configure` /
+`docker login`.
 
 **Deliberately NOT doing:** scanning the keyring for entries *outside* our
 namespace and guessing by prefix (`AIza…`/`sk-…`) — that's creepy even when
@@ -106,7 +135,7 @@ well-intentioned. Our own namespace + paste covers it (D3).
 ```
 url:    --llm-url → TABLES_LLM_URL → system_config.llm_url (in-file) → refuse loudly
 model:  --model   → TABLES_LLM_MODEL → system_config.llm_model → manifest recommended_model → refuse loudly
-key:    §4 order above
+key:    --api-key → env → keyring(profile) → ~/.config/tables/credentials.json → paste
 ```
 
 In-file `system_config` sits *above* the manifest because setup writes it and
@@ -118,19 +147,20 @@ is still no default model (T-batch decision, unchanged).
 - **Web (`src/cartridge.js`, export path):** stamp profiles at export (§2).
   Web boot already records `llm_model`; extend the same pattern with
   `llm_provider` / `llm_url` (active profile) + the full profile set.
-- **Host (`host/tables.py`):** `--setup` flow, key backends, secrets table,
-  new resolution chain, connection test. Est. +250–350 lines (the file is
-  840 today; the user has accepted its length — this grows it deliberately).
-- **Schema (`src/schema.js`):** `secrets` table DDL + `INTERNAL_TABLES` entry
-  (web brains get it too, so imported-back files are consistent); new
-  `system_config` keys seeded empty.
+- **Host (`host/tables.py`):** `--setup` flow, key backends (keyring optional
+  import + 0600 local file), new resolution chain, connection test. Est.
+  +250–350 lines (the file is 840 today; the user has accepted its length —
+  this grows it deliberately).
+- **Schema (`src/schema.js`):** new `system_config` keys seeded empty
+  (`llm_provider`, `llm_url` + profile set per D1). No secrets table — keys
+  never touch the file (§4.1).
 
 ## 7. Decisions — need user confirmation
 
 | # | Decision | Recommendation |
 |---|---|---|
 | D1 | Profiles in the file: real table `llm_profiles(id, name, provider, url, model)` vs JSON blob in `system_config` | **Table** — "everything is a table" is the product's identity; setup lists them with plain SQL. (Blob is the cheap alternative if you want less schema surface.) |
-| D2 | Key backends: keyring-default **+ sealed-in-file optional** (accepts ~40 lines of hand-rolled stdlib crypto) vs keyring-only v1 | **Both** — the sealed option is what makes the file truly portable; but it's your explicit call to accept the crypto surface. |
+| D2 | Key backends: keyring + 0600 local-file fallback, **no in-file sealing, no hand-rolled crypto** (per §4.1 — AGY `agy-1787668835-614956` + tech lead) vs the original draft's sealed-in-file option | **Keyring + local file.** The original draft's sealed backend is killed: UX contradiction (passphrase per run breaks flagless use), contradicts our own key-leak invariant, no industry precedent, and a crypto surface that buys nothing the threat model needs. *Pending your sign-off — this reverses part of your original brainstorm, so it's yours to confirm.* |
 | D3 | Keyring discovery: our namespace only + paste, no prefix-sniffing foreign entries | **Yes** (privacy) |
 | D4 | Setup writes non-secret config **back into the cartridge** vs sidecar `.tables-config` file | **Into the cartridge** — T37 D6 already locked "the file is the user's agent, in-place always"; a sidecar breaks the one-file story. |
 | D5 | Connection test at end of setup (one tiny real completion) | **Yes** — "✓ works" beats "saved." |
@@ -145,14 +175,15 @@ is still no default model (T-batch decision, unchanged).
 - **Keyring:** injectable fake — `TABLES_KEYRING=mock` env hook (or a small
   seam module) so specs run on any CI box; real-keyring smoke stays
   live-gated like the other probes.
-- **Sealed crypto:** known-answer vectors (fixed passphrase/salt → fixed
-  ciphertext) + round-trip + wrong-passphrase MAC failure + tamper detection.
+- **Local-file backend:** round-trip + 0600 permission assertion +
+  keyring-absent fallback path (mock import failure).
 - **Export side:** t37-style spec — export carries profiles, never keys
   (sentinel-key full-file scan, same as the model-tracking test).
 
 ## 9. Open questions (parked, not blocking)
 
-- Passphrase caching for a single run's multiple prompts (fetch approvals etc.)
-  — probably just keep it in memory per process; no disk cache, ever.
 - `--setup --rekey` (move a key between backends) — likely a v1.1 nicety.
 - Windows: `getpass` works but console echo quirks may need a `ctypes` nudge.
+- Whether the local-file backend should store per-profile entries keyed by the
+  SAME profile ids as the in-file profiles (so a re-exported cartridge's
+  profiles line up with the machine's stored keys) — leaning yes.
