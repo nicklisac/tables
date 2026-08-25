@@ -180,7 +180,70 @@ is still no default model (T-batch decision, unchanged).
 - **Export side:** t37-style spec — export carries profiles, never keys
   (sentinel-key full-file scan, same as the model-tracking test).
 
-## 9. Open questions (parked, not blocking)
+## 9. Setup UX scripts (2026-08-24, walked through with user)
+
+One interaction idiom throughout: numbered list → type a number; single item →
+`[Y/n]`. The key step is a 2×2: (backend available?) × (entry exists for THIS
+profile — lookup is by profile id, so one pairing covers every cartridge
+exported from the same web app). Setup ends in exactly one of two honest
+states: "✓ works" (connection-tested) or "config saved, key not paired — you'll
+be asked on first run" (skip chosen).
+
+**S1 — keyring has the credential (fast path, ~4 keypresses):**
+```
+◆ Cartridges in ~/Downloads:
+  1. my-agent.sqlite3    Tables v3 · exported 2026-08-24
+Is this the right one? [Y/n] Y
+◆ Provider (saved in the file):
+  Groq — https://api.groq.com/openai/v1 · llama-3.3-70b-versatile
+Use this? [Y/n/edit] Y
+◆ API key: found in your keychain — "tables / groq" (saved Aug 20)
+Use it? [Y/n] Y                      ← shows service/account + date, NEVER the key
+◆ Testing connection… ✓ works (groq · llama-3.3-70b-versatile)
+✓ Done. Daily use: python3 tables.py my-agent.sqlite3 "your question"
+```
+
+**S2 — keyring present, nothing for this profile:**
+```
+◆ API key: none found for this profile (keychain + local config).
+  [1] Paste your API key
+  [2] Skip — pair it later
+> 1
+API key: ********                    ← getpass, no echo
+Save it so future runs don't ask?
+  [1] OS keychain (recommended)
+  [2] Local file (~/.config/tables/credentials.json, owner-only)
+  [3] Don't save
+> 1
+✓ Saved to your keychain ("tables / groq")
+◆ Testing connection… ✓ works        ← failure shows the provider's real error
+                                       and loops back to re-enter; setup never
+                                       ends on an unverified "saved"
+```
+No scanning of foreign keyring namespaces by prefix (D3).
+
+**S3 — missing everything** (no keyring package/backend, nothing saved; shown
+with a pre-T38 export that has no provider config):
+```
+◆ Provider: this file has no saved provider config (older export).
+  [1] OpenAI-compatible (custom)   [2] Ollama (local)   [3] LM Studio …
+> 2
+  Base URL: http://localhost:11434
+    → healed to http://localhost:11434/v1/chat/completions
+  Model: llama3.2
+◆ API key: Ollama needs none — skipped.      ← keyRequired=false from registry
+◆ Testing connection… ✓ works (ollama · llama3.2)
+✓ Done. Config saved in the file.
+Tip: pip install keyring, then re-run --setup to use your OS keychain.
+```
+Keyed variant: paste → save offer lists only available backends (local file when
+keyring absent) → test. The `pip install keyring` hint lands at the END, never
+mid-flow. Local providers skip the key step entirely.
+
+**Open micro-decision:** keep "Skip — pair it later" (S2) with its honest
+end-state marker, or make setup refuse to finish without a working key?
+
+## 10. Open questions (parked, not blocking)
 
 - `--setup --rekey` (move a key between backends) — likely a v1.1 nicety.
 - Windows: `getpass` works but console echo quirks may need a `ctypes` nudge.
