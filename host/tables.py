@@ -61,8 +61,11 @@ T38 — portable onboarding (--setup):
             → refuse loudly
       model: --model → TABLES_LLM_MODEL → system_config.llm_model →
             manifest recommended_model → refuse loudly
-      key:   --api-key → env → keyring("tables", profile id) →
+      key:   --api-key → TABLES_LLM_API_KEY → keyring("tables", profile id) →
             ~/.config/tables/credentials.json → paste (offers to save)
+            (ambient OPENAI_API_KEY/GEMINI_API_KEY are deliberately NOT
+            consulted — they're set for other tools and would silently
+            shadow a paired key)
   The key is paired once per machine, under the profile's id — the same model
   as `gh auth login` / `aws configure` / `docker login`. Re-run --setup any
   time to change providers or keys.
@@ -84,8 +87,9 @@ Usage:
                         no default; when omitted, the in-file config and then
                         the manifest's recommended_model (the exporting build's
                         config) are used if present, otherwise boot refuses.
-      --api-key KEY     bearer key (env TABLES_LLM_API_KEY / OPENAI_API_KEY /
-                        GEMINI_API_KEY; falls back to the paired key)
+      --api-key KEY     bearer key (env TABLES_LLM_API_KEY, else the
+                        profile-paired key; ambient OPENAI/GEMINI env vars
+                        are never consulted)
 
 Environment:
   TABLES_ALLOW_FETCH=1  disable the fetch_url approval layer (free fetches).
@@ -763,10 +767,14 @@ class Host:
         model = (args.model or os.environ.get("TABLES_LLM_MODEL", "")
                  or self._cfg("llm_model")
                  or (self.manifest or {}).get("recommended_model") or "")
+        # Key resolution is deliberately CLOSED: explicit tool overrides,
+        # then the profile-paired key (keyring or credentials.json — a
+        # deliberate setup-time binding), then the paste prompt. Ambient
+        # generic env vars (OPENAI_API_KEY/GEMINI_API_KEY) do NOT participate:
+        # they're set for other tools, and one silently shadowing a paired key
+        # is exactly how a .bashrc GEMINI_API_KEY 401'd a local Qwen server.
         key = (args.api_key
                or os.environ.get("TABLES_LLM_API_KEY")
-               or os.environ.get("OPENAI_API_KEY")
-               or os.environ.get("GEMINI_API_KEY")
                or "")
         if not key:
             profile_id = self.active_profile_id()

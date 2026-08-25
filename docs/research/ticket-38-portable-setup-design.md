@@ -135,12 +135,21 @@ well-intentioned. Our own namespace + paste covers it (D3).
 ```
 url:    --llm-url → TABLES_LLM_URL → system_config.llm_url (in-file) → refuse loudly
 model:  --model   → TABLES_LLM_MODEL → system_config.llm_model → manifest recommended_model → refuse loudly
-key:    --api-key → env → keyring(profile) → ~/.config/tables/credentials.json → paste
+key:    --api-key → TABLES_LLM_API_KEY → keyring(profile) → ~/.config/tables/credentials.json → paste
 ```
 
 In-file `system_config` sits *above* the manifest because setup writes it and
 it's the same data, fresher. Refuse-loudly stays the terminal behavior — there
 is still no default model (T-batch decision, unchanged).
+
+**Key-order amendment (2026-08-25, real incident):** ambient generic env vars
+(`OPENAI_API_KEY`/`GEMINI_API_KEY`) REMOVED from the chain entirely. A
+profile-paired key is a deliberate setup-time binding to THAT profile; a
+`GEMINI_API_KEY` exported in `.bashrc` for other tools was silently shadowing
+it (401 "Invalid token payload" on a local Qwen server — setup's connection
+test had passed because it uses the pasted key directly, not the resolution
+chain). The chain is now CLOSED: explicit tool overrides (`--api-key`,
+`TABLES_LLM_API_KEY`) → paired key → paste. Nothing else participates.
 
 ## 6. Changes by surface
 

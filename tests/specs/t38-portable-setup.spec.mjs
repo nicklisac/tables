@@ -768,6 +768,32 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
     } finally { await llm.close(); }
   });
 
+  test('profile-paired key beats ambient generic env vars (real incident: GEMINI_API_KEY in .bashrc 401\'d a local server)', async ({ page }) => {
+    const llm = await startFakeLlm();
+    try {
+      const file = writeCartridgeFile(await exportWithProfile(page, llm), 'shadow');
+      const xdg = freshXdg();
+      const kr = mockKeyring(xdg.dir, {
+        [PROFILE_ID]: { key: 'sk-paired-shadow', saved_at: '2026-08-25T14:00:00+00:00' },
+      });
+      try {
+        // Ambient generic env vars set (as in a real .bashrc) — they must NOT
+        // shadow the profile-paired key.
+        const base = { ...kr.env, ...xdg.env,
+                       OPENAI_API_KEY: 'sk-ambient-openai',
+                       GEMINI_API_KEY: 'sk-ambient-gemini' };
+        const run = await runHost(file, 'hi', { env: base });
+        expect(run.code, `stderr:\n${run.stderr}`).toBe(0);
+        expect(llm.seen.at(-1).auth).toBe('Bearer sk-paired-shadow');
+
+        // But an explicit tool-specific override still wins over everything.
+        const explicit = await runHost(file, 'hi', { env: { ...base, TABLES_LLM_API_KEY: 'sk-explicit' } });
+        expect(explicit.code).toBe(0);
+        expect(llm.seen.at(-1).auth).toBe('Bearer sk-explicit');
+      } finally { fs.rmSync(file, { force: true }); }
+    } finally { await llm.close(); }
+  });
+
   test('discovery: multi-file numbered list + zero-file path prompt', async ({ page }) => {
     const llm = await startFakeLlm();
     try {
