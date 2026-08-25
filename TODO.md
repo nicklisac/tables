@@ -1,87 +1,73 @@
-# TODO — dumped 2026-08-24 (unorganized on purpose; we'll sort later)
+# TODO — dumped 2026-08-24
 
-Raw list from the user, each item grounded to where it lives in the code.
-(Original numbering had two "3"s — renumbered 1–7 below.)
+Status as of 2026-08-24 (branch `fix/todo-batch-2026-08-24`). Original numbering
+had two "3"s — renumbered 1–7.
 
 ---
 
-## 1. Put an actual README inside the exported `.sqlite3` file
+## ✅ 1. README inside the exported `.sqlite3` file — DONE
 
-Exported cartridges get a `_manifest` key/value table + `system_files`, but no
-human-readable readme — someone opening the file has nothing to find easily.
-Add one (e.g. a `readme` row in `_manifest`, or a markdown doc in `system_files`)
-stamped at export time.
+Every export now stamps `system_files('README.md', 'text/markdown')` — source of
+truth `host/cartridge-readme.md` (Vite `?raw`, same pattern as the host).
+Content per user spec: points at https://github.com/nicklisac/tables, basic
+overview, and mostly setup/run instructions for the Python host (endpoint /
+model / API key via flags + env vars, keychain one-liner, `TABLES_ALLOW_FETCH`).
+Findable by plain SQL peek:
+`select body from system_files where name='README.md'`.
 
-- Where: `src/cartridge.js` — manifest stamping (~line 173), `system_files` (~line 248)
+## ✅ 2. System prompt broken in the portable package — DONE (root cause found)
 
-## 2. System prompt did not work out of the box in the portable Python package
+**Root cause:** the persona travels as `messages.id=0` — but `id` is a GLOBAL
+PK, so only the `default` session ever had one (`createSession` never inserts a
+system row). Every non-default session ran with **no system row at all** → the
+LLM saw only the tool protocol. Affected web AND portable.
 
-**CONFIRMED by user:** the agent started with just the tool protocol — no persona.
-Root cause is almost certainly: `udf_ask_llm` derives the base prompt from the
-**system row inside the message context** (`base_prompt = (system_row or {})
-.get("content")`, ~line 468); when that row is missing/empty,
-`build_system_prompt(tools, "")` degrades to just the tool protocol. Find out why
-the system row was absent on a fresh portable run and make the engine prompt
-guaranteed (e.g. fall back to the canonical bundle instead of `""`).
+Fix: `v_active_context` now COALESCEs the session's id=0 row with
+`system_config.system_prompt` (canonical bundle); compaction token estimate
+mirrors it; the portable host falls back to `system_config` for pre-fix exports
+(old embedded view) and refuses loudly if neither source has a prompt.
+Regression tests: view emits persona for non-default sessions + host fallback
+against a simulated pre-fix export.
 
-- Where: `host/tables.py` — `build_system_prompt()` (line 136), `udf_ask_llm` (~line 465)
+## ✅ 3. `gemini-2.5-flash` must never be the default — DONE
 
-## 3. `gemini-2.5-flash` should NEVER be our default model
+- **Portable:** `DEFAULT_MODEL` removed. Chain: `--model` → `TABLES_LLM_MODEL`
+  → manifest `recommended_model` (the exporting build's config) → **refuse
+  loudly** ("no model configured — there is no default").
+- **Web:** the "artifact" was `main.js` silently sending the provider's
+  *placeholder* as the model when the field was empty (`cfg.model ||
+  p.modelPlaceholder`) — removed. `llm_model` seed is now `''` (not
+  configured); harness warns at boot when no model is set.
 
-May have been an artifact, but we need to know exactly how the default model is
-resolved on the portable build and change it everywhere:
+## ✅ 4. Portable build read-only → full permission — DONE (earlier session)
 
-- Portable: `DEFAULT_MODEL = "gemini-2.5-flash"` (`host/tables.py:82`). Resolution
-  chain today: `--model` flag → `TABLES_LLM_MODEL` env → manifest
-  `recommended_model` (advisory) → `DEFAULT_MODEL`.
-- Web: seeded in `system_config.llm_model` (`src/schema.js:205`), hardcoded
-  fallback `src/harness.js:278`, placeholder text `src/llm-provider.js:214` +
-  `index.html:646`.
+`execute_sql` UDF: full DML + DDL, commits in place to the cartridge.
 
-Decide the real default and make it consistent across both surfaces.
+## ✅ 5. Auto-heal OpenAI-compatible base URLs — DONE (web + portable)
 
-## 4. Portable build is READ-ONLY — make it full permission like always
+3-case rule on both surfaces (and anthropic's parallel path): ends in
+`/chat/completions` → as-is · ends in `/v1` → append `/chat/completions` ·
+otherwise → append `/v1/chat/completions`. t32 endpoint tests extended; t36
+proves the portable host heals a bare `--llm-url`.
 
-No need to be a pussy with all this security. The `execute_sql` UDF in the
-portable host only allows `SELECT / WITH / EXPLAIN / PRAGMA` ("standalone host
-(v1 is read-only)"). Remove the restriction — full DML + DML/DDL like the web
-agent. (Consistent with T37 decision D6: "if a user is using the agent then it
-is their agent. open it and run it.")
+## ⏸ 6. `allow_dml` flag — RESEARCH DONE, decision pending (user, tomorrow)
 
-- Where: `host/tables.py` — header line 25, guard ~lines 522–550 (gate removed; full DML + DDL)
+Exhaustive research (verified): **dead config.**
 
-## 5. Auto-heal OpenAI-compatible base URLs (web + portable)
+- Read exactly twice: seed (`src/schema.js:208`, value `'1'`) + one gate
+  (`src/harness.js:936–946`).
+- **Zero write paths** — no UI toggle, no settings field, no migration, no CLI.
+  Only changeable by hand-running `UPDATE system_config …`. So it is a constant
+  `'1'` in practice.
+- Gates ONLY the agent's `execute_sql` tool; scratchpad bang-SQL, CSV ingestion,
+  and explorer DDL/DML all bypass it.
+- Zero test coverage of the `= '0'` path.
+- Docs disagree with the code (WAYFINDER T3 says "default OFF"; seed is `'1'`).
 
-People type them wrong: sometimes no `/v1`, sometimes `/v1` but not
-`/chat/completions`. Normalize on both surfaces:
+Options when we get to it: **A) delete** (seed + gate + comments — matches the
+"full permission like always" stance) · **B) wire up** (settings toggle + fix
+docs/seed).
 
-- Ends in `/chat/completions` → use as-is
-- Ends in `/v1` → append `/chat/completions`
-- Otherwise → append `/v1/chat/completions`
+## ✅ 7. Favicon — DONE (earlier session)
 
-- Web today: `src/llm-provider.js:98` — only handles the "ends in `/v1`" case;
-  a bare `http://host:port` is used as-is and breaks.
-- Portable today: `host/tables.py` uses `self.llm_url` verbatim (~lines 490–495) —
-  no normalization at all.
-- (User said "and also remote (i guess)" — confirm if there's another remote
-  surface beyond web + portable.)
-
-## 6. `allow_dml` flag — we don't actually use it; why?
-
-**CONFIRMED by user:** this is the one. Findings:
-
-- `system_config.allow_dml` gates ONLY the agent's `execute_sql` tool
-  (`src/harness.js:933`); scratchpad bang-SQL and everything else bypass it.
-- **No UI anywhere to toggle it** — it can only be changed by hand-editing the
-  DB, so in practice it's dead config.
-- Inconsistent defaults: docs (WAYFINDER_MAP T3) say "default OFF" but the seed
-  is `'1'` (`src/schema.js:206`) and the harness comment says "default ON '1'".
-
-Decision needed: **delete it** (matches the "full permission like always" stance)
-or **wire it up** (settings UI toggle + fix the docs/seed discrepancy).
-
-## 7. Favicon on the site
-
-No `<link rel="icon">` in `index.html`, no icon file in `public/`. Add one —
-the brand SVG at `index.html:17` is a ready-made source (inline data-URI or a
-file in `public/`).
+`public/favicon.svg` (brand mark in accent teal) + `<link rel="icon">`.

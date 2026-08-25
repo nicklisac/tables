@@ -146,15 +146,19 @@ export async function estimateActiveContextTokens(sqlite3, db, sessionId) {
   }
 
   // No anchor: the whole active context — the same three row sets
-  // v_active_context emits: [system row (id=0)] + [latest summary as a
+  // v_active_context emits: [system (id=0 row, or the system_config bundle —
+  // same COALESCE as the view's sysprompt CTE)] + [latest summary as a
   // synthetic user row, the "Previous conversation summary:" wrapper] +
   // [the visible tail]. The tail comes from v_turn_boundaries minus the
   // system row (id=0 is in the region before the first compaction and is
   // emitted by Branch 1 of v_active_context, not the tail).
   const rows = await queryAll(sqlite3, db, `
     SELECT COALESCE(SUM(est), 0) FROM (
-      SELECT CEIL(LENGTH(content) / 4.0) AS est
-      FROM messages WHERE id = 0 AND session_id = ?
+      SELECT CEIL(LENGTH(COALESCE(
+              (SELECT m.content FROM messages m WHERE m.id = 0 AND m.session_id = ?),
+              (SELECT sc.value FROM system_config sc WHERE sc.key = 'system_prompt')
+          )) / 4.0) AS est
+      FROM (SELECT 1 AS one)
       UNION ALL
       SELECT CEIL(LENGTH('Previous conversation summary:' || char(10) || c.summary) / 4.0)
       FROM compactions c

@@ -45,8 +45,10 @@ Usage:
   python3 host/tables.py CARTRIDGE.sqlite3 [message]
       --llm-url URL     OpenAI-compatible chat-completions endpoint
                         (env TABLES_LLM_URL)
-      --model MODEL     model name (env TABLES_LLM_MODEL; default: the
-                        manifest's recommended_model, else gemini-2.5-flash)
+      --model MODEL     model name (env TABLES_LLM_MODEL). Required — there is
+                        no default; when omitted, the manifest's
+                        recommended_model (the exporting build's config) is
+                        used if present, otherwise boot refuses.
       --api-key KEY     bearer key (env TABLES_LLM_API_KEY / OPENAI_API_KEY /
                         GEMINI_API_KEY)
 
@@ -79,7 +81,6 @@ TOOL_UDF_MAP = {"execute_sql": "run_dynamic_sql"}
 # refuse loudly, never silently corrupt a newer cartridge).
 HOST_VERSION = 1
 
-DEFAULT_MODEL = "gemini-2.5-flash"
 FETCH_TIMEOUT_S = 15
 FETCH_MAX_CHARS = 8000          # preview cap returned to the agent
 LLM_TIMEOUT_S = 120
@@ -132,6 +133,20 @@ class TurnError(Exception):
 # answer {"content","tool_calls"}, so no native function-calling is required —
 # this works against any OpenAI-compatible endpoint.
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_llm_url(url):
+    """Auto-heal common user input mistakes: a bare base (http://host:port),
+    a /v1 base, or a full chat-completions URL all normalize to the same
+    endpoint. Mirrors the web engine's provider endpoint resolution."""
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if u.endswith("/chat/completions"):
+        return u
+    if u.endswith("/v1"):
+        return u + "/chat/completions"
+    return u + "/v1/chat/completions"
+
 
 def build_system_prompt(tools, base_prompt=""):
     """Port of harness.js buildSystemPrompt. `tools` = list of schema objects."""
@@ -231,7 +246,7 @@ def parse_llm_content(content):
 class Host:
     def __init__(self, path, llm_url, llm_model, api_key):
         self.path = path
-        self.llm_url = (llm_url or "").strip()
+        self.llm_url = _normalize_llm_url(llm_url)
         self.llm_model = (llm_model or "").strip()
         self.api_key = (api_key or "").strip()
         self.conn = None
@@ -466,7 +481,18 @@ class Host:
             messages = json.loads(context_json or "[]")
             tools = json.loads(tools_json or "[]")
             system_row = next((m for m in messages if m.get("role") == "system"), None)
-            base_prompt = (system_row or {}).get("content") or ""
+            base_prompt = ((system_row or {}).get("content") or "").strip()
+            if not base_prompt:
+                # Pre-fix cartridges: the stored v_active_context only emitted a
+                # system row for the session owning messages.id=0 ('default' — id
+                # is a global PK, so no other session ever had one) and ran with
+                # just the tool protocol. Fall back to the canonical bundle;
+                # refuse loudly if that is missing too (not a Tables export).
+                base_prompt = (self._cfg("system_prompt") or "").strip()
+                if not base_prompt:
+                    return json.dumps({"error": "no system prompt found in this cartridge — "
+                                                "neither the context nor system_config.system_prompt "
+                                                "carries one. Re-export from a trusted Tables build."})
             system_prompt = build_system_prompt(tools, base_prompt)
             api_messages = format_flattened([m for m in messages if m.get("role") != "system"])
 
@@ -488,7 +514,7 @@ class Host:
         if not self.llm_url:
             raise TurnError("no LLM endpoint configured (set --llm-url or TABLES_LLM_URL)")
         body = {
-            "model": self.llm_model or DEFAULT_MODEL,
+            "model": self.llm_model,
             "messages": [{"role": "system", "content": system_prompt}, *api_messages],
             "stream": False,
         }
@@ -681,7 +707,7 @@ class Host:
             f"Tables standalone host v{HOST_VERSION} — {HOST_NAME}",
             f"  cartridge     {cid[:8]}  (format {'v' + m.get('format_version', '0') if m else 'v0'})",
             f"  active session {self.session_id}" + (f"  ({sess_name[0]})" if sess_name else ""),
-            f"  model         {self.llm_model or DEFAULT_MODEL}",
+            f"  model         {self.llm_model}",
             f"  endpoint      {self.llm_url or '(not set)'}",
             f"  api key       {masked}",
             f"  identity      {identity}",
@@ -708,7 +734,7 @@ class Host:
         lines.append(f"  fetch         " + ("approval layer OFF — free fetches (TABLES_ALLOW_FETCH=1)"
                          if self.allow_fetch
                          else "approval per fetch [y/N/a] (set TABLES_ALLOW_FETCH=1 for free fetches)"))
-        if m.get("recommended_model") and m["recommended_model"] != (self.llm_model or DEFAULT_MODEL):
+        if m.get("recommended_model") and m["recommended_model"] != self.llm_model:
             lines.append(f"  note          cartridge was exported with model "
                          f"{m['recommended_model']!r} (advisory)")
         real = sorted(self.real_udfs)
@@ -763,9 +789,15 @@ def main(argv=None):
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    # Fill in a default model from the manifest now that we can read it.
+    # Fill in a model from the manifest (the exporting build's config) when
+    # the user gave none. There is NO hardcoded default — a missing model is
+    # a configuration error, refused loudly rather than guessed.
     if not host.llm_model and host.manifest and host.manifest.get("recommended_model"):
         host.llm_model = host.manifest["recommended_model"]
+    if not host.llm_model:
+        print("error: no model configured — pass --model or set TABLES_LLM_MODEL "
+              "(there is no default)", file=sys.stderr)
+        return 2
 
     host.report()
 

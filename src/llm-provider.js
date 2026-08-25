@@ -93,9 +93,14 @@ function openAiCompatible(opts) {
     // present is stale and would silently route turns to the wrong endpoint.
     endpoint: (cfg) => {
       if (fixedEndpoint) return endpoint;
+      // Auto-heal common user input mistakes — a bare base (http://host:port),
+      // a /v1 base, or a full chat-completions URL all normalize to the same
+      // endpoint. Trailing slashes are tolerated.
       const raw = ((cfg && cfg.url) || presetUrl || '').trim().replace(/\/+$/, '');
       if (!raw) return '';
-      return raw.endsWith('/v1') ? `${raw}/chat/completions` : raw;
+      if (raw.endsWith('/chat/completions')) return raw;
+      if (raw.endsWith('/v1')) return `${raw}/chat/completions`;
+      return `${raw}/v1/chat/completions`;
     },
 
     headers: (cfg) => ({
@@ -157,9 +162,11 @@ const anthropic = {
 
   endpoint: (cfg) => {
     const raw = ((cfg && cfg.url) || ANTHROPIC_PRESET).trim().replace(/\/+$/, '');
-    // Consistent with OpenAI-compatible: a base ending in /v1 gets /messages
-    // appended; a full …/messages URL is used as-is.
-    return raw.endsWith('/v1') ? `${raw}/messages` : raw;
+    // Same auto-heal as OpenAI-compatible: bare base → /v1/messages, a /v1
+    // base gets /messages appended, a full …/messages URL is used as-is.
+    if (raw.endsWith('/messages')) return raw;
+    if (raw.endsWith('/v1')) return `${raw}/messages`;
+    return `${raw}/v1/messages`;
   },
 
   headers: (cfg) => ({

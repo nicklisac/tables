@@ -73,7 +73,7 @@ test.describe('T32 — provider registry: metadata + endpoints', () => {
     expect(r.fallbackId).toBe('openai');
   });
 
-  test('endpoint resolution: fixed ignores stale url; /v1 base appends provider path', async ({ page }) => {
+  test('endpoint resolution: fixed ignores stale url; user URLs auto-heal (bare /v1 / full)', async ({ page }) => {
     await toOrigin(page);
     const r = await page.evaluate(async () => {
       const m = await import('/src/llm-provider.js');
@@ -88,6 +88,13 @@ test.describe('T32 — provider registry: metadata + endpoints', () => {
         openaiPreset: P.openai.endpoint({}),
         groqPreset: P.groq.endpoint({}),
         lmStudioPreset: P['lm-studio'].endpoint({}),
+        // Auto-heal cases (the field bug: people omit /v1, or type the full
+        // endpoint — both must land on the same URL).
+        openaiBare: P.openai.endpoint({ url: 'http://localhost:11434' }),
+        openaiBareTrailingSlash: P.openai.endpoint({ url: 'http://localhost:11434/' }),
+        openaiFull: P.openai.endpoint({ url: 'http://localhost:11434/v1/chat/completions' }),
+        anthropicBare: P.anthropic.endpoint({ url: 'https://api.anthropic.com' }),
+        anthropicRootMessages: P.anthropic.endpoint({ url: 'http://localhost:1234/messages' }),
       };
     });
     expect(r.geminiIgnoresStale).toBe('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions');
@@ -99,6 +106,12 @@ test.describe('T32 — provider registry: metadata + endpoints', () => {
     expect(r.openaiPreset).toBe('http://localhost:11434/v1/chat/completions');
     expect(r.groqPreset).toBe('https://api.groq.com/openai/v1/chat/completions');
     expect(r.lmStudioPreset).toBe('http://localhost:1234/v1/chat/completions');
+    // Auto-heal: all three input shapes converge on one endpoint.
+    expect(r.openaiBare).toBe('http://localhost:11434/v1/chat/completions');
+    expect(r.openaiBareTrailingSlash).toBe('http://localhost:11434/v1/chat/completions');
+    expect(r.openaiFull).toBe('http://localhost:11434/v1/chat/completions');
+    expect(r.anthropicBare).toBe('https://api.anthropic.com/v1/messages');
+    expect(r.anthropicRootMessages).toBe('http://localhost:1234/messages');
   });
 });
 

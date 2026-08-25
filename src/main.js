@@ -549,7 +549,9 @@ async function bootAgent() {
   // T32: registry-driven defaults. Fixed-endpoint providers carry no URL; the
   // rest fall back to the provider's preset (Ollama / Groq / …).
   const url = cfg.url || (p.fixedEndpoint ? '' : (p.presetUrl || ''));
-  const model = cfg.model || (p.modelPlaceholder || 'llama3.2');
+  // No placeholder fallback: an empty model field means "not configured" —
+  // the harness warns at boot and the provider errors loudly per turn.
+  const model = cfg.model || '';
   const apiKey = cfg.apiKey || '';
   const maxTokens = cfg.maxTokens || '';
 

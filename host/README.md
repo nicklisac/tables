@@ -48,8 +48,8 @@ config are supplied at boot and never travel in the file.
 
 | Setting    | Flag        | Env var(s)                                        | Default |
 |------------|-------------|---------------------------------------------------|---------|
-| Endpoint   | `--llm-url` | `TABLES_LLM_URL`                                  | *(required)* |
-| Model      | `--model`   | `TABLES_LLM_MODEL`                                | the manifest's `recommended_model`, else `gemini-2.5-flash` |
+| Endpoint   | `--llm-url` | `TABLES_LLM_URL`                                  | *(required; auto-healed — bare base, `…/v1`, or the full `…/v1/chat/completions` all work)* |
+| Model      | `--model`   | `TABLES_LLM_MODEL`                                | the manifest's `recommended_model` (the exporting build's config) — **required**, no hardcoded default; boot refuses if none is found |
 | API key    | `--api-key` | `TABLES_LLM_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY` | *(none)* |
 | Fetch      | —           | `TABLES_ALLOW_FETCH=1`                                    | approval per fetch `[y/N/a]` (T37 L3) |
 

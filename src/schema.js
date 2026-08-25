@@ -202,7 +202,9 @@ CREATE TABLE IF NOT EXISTS system_config (
 INSERT OR IGNORE INTO system_config (key, value) VALUES
   ('system_prompt',
      'You are Tables. (Prompt placeholder — replaced at boot by migrateSystemPrompt.)'),
-  ('llm_model', 'gemini-2.5-flash'),
+  -- No default model: an empty value means "not configured" (the portable
+  -- host refuses to boot without one; the web harness warns at boot).
+  ('llm_model', ''),
   ('allow_dml', '1'),
   -- T2: fallback effective context window (tau's DEFAULT_CONTEXT_WINDOW_TOKENS).
   -- The LIVE window resolves as: user override (settings field, written to this
@@ -398,9 +400,14 @@ CREATE INDEX IF NOT EXISTS idx_tool_approvals_session ON tool_approvals(session_
 -- =====================================================================
 -- 4f. v_active_context (T2: the LLM's working context)
 --
--- [system row (id=0, if present)] + [latest rolling summary rendered as a
--- synthetic user row, tau-style "Previous conversation summary:" wrapper]
+-- [system] + [latest rolling summary rendered as a synthetic user row,
+-- tau-style "Previous conversation summary:" wrapper]
 -- + [in_context=1 rows with id > latest watermark].
+--
+-- System branch: prefers the session's own messages.id=0 row (legacy — id is
+-- a GLOBAL PK, so only 'default' ever had one); falls back to the canonical
+-- bundle in system_config.system_prompt. Pre-fix, every non-default session
+-- ran with NO system row at all (the LLM saw only the tool protocol).
 --
 -- Emits a ctx_order column (system=0, summary=1, messages=id+1) because the
 -- synthetic summary row cannot sort between id=0 and id=1 as a raw id.
@@ -423,12 +430,22 @@ latest AS (
     SELECT c.session_id, c.seq, c.summary, c.watermark_id
     FROM compactions c
     WHERE c.seq = (SELECT MAX(seq) FROM compactions WHERE session_id = c.session_id)
+),
+sysprompt AS (
+    -- See header: id=0 row if present for this session, else the canonical
+    -- bundle from system_config (the single source of truth — kept in sync by
+    -- migrateSystemPrompt, which also rewrites any existing system rows).
+    SELECT a.session_id AS session_id,
+           COALESCE(
+               (SELECT m.content FROM messages m WHERE m.id = 0 AND m.session_id = a.session_id),
+               (SELECT sc.value FROM system_config sc WHERE sc.key = 'system_prompt')
+           ) AS content
+    FROM active a
 )
-SELECT 0 AS ctx_order, m.id AS id, m.session_id AS session_id, 'system' AS role,
-       m.content AS content, NULL AS tool_calls, NULL AS tool_call_id
-FROM messages m
-CROSS JOIN active a
-WHERE m.id = 0 AND m.session_id = a.session_id
+SELECT 0 AS ctx_order, -2 AS id, sp.session_id AS session_id, 'system' AS role,
+       sp.content AS content, NULL AS tool_calls, NULL AS tool_call_id
+FROM sysprompt sp
+WHERE sp.content IS NOT NULL AND TRIM(sp.content) != ''
 UNION ALL
 SELECT 1 AS ctx_order, -1 AS id, l.session_id AS session_id, 'user' AS role,
        ('Previous conversation summary:' || char(10) || l.summary) AS content,

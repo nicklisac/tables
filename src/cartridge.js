@@ -39,6 +39,9 @@ import { isProtectedTable, getVirtualTableParents, ENGINE_MIN_VERSION, SYSTEM_PR
 // T37: the standalone host source — single source of truth = host/tables.py (D1).
 // Vite's ?raw transform inlines the file as a string; stamped into every export.
 import hostPySource from '../host/tables.py?raw';
+// The human-facing readme stamped into every export (system_files 'README.md')
+// — what the file is + how to run it, findable by plain SQL peek.
+import cartridgeReadme from '../host/cartridge-readme.md?raw';
 
 const SQLITE_OK = 0;
 const SQLITE_SERIALIZE_NORMAL = 0;
@@ -263,6 +266,13 @@ export async function stampHost(sqlite3, stagingDb) {
     `INSERT INTO system_files (name, mime, body, sha256) VALUES ('tables.py', 'text/x-python', ?, ?)
      ON CONFLICT(name) DO UPDATE SET mime = excluded.mime, body = excluded.body, sha256 = excluded.sha256`,
     [hostPySource, sha]);
+  // The human-facing readme — the first thing a stranger opening this file
+  // should find (what it is + how to run it). Not part of the compatibility
+  // contract: no manifest key, re-export converges like the host.
+  await execParams(sqlite3, stagingDb,
+    `INSERT INTO system_files (name, mime, body, sha256) VALUES ('README.md', 'text/markdown', ?, ?)
+     ON CONFLICT(name) DO UPDATE SET mime = excluded.mime, body = excluded.body, sha256 = excluded.sha256`,
+    [cartridgeReadme, await sha256Hex(cartridgeReadme)]);
   await execParams(sqlite3, stagingDb,
     `INSERT INTO _manifest (key, value) VALUES ('host_sha256', ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`,

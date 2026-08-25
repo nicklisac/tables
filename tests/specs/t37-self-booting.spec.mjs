@@ -23,9 +23,12 @@ import { waitAgent } from '../helpers.mjs';
 
 const pExecFile = promisify(execFile);
 const HOST_FILE = path.resolve('host/tables.py');
+const README_FILE = path.resolve('host/cartridge-readme.md');
 const PY = process.env.PYTHON || 'python3';
 const hostSource = fs.readFileSync(HOST_FILE, 'utf8');
 const hostSha256 = crypto.createHash('sha256').update(hostSource, 'utf8').digest('hex');
+const readmeSource = fs.readFileSync(README_FILE, 'utf8');
+const readmeSha256 = crypto.createHash('sha256').update(readmeSource, 'utf8').digest('hex');
 
 // ── Download capture + file-chooser staging (no FSA — field freeze, 2026-08-24) ──
 // The app exports via blob download and imports via a hidden <input type=file>:
@@ -121,17 +124,36 @@ test.describe('T37 (Phase A) — in-file host stamping + import trust surface', 
     await boot(page);
     const bytes = await exportCurrent(page);
     withCartridgeDb(bytes, (db) => {
-      const row = db.prepare('SELECT name, mime, body, sha256 FROM system_files').all();
-      expect(row).toHaveLength(1);
-      expect(row[0].name).toBe('tables.py');
-      expect(row[0].mime).toBe('text/x-python');
+      const rows = Object.fromEntries(
+        db.prepare('SELECT name, mime, body, sha256 FROM system_files').all().map((r) => [r.name, r])
+      );
+      expect(Object.keys(rows).sort()).toEqual(['README.md', 'tables.py']);
+      const row = rows['tables.py'];
+      expect(row.mime).toBe('text/x-python');
       // Body is the repo source verbatim — single source of truth (D1).
-      expect(row[0].body).toBe(hostSource);
+      expect(row.body).toBe(hostSource);
       // Hash matches an independent Node-side digest of the same file.
-      expect(row[0].sha256).toBe(hostSha256);
+      expect(row.sha256).toBe(hostSha256);
       // Additive manifest key (D3) carries the same hash — visible via plain SQL peek.
       const m = db.prepare("SELECT value FROM _manifest WHERE key='host_sha256'").get();
       expect(m.value).toBe(hostSha256);
+    });
+  });
+
+  test('every export stamps a human-facing README.md (repo source verbatim, correct sha256)', async ({ page }) => {
+    await boot(page);
+    const bytes = await exportCurrent(page);
+    withCartridgeDb(bytes, (db) => {
+      const row = db.prepare("SELECT name, mime, body, sha256 FROM system_files WHERE name='README.md'").get();
+      expect(row).toBeTruthy();
+      expect(row.mime).toBe('text/markdown');
+      // The readme travels verbatim from the repo — single source of truth.
+      expect(row.body).toBe(readmeSource);
+      expect(row.sha256).toBe(readmeSha256);
+      // It points at the project and covers setup (the point of it existing).
+      expect(row.body).toContain('https://github.com/nicklisac/tables');
+      expect(row.body).toContain('--llm-url');
+      expect(row.body).toContain('TABLES_LLM_MODEL');
     });
   });
 

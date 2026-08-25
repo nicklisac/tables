@@ -275,7 +275,7 @@ export async function bootSqliteAgent(config = {}) {
   const {
     dbName      = 'agent_brain.sqlite3',
     llmUrl      = '',
-    llmModel    = 'gemini-2.5-flash',
+    llmModel    = '',
     llmApiKey   = '',
     llmProvider = 'openai',
     llmMaxTokens = '',
@@ -286,6 +286,9 @@ export async function bootSqliteAgent(config = {}) {
   const endpointUrl = provider.endpoint({ url: llmUrl });
   if (!endpointUrl && !provider.fixedEndpoint) {
     console.warn('[harness] No LLM URL configured.');
+  }
+  if (!llmModel) {
+    console.warn('[harness] No LLM model configured — set it in [config].');
   }
 
   // 1. Boot wa-sqlite JSPI engine

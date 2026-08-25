@@ -205,6 +205,115 @@ test.describe('T36 — standalone cartridge host (Python-first)', () => {
     }
   });
 
+  // Pre-fix, v_active_context emitted a system row ONLY for the session
+  // owning messages.id=0 ('default' — id is a global PK). Every other session
+  // ran with no persona at all. The view now falls back to the canonical
+  // bundle in system_config; these tests pin both halves of the fix.
+  const OLD_V_ACTIVE_CONTEXT = `
+    DROP VIEW IF EXISTS v_active_context;
+    CREATE VIEW v_active_context AS
+    WITH active AS (
+        SELECT value AS session_id FROM session_context WHERE key = 'active_session_id'
+    ),
+    latest AS (
+        SELECT c.session_id, c.seq, c.summary, c.watermark_id
+        FROM compactions c
+        WHERE c.seq = (SELECT MAX(seq) FROM compactions WHERE session_id = c.session_id)
+    )
+    SELECT 0 AS ctx_order, m.id AS id, m.session_id AS session_id, 'system' AS role,
+           m.content AS content, NULL AS tool_calls, NULL AS tool_call_id
+    FROM messages m
+    CROSS JOIN active a
+    WHERE m.id = 0 AND m.session_id = a.session_id
+    UNION ALL
+    SELECT 1 AS ctx_order, -1 AS id, l.session_id AS session_id, 'user' AS role,
+           ('Previous conversation summary:' || char(10) || l.summary) AS content,
+           NULL AS tool_calls, NULL AS tool_call_id
+    FROM latest l
+    CROSS JOIN active a
+    WHERE l.session_id = a.session_id
+    UNION ALL
+    SELECT (m.id + 1) AS ctx_order, m.id AS id, m.session_id AS session_id, m.role AS role,
+           m.content AS content, m.tool_calls AS tool_calls, m.tool_call_id AS tool_call_id
+    FROM messages m
+    CROSS JOIN active a
+    LEFT JOIN latest l ON l.session_id = a.session_id
+    WHERE m.session_id = a.session_id
+       AND COALESCE(m.in_context, 1) = 1
+        AND m.id != 0
+       AND (l.watermark_id IS NULL OR m.id > l.watermark_id)
+       AND COALESCE(m.rewound, 0) = 0
+     ORDER BY ctx_order ASC;
+  `;
+
+  /** Activate a fresh non-default session inside the cartridge file. */
+  function activateSecondSession(file) {
+    const db = new DatabaseSync(file);
+    try {
+      db.prepare("INSERT INTO sessions (id, name) VALUES ('s2', 'S2')").run();
+      db.prepare("UPDATE session_context SET value = 's2' WHERE key = 'active_session_id'").run();
+    } finally { db.close(); }
+  }
+
+  test('v_active_context emits the persona for non-default sessions (view fix)', async ({ page }) => {
+    await boot(page);
+    const file = writeCartridge(await exportCurrent(page), 'viewfix');
+    try {
+      activateSecondSession(file);
+      const db = new DatabaseSync(file, { readOnly: true });
+      try {
+        const sysRows = db.prepare(
+          "SELECT content FROM v_active_context WHERE role = 'system'"
+        ).all();
+        expect(sysRows).toHaveLength(1);
+        expect(sysRows[0].content).toContain('You are Tables');
+      } finally { db.close(); }
+    } finally {
+      fs.rmSync(file, { force: true });
+    }
+  });
+
+  test('pre-fix export (old view + non-default session): host falls back to the system_config persona', async ({ page }) => {
+    await boot(page);
+    const file = writeCartridge(await exportCurrent(page), 'hostfallback');
+    // Simulate a pre-fix export: restore the old view definition, then
+    // activate a non-default session — the exact shape of the field bug.
+    const db = new DatabaseSync(file);
+    db.exec(OLD_V_ACTIVE_CONTEXT);
+    db.close();
+    activateSecondSession(file);
+
+    const llm = await startFakeLlm([FINAL_REPLY]);
+    try {
+      const res = await runHost(file, 'Hello.', llm.url);
+      expect(res.code, `host stderr:\n${res.stderr}`).toBe(0);
+      // The host's system_config fallback put the persona on the wire.
+      const firstSystem = llm.requests[0].body.messages.find((m) => m.role === 'system');
+      expect(firstSystem, 'no system message sent to the LLM').toBeTruthy();
+      expect(firstSystem.content).toContain('You are Tables');
+    } finally {
+      await llm.close();
+      fs.rmSync(file, { force: true });
+    }
+  });
+
+  test('a bare --llm-url (no /v1) is auto-healed to /v1/chat/completions', async ({ page }) => {
+    await boot(page);
+    const file = writeCartridge(await exportCurrent(page), 'urlheal');
+    const llm = await startFakeLlm([FINAL_REPLY]);
+    try {
+      // Strip the full path — pass a bare base, the way people type it.
+      const bareBase = llm.url.replace(/\/v1\/chat\/completions$/, '');
+      const res = await runHost(file, 'Hello.', bareBase);
+      expect(res.code, `host stderr:\n${res.stderr}`).toBe(0);
+      // The healed request landed at the full chat-completions path.
+      expect(llm.requests[0].url).toBe('/v1/chat/completions');
+    } finally {
+      await llm.close();
+      fs.rmSync(file, { force: true });
+    }
+  });
+
   test('engine_min_version above the host is refused loudly, DB untouched', async ({ page }) => {
     await boot(page);
     const bytes = await exportCurrent(page);
