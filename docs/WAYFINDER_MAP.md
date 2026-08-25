@@ -873,6 +873,15 @@ graph TD
 * **Depends on:** T36 ✅ (its committed loader is the reference semantics for what an in-file host does; its manifest consumption is the contract under test).
 * **Source:** fog entry "Agent on a Keychain" (2026-08-20/21); four-class split research doc §6 (2026-08-24) — class 4 (host capabilities) is what moves into the file here.
 
+### Ticket 38: Portable Onboarding — `tables.py --setup`
+
+* **Label:** `wayfinder:frontier`
+* **Status:** 📐 **DESIGN DRAFT (2026-08-24)** — design doc: [docs/research/ticket-38-portable-setup-design.md](file:///home/nick/Documents/projects/web-sql-agent/docs/research/ticket-38-portable-setup-design.md) — D1–D7 need user confirmation (esp. **D2**: accept ~40 lines of hand-rolled stdlib crypto for the sealed-in-file key backend, or keyring-only v1).
+* **Goal:** one guided command (`python3 tables.py --setup`) takes a user from "I have this `.sqlite3` file" to a first *verified* turn: (1) discover `*.sqlite3` in cwd (shape-checked; numbered selection when >1), (2) pick the provider — profiles now **exported from the web** (provider id + URL + model per profile, keys structurally excluded), (3) pair the key, (4) tiny real connection test before declaring success, (5) persist config into the cartridge + print the flagless daily one-liner. After setup, `python3 tables.py FILE "msg"` works with zero flags.
+* **Key design points:** two key backends behind one resolution order (flag → env → OS keyring → sealed-in-file passphrase prompt → paste): **A** = `keyring` package as *optional* import (zero-dep core preserved; weak-backend warning for headless Linux), entries under service `tables`; **B** = ciphertext BLOBs in a new `secrets` table (`INTERNAL_TABLES`-protected) sealed with PBKDF2-HMAC-SHA256 + HMAC counter-mode keystream + encrypt-then-MAC (stdlib-only; no symmetric cipher exists in stdlib — this is the hand-rolled surface D2 asks about). In-file encryption protects against inspection, not execution (T37 trust boundary unchanged). No prefix-sniffing of foreign keyring entries (privacy). Setup writes non-secret config back INTO the cartridge (T37 D6: in-place always).
+* **Depends on:** T36 ✅ · T37 ✅ · model tracking (`85a9580` — `llm_model` already travels; this ticket adds provider/URL/profiles to the export).
+* **Source:** user onboarding feedback (2026-08-24): "the onboarding for the python was clunky at best… a simple --setup or something to carry the weight and bring in any data from the web if it has already been established."
+
 ---
 
 
