@@ -32,13 +32,13 @@ function call, so the pure-SQL flagship loop runs natively.
 
 ```sh
 # One-shot: boot the cartridge, send one message, print the answer, exit.
-python3 host/host.py my-agent.sqlite3 "What tables do I have?"
+python3 host/tables.py my-agent.sqlite3 "What tables do I have?"
 
 # Interactive REPL (omit the message).
-python3 host/host.py my-agent.sqlite3
+python3 host/tables.py my-agent.sqlite3
 
 # Piped input is treated as a single message (scripting-friendly).
-echo "Summarize my data" | python3 host/host.py my-agent.sqlite3
+echo "Summarize my data" | python3 host/tables.py my-agent.sqlite3
 ```
 
 ### Configuration (the keychain split)
@@ -57,7 +57,7 @@ Example with Gemini's OpenAI-compatible endpoint:
 
 ```sh
 export TABLES_LLM_URL="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-python3 host/host.py my-agent.sqlite3 --model gemini-2.5-flash "Hello?"
+python3 host/tables.py my-agent.sqlite3 --model gemini-2.5-flash "Hello?"
 ```
 
 ## What the host checks at boot
@@ -65,7 +65,8 @@ python3 host/host.py my-agent.sqlite3 --model gemini-2.5-flash "Hello?"
 1. **Shape** — the file must be a Tables database (`sessions`, `messages`,
    `system_config`, `tools` present).
 2. **Embedded-host integrity (T37 L1)** — if the cartridge embeds its own
-   host (`system_files.host.py`), the stored sha256 is verified against the
+   host (`system_files.tables.py`; pre-rename exports store `host.py` — both
+   are accepted), the stored sha256 is verified against the
    body **before any DML runs**; a mismatch (corruption or post-export
    tamper) refuses boot loudly. Pre-T37 exports (no table) boot with a note.
 3. **`_manifest` v1** (stamped by the web engine's export):
@@ -93,7 +94,7 @@ masked key, identity/prompt version, tool matrix) before the first turn.
 | Tool               | Status      | Notes |
 |--------------------|-------------|-------|
 | `ask_llm`          | full        | OpenAI-compatible chat completions; JSON-in-content protocol (no native function-calling required — works with any compatible endpoint) |
-| `execute_sql`      | **read-only** | `SELECT` / `WITH` / `EXPLAIN` / `PRAGMA`. Writes are refused with a clear error envelope (the loop survives; the agent adapts). |
+| `execute_sql`      | **full**    | DML + DDL. Writes commit in place to the cartridge (one statement per call, like CPython's `execute()`). Errors land as an error envelope — the loop survives and the agent adapts. |
 | `fetch_url`        | **gated**   | HTTP(S) fetch + HTML→text, SSRF-blocked (loopback/private ranges), 8k-char preview. **Every call asks for interactive approval** `[y]es/[N]o/[a]ll-for-run` (T37 L3 — the one UDF whose egress destination is model-chosen at runtime). `TABLES_ALLOW_FETCH=1` disables the approval layer; without a TTY, fetches fail closed with an actionable error naming the env var. |
 | `search_web`       | stub        | registered; returns a clear "not in v1" error envelope |
 | `materialize`      | stub        | registered; returns a clear "not in v1" error envelope |
@@ -120,8 +121,8 @@ stuck suppression flag.
 
 ## Non-goals for v1 (deliberate)
 
-- **Writes** (`execute_sql` DML/DDL, `materialize`) — read-only by design in
-  v1; the rewind/approval machinery is web-engine territory for now.
+- **Rewind / approval** — writes commit directly with no per-op approval queue
+  or savepoint-based rewind (web-engine territory); `materialize` stays a stub.
 - **Compaction** — long conversations will eventually exceed the model's
   context window and surface a provider error; run `/compact` in the web
   engine to summarize, then re-export.
@@ -142,8 +143,8 @@ npx playwright test tests/specs/t36-bootstrap-host.spec.mjs
 
 Covered: multi-turn tool round-trip, identity/persona fidelity,
 `engine_min_version` refusal, UDF capability-gap refusal (D4), v0
-back-compat, LLM transport-error rollback + next-boot survival, read-only
-gating. A live Gemini probe is included but gated behind
+back-compat, LLM transport-error rollback + next-boot survival, full-permission
+writes landing in the cartridge. A live Gemini probe is included but gated behind
 `RUN_LIVE_PROBE=1` + `GEMINI_API_KEY`.
 
 ## Self-booting cartridges (T37)
@@ -154,8 +155,11 @@ sha256 also published as the additive `_manifest.host_sha256` key — so a
 `.sqlite3` literally contains its own engine ("agent on a keychain"):
 
 ```sh
-python3 -c "import sqlite3;exec(sqlite3.connect('C').execute(\"select body from system_files where name='host.py'\").fetchone()[0])" C [message]
+python3 -c "import sqlite3;exec(sqlite3.connect('C').execute(\"select body from system_files where name='tables.py'\").fetchone()[0])" C [message]
 ```
+
+(Pre-rename exports store the host under `host.py` — use that name in the
+query for those files.)
 
 The trust model is layered (no crypto in v1 — signing is the follow-up):
 **L0** consent at boot (the report states host hash + fetch mode before any

@@ -22,7 +22,7 @@ Keychain split (the file = the agent; the key = where you plug it in):
 
 v1 tool matrix (thin on purpose — T37 lifts this loader into an in-file host):
   ask_llm            full   OpenAI-compatible chat completions, JSON-in-content
-  execute_sql        read-only SELECT / WITH / EXPLAIN / PRAGMA
+  execute_sql        full   DML + DDL — writes commit in place to the cartridge
   fetch_url          gated  HTTP(S) fetch + HTML->text (SSRF-blocked); every call
                             asks for interactive approval (y/N/a). Set
                             TABLES_ALLOW_FETCH=1 to disable the approval layer
@@ -42,7 +42,7 @@ Dashboard cards are inert by design (the optional `dashboard_html` feature is
 unimplemented here — not a bug).
 
 Usage:
-  python3 host/host.py CARTRIDGE.sqlite3 [message]
+  python3 host/tables.py CARTRIDGE.sqlite3 [message]
       --llm-url URL     OpenAI-compatible chat-completions endpoint
                         (env TABLES_LLM_URL)
       --model MODEL     model name (env TABLES_LLM_MODEL; default: the
@@ -311,11 +311,12 @@ class Host:
         ).fetchone()
         if not row:
             return  # pre-T37 export — nothing embedded to check
+        # 'tables.py' = current build; 'host.py' = pre-rename exports (legacy).
         rec = self.conn.execute(
-            "SELECT body, sha256 FROM system_files WHERE name='host.py'"
+            "SELECT body, sha256 FROM system_files WHERE name IN ('tables.py', 'host.py')"
         ).fetchone()
         if not rec:
-            print(f"[{HOST_NAME}] note: system_files present but no host.py row",
+            print(f"[{HOST_NAME}] note: system_files present but no host row",
                   file=sys.stderr)
             return
         body, stored = rec
@@ -519,44 +520,19 @@ class Host:
                 int(usage.get("prompt_tokens") or 0),
                 int(usage.get("completion_tokens") or 0))
 
-    # ── UDF: execute_sql (read-only in v1) ──────────────────────────────────
+    # ── UDF: execute_sql (full permissions — DML + DDL) ─────────────────────
     def udf_run_dynamic_sql(self, sql):
         if not sql or not sql.strip():
             return json.dumps({"error": "Empty query"})
-        # Strip comments BEFORE the first-word check: `/*SELECT*/ DELETE …`
-        # would otherwise normalize its leading token to SELECT and slip past
-        # the gate (CPython's one-statement-per-execute() still blocks
-        # multi-statement strings, so this is the last line of defense).
-        no_comments = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
-        no_comments = re.sub(r"--[^\n]*", " ", no_comments)
-        tokens = no_comments.strip().split()
-        if not tokens:
-            # Comment-only input: nothing to run.
-            return json.dumps({"error": "Empty query"})
-        first_word = re.sub(r"[^A-Z]", "", tokens[0].upper())
-        is_read_only = first_word in ("SELECT", "WITH", "EXPLAIN", "PRAGMA")
-        if not is_read_only:
-            return json.dumps({"error": "Write operations are not enabled in the "
-                                        "standalone host (v1 is read-only). Use a "
-                                        "SELECT / WITH / EXPLAIN / PRAGMA query."})
-        # SQLite 3.35+ writable CTEs: `WITH d AS (DELETE … RETURNING *) SELECT`
-        # starts with WITH but performs writes — reject any WITH that carries a
-        # DML verb (string literals are stripped first to avoid false positives).
-        if first_word == "WITH":
-            no_strings = re.sub(r"'(?:[^']|'')*'", " '' ", no_comments)
-            no_strings = re.sub(r'"(?:[^"]|"")*"', ' "" ', no_strings)
-            if re.search(r"\b(INSERT|UPDATE|DELETE)\b", no_strings, flags=re.I):
-                return json.dumps({"error": "Write operations are not enabled in the "
-                                            "standalone host (v1 is read-only). "
-                                            "WITH queries containing INSERT/UPDATE/"
-                                            "DELETE are refused."})
         try:
             cur = self.conn.execute(sql)
             cols = [d[0] for d in cur.description] if cur.description else []
             rows = [list(r) for r in cur.fetchall()]
             if cols or rows:
                 return json.dumps([{"columns": cols, "values": rows}])
-            return json.dumps([{"columns": ["status", "changes"], "values": [["OK", 1]]}])
+            # CPython sqlite3: rowcount = affected rows for DML, -1 for DDL.
+            changes = max(0, cur.rowcount)
+            return json.dumps([{"columns": ["status", "changes"], "values": [["OK", changes]]}])
         except Exception as e:
             return json.dumps({"error": str(e)})
 

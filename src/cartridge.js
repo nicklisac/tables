@@ -36,9 +36,9 @@
 // T26.3: shared result codes + query/ident helpers now live in src/utils.js.
 import { SQLITE_ROW, SQLITE_DONE, queryAll, quoteIdent, execParams } from './utils.js';
 import { isProtectedTable, getVirtualTableParents, ENGINE_MIN_VERSION, SYSTEM_PROMPT_VERSION } from './schema.js';
-// T37: the standalone host source — single source of truth = host/host.py (D1).
+// T37: the standalone host source — single source of truth = host/tables.py (D1).
 // Vite's ?raw transform inlines the file as a string; stamped into every export.
-import hostPySource from '../host/host.py?raw';
+import hostPySource from '../host/tables.py?raw';
 
 const SQLITE_OK = 0;
 const SQLITE_SERIALIZE_NORMAL = 0;
@@ -260,7 +260,7 @@ export async function stampHost(sqlite3, stagingDb) {
     sha256 TEXT NOT NULL
   )`);
   await execParams(sqlite3, stagingDb,
-    `INSERT INTO system_files (name, mime, body, sha256) VALUES ('host.py', 'text/x-python', ?, ?)
+    `INSERT INTO system_files (name, mime, body, sha256) VALUES ('tables.py', 'text/x-python', ?, ?)
      ON CONFLICT(name) DO UPDATE SET mime = excluded.mime, body = excluded.body, sha256 = excluded.sha256`,
     [hostPySource, sha]);
   await execParams(sqlite3, stagingDb,
@@ -281,8 +281,9 @@ async function captureEmbeddedHost(sqlite3, db) {
   const present = await queryAll(sqlite3, db,
     `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'system_files'`);
   if (!present.length) return null;
+  // 'tables.py' = current build; 'host.py' = pre-rename exports (legacy).
   const row = (await queryAll(sqlite3, db,
-    `SELECT body, sha256 FROM system_files WHERE name = 'host.py'`))[0];
+    `SELECT body, sha256 FROM system_files WHERE name IN ('tables.py', 'host.py')`))[0];
   if (!row) return { present: true, storedSha256: null, actualSha256: null };
   return { present: true, storedSha256: row[1], actualSha256: await sha256Hex(row[0]) };
 }
@@ -720,10 +721,10 @@ async function buildImportReport(agent, preSwap) {
   if (preSwap) {
     const eh = preSwap.embeddedHost;
     const shortHash = (h) => (h || '?').slice(0, 8);
-    // F-02: a table without a host.py row (foreign/empty system_files) has no
+    // F-02: a table without a host row (foreign/empty system_files) has no
     // embedded host to speak of — report it as none, not as drift.
     if (eh === null || !eh.actualSha256) {
-      lines.push(['Embedded host', eh === null ? 'none (pre-T37 export)' : 'none (no host.py in system_files)']);
+      lines.push(['Embedded host', eh === null ? 'none (pre-T37 export)' : 'none (no host row in system_files)']);
     } else if (eh.storedSha256 !== eh.actualSha256) {
       // Overrides the provider banner — a tamper warning outranks config.
       banner = { kind: 'warn', text: 'The embedded host does not match its own recorded hash — this file was modified after export. Review it before running it in a CLI.' };

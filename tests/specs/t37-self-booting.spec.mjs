@@ -1,6 +1,6 @@
 // T37 (Phase A) — Self-Booting Cartridges: export-time host stamping + import
 // trust surface. Decisions in docs/research/ticket-37-self-booting-design.md:
-//   D1: single source of truth = host/host.py (Vite ?raw), stamped into the
+//   D1: single source of truth = host/tables.py (Vite ?raw), stamped into the
 //       EXPORT STAGING COPY only — the live web DB stays lean.
 //   D2: system_files(name, mime, body, sha256) — protected by T21's underscore rule.
 //   D3: additive `host_sha256` manifest key (freeze-safe — per-field frozen-shape test).
@@ -22,7 +22,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { waitAgent } from '../helpers.mjs';
 
 const pExecFile = promisify(execFile);
-const HOST_FILE = path.resolve('host/host.py');
+const HOST_FILE = path.resolve('host/tables.py');
 const PY = process.env.PYTHON || 'python3';
 const hostSource = fs.readFileSync(HOST_FILE, 'utf8');
 const hostSha256 = crypto.createHash('sha256').update(hostSource, 'utf8').digest('hex');
@@ -117,13 +117,13 @@ function mutateCartridge(bytes, fn) {
 }
 
 test.describe('T37 (Phase A) — in-file host stamping + import trust surface', () => {
-  test('every export stamps system_files(host.py) with a correct sha256 + manifest key', async ({ page }) => {
+  test('every export stamps system_files(tables.py) with a correct sha256 + manifest key', async ({ page }) => {
     await boot(page);
     const bytes = await exportCurrent(page);
     withCartridgeDb(bytes, (db) => {
       const row = db.prepare('SELECT name, mime, body, sha256 FROM system_files').all();
       expect(row).toHaveLength(1);
-      expect(row[0].name).toBe('host.py');
+      expect(row[0].name).toBe('tables.py');
       expect(row[0].mime).toBe('text/x-python');
       // Body is the repo source verbatim — single source of truth (D1).
       expect(row[0].body).toBe(hostSource);
@@ -149,7 +149,7 @@ test.describe('T37 (Phase A) — in-file host stamping + import trust surface', 
     await boot(page);
     const bytes = mutateCartridge(await exportCurrent(page), (db) => {
       // Append to the body WITHOUT updating sha256 — simulates post-export modification.
-      db.prepare("UPDATE system_files SET body = body || '# tampered after export' WHERE name='host.py'").run();
+      db.prepare("UPDATE system_files SET body = body || '# tampered after export' WHERE name='tables.py'").run();
     });
     await stageImportFile(page, bytes);
     await importViaConsent(page);
@@ -167,7 +167,7 @@ test.describe('T37 (Phase A) — in-file host stamping + import trust surface', 
     const oldHost = '#!/usr/bin/env python3\n# tables standalone host v0 (simulated older build)\n';
     const oldHash = crypto.createHash('sha256').update(oldHost, 'utf8').digest('hex');
     const bytes = mutateCartridge(await exportCurrent(page), (db) => {
-      db.prepare("UPDATE system_files SET body=?, sha256=? WHERE name='host.py'").run(oldHost, oldHash);
+      db.prepare("UPDATE system_files SET body=?, sha256=? WHERE name='tables.py'").run(oldHost, oldHash);
       db.prepare("UPDATE _manifest SET value=? WHERE key='host_sha256'").run(oldHash);
     });
     await stageImportFile(page, bytes);
@@ -199,7 +199,7 @@ test.describe('T37 (Phase A) — in-file host stamping + import trust surface', 
     const oldHost = '#!/usr/bin/env python3\n# tables standalone host v0 (simulated older build)\n';
     const oldHash = crypto.createHash('sha256').update(oldHost, 'utf8').digest('hex');
     const foreign = mutateCartridge(await exportCurrent(page), (db) => {
-      db.prepare("UPDATE system_files SET body=?, sha256=? WHERE name='host.py'").run(oldHost, oldHash);
+      db.prepare("UPDATE system_files SET body=?, sha256=? WHERE name='tables.py'").run(oldHost, oldHash);
     });
     await stageImportFile(page, foreign);
     await importViaConsent(page);
@@ -208,7 +208,7 @@ test.describe('T37 (Phase A) — in-file host stamping + import trust surface', 
 
     const bytes2 = await exportCurrent(page);
     withCartridgeDb(bytes2, (db) => {
-      const row = db.prepare('SELECT body, sha256 FROM system_files WHERE name=\'host.py\'').get();
+      const row = db.prepare('SELECT body, sha256 FROM system_files WHERE name=\'tables.py\'').get();
       expect(row.body).toBe(hostSource);
       expect(row.sha256).toBe(hostSha256);
     });
@@ -289,7 +289,7 @@ cartridge, message, llm_url, answers_csv = sys.argv[1:5]
 answers = [a for a in answers_csv.split(",") if a != ""]
 pid, fd = pty.fork()
 if pid == 0:
-    os.execvp(sys.executable, [sys.executable, "host/host.py", cartridge, message,
+    os.execvp(sys.executable, [sys.executable, "host/tables.py", cartridge, message,
                                 "--llm-url", llm_url, "--model", "fake-model", "--api-key", "test-key-000"])
 out = b""
 prompt = b"fetch_url wants to fetch"
@@ -336,7 +336,7 @@ sys.exit(code)
   test('L1: a tampered embedded host (body ≠ recorded hash) refuses boot before any DML', async ({ page }) => {
     await boot(page);
     const file = writeCartridgeFile(mutateCartridge(await exportCurrent(page), (db) => {
-      db.prepare("UPDATE system_files SET body = body || '# tampered' WHERE name='host.py'").run();
+      db.prepare("UPDATE system_files SET body = body || '# tampered' WHERE name='tables.py'").run();
     }), 'l1-tamper');
     try {
       const llm = await startFakeLlm([FINAL_REPLY]);

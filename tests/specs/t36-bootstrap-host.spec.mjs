@@ -24,7 +24,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { waitAgent } from '../helpers.mjs';
 
 const pExecFile = promisify(execFile);
-const HOST = path.resolve('host/host.py');
+const HOST = path.resolve('host/tables.py');
 const PY = process.env.PYTHON || 'python3';
 
 // ── Download capture (no FSA — field freeze, 2026-08-24) ───────────────────
@@ -367,13 +367,12 @@ test.describe('T36 — standalone cartridge host (Python-first)', () => {
     }
   });
 
-  test('a write query is refused (v1 host is read-only) but the loop survives', async ({ page }) => {
+  test('a write query executes (full permissions) and lands in the cartridge', async ({ page }) => {
     await boot(page);
     const bytes = await exportCurrent(page);
-    const file = writeCartridge(bytes, 'readonly');
-    // The model tries a DML write; the UDF returns an error envelope; the model
-    // then answers. Proves read-only gating + that an errored tool doesn't kill
-    // the cascade.
+    const file = writeCartridge(bytes, 'writable');
+    // The model issues a DML write; the UDF runs it; the model then answers.
+    // Proves full-permission writes commit in place to the cartridge.
     const dmlReply = JSON.stringify({
       content: '',
       tool_calls: [{
@@ -389,10 +388,10 @@ test.describe('T36 — standalone cartridge host (Python-first)', () => {
         const toolRow = db.prepare(
           "SELECT content FROM messages WHERE session_id='default' AND role='tool' ORDER BY id DESC LIMIT 1"
         ).get();
-        expect(toolRow.content).toMatch(/read-only/i);
-        // The write did NOT happen.
-        const exists = db.prepare("SELECT 1 FROM sessions WHERE id='x'").get();
-        expect(exists).toBeUndefined();
+        expect(toolRow.content).toMatch(/OK/);
+        // The write DID happen.
+        const exists = db.prepare("SELECT name FROM sessions WHERE id='x'").get();
+        expect(exists.name).toBe('x');
       });
     } finally {
       await llm.close();
