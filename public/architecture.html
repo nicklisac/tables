@@ -882,7 +882,7 @@
         ddl: 'CREATE VIEW v_grid_matrix AS\nWITH RECURSIVE rows_axis(n) AS (SELECT 0 UNION ALL ...),\n     cols_axis(n) AS (SELECT 0 UNION ALL ...)\nSELECT r.n AS row, c.n AS col, dc.id AS card_id, ...\nFROM rows_axis r CROSS JOIN cols_axis c\nLEFT JOIN dashboard_cards dc ON ...;' },
 
       { name: 'system_config', type: 'table', cat: 'config',
-        what: 'Key/value settings: the system prompt, model name, the allow_dml flag, and the effective context window.',
+        what: 'Key/value settings: the system prompt, the last-loaded model name (travels in exports as the recommended model), and the effective context window.',
         why: 'The agent\'s "personality" and limits live here as data — editable via SQL, and carried along in a cartridge export.',
         ddl: 'CREATE TABLE system_config (\n  key TEXT PRIMARY KEY, value TEXT NOT NULL\n);' },
       { name: 'v_schema_catalog', type: 'view', cat: 'config',

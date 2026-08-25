@@ -933,23 +933,6 @@ export async function bootSqliteAgent(config = {}) {
             }
           }
 
-          // Read allow_dml from system_config (default ON '1')
-          let allowDml = true;
-          for await (const cfgStmt of sqlite3.statements(db, `SELECT value FROM system_config WHERE key = 'allow_dml'`)) {
-            if (await sqlite3.step(cfgStmt) === SQLITE_ROW) allowDml = sqlite3.row(cfgStmt)[0] !== '0';
-          }
-
-          if (!allowDml) {
-            // D3: allow_dml = 0 is a hard kill switch — refuse before any
-            // approval is offered. Approval is per-op, layered on top.
-            const res = {
-              error: 'Database write operations are disabled in system_config (allow_dml = 0).',
-            };
-            agentEventStream.emit('tool_result', { tool: 'execute_sql', query: sql, error: res.error, result: res });
-            sqlite3.result_text(context, JSON.stringify(res));
-            return;
-          }
-
           // T17: human-in-the-loop approval. Insert a durable 'pending' row,
           // emit the request, and SUSPEND the cascade (JSPI parks this fiber
           // on the promise) until the UI's decision path resolves it. The row

@@ -147,6 +147,20 @@ export async function migrateSystemPrompt(sqlite3, db) {
 }
 
 /**
+ * Upsert a system_config value (trusted JS code path). Used at boot to record
+ * the model actually running — the NAME only, never credentials (keys stay in
+ * localStorage by design, provider-store.js) — so exports can carry it as
+ * _manifest.recommended_model ("which model was last loaded"). '' when
+ * nothing is configured: we never recommend a model.
+ */
+export async function upsertSystemConfig(sqlite3, db, key, value) {
+  await execParams(sqlite3, db,
+    `INSERT INTO system_config (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    [key, String(value ?? '')]);
+}
+
+/**
  * T33b: stable per-Tables-database identity for the _manifest (cartridge_id).
  * Seeded once at boot; travels in every export. INSERT OR IGNORE — an imported
  * database keeps its own id (the id IS that database's identity).
@@ -205,7 +219,6 @@ INSERT OR IGNORE INTO system_config (key, value) VALUES
   -- No default model: an empty value means "not configured" (the portable
   -- host refuses to boot without one; the web harness warns at boot).
   ('llm_model', ''),
-  ('allow_dml', '1'),
   -- T2: fallback effective context window (tau's DEFAULT_CONTEXT_WINDOW_TOKENS).
   -- The LIVE window resolves as: user override (settings field, written to this
   -- same key) -> cloud model-name lookup -> this fallback. The 85% compaction
@@ -217,6 +230,11 @@ INSERT OR IGNORE INTO system_config (key, value) VALUES
   -- identity" from "engine bundle": a customized prompt is NEVER clobbered.
   ('persona', ''),
   ('prompt_customized', '0');
+
+-- Cleanup (2026-08-24): allow_dml was a dead flag — seeded but never
+-- writable from any UI/CLI path, and it gated only the agent's execute_sql.
+-- Removed; shed the orphan row from pre-existing brains (idempotent).
+DELETE FROM system_config WHERE key = 'allow_dml';
 
 -- =====================================================================
 -- 2. Tool Definitions
@@ -336,9 +354,9 @@ CREATE INDEX IF NOT EXISTS idx_changesets_turn ON turn_changesets(session_id, tu
 -- =====================================================================
 -- 4c. Turn DDL Log (T3)
 --
--- DDL executed during a turn, with a pre-image so it can be undone. DDL is
--- locked from the agent in T3 (allow_dml gates DML only); this log is
--- exercised by the !!DDL scratchpad (T9) and future materialization tools
+-- DDL executed during a turn, with a pre-image so it can be undone. The
+-- agent's DDL path is bounded by the protected-objects check (T21); this log
+-- is exercised by the !!DDL scratchpad (T9) and future materialization tools
 -- (T13). pre_image JSON: { create_sql, rows } — for DROP TABLE the rows are
 -- captured BEFORE the drop so they can be re-inserted on rewind.
 -- =====================================================================

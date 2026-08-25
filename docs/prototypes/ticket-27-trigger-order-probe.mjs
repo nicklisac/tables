@@ -63,7 +63,6 @@ export async function runT27Probe() {
     // for turn 1: CAST('' AS INTEGER) = 0).
     const turnIdBefore = (await q(`SELECT value FROM session_context WHERE key='current_turn_id'`))[0][0];
     await exec(`UPDATE session_context SET value = '' WHERE key = 'current_turn_id'`);
-    const allowDmlBefore = (await q(`SELECT value FROM system_config WHERE key='allow_dml'`))[0][0];
 
     // ---- scripted fake ask_llm (replaces the boot closure until reload)
     let script = [];
@@ -213,7 +212,6 @@ export async function runT27Probe() {
     if (defaultItem) { defaultItem.click(); await sleep(800); }
     await deleteSession(sqlite3, db, probeSession);
     await exec('DROP TABLE IF EXISTS t27_probe_data');
-    await exec(`UPDATE system_config SET value = ? WHERE key = 'allow_dml'`, [allowDmlBefore]);
     await exec(`UPDATE session_context SET value = ? WHERE key = 'current_turn_id'`, [turnIdBefore]);
     await populateSessionDropdown();
     R.cleaned = (await q(`SELECT COUNT(*) FROM sessions WHERE id = ?`, [probeSession]))[0][0] === 0;

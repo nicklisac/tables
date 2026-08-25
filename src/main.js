@@ -15,6 +15,7 @@ import {
   setSuppressCapture,
   execParams, queryAll,
   assertProtectedTablesInvariant,
+  upsertSystemConfig,
 } from './schema.js';
 import {
   runCompaction, estimateActiveContextTokens, resolveContextWindow,
@@ -567,6 +568,12 @@ async function bootAgent() {
       llmProvider: provider,
       llmMaxTokens: maxTokens,
     });
+
+    // Record the model actually running in system_config (the NAME only —
+    // keys never leave localStorage; provider-store.js is deliberate about
+    // that). Exports carry it as _manifest.recommended_model, so a cartridge
+    // knows which model was last loaded. '' when nothing is configured.
+    await upsertSystemConfig(agent.sqlite3, agent.db, 'llm_model', model);
 
     // Debug/test handle (used by the cartridge round-trip tests & console).
     window.__agent = agent;

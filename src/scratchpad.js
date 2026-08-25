@@ -17,8 +17,6 @@
  * No write gates: the bang prefix is the explicitness marker (it's a command
  * the human typed). Every WRITE statement (DML + DDL) asks for confirmation
  * before executing; reads (SELECT/WITH/EXPLAIN/…) run immediately.
- * system_config.allow_dml is untouched — it gates the AGENT's execute_sql
- * tool only (T3).
  *
  * Turn identity: the scratchpad user row's message id M becomes turn_id = -M
  * (negative, per T3) so its changesets/DDL log never pollute the real turn

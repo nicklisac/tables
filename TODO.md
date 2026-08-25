@@ -50,24 +50,33 @@ against a simulated pre-fix export.
 otherwise → append `/v1/chat/completions`. t32 endpoint tests extended; t36
 proves the portable host heals a bare `--llm-url`.
 
-## ⏸ 6. `allow_dml` flag — RESEARCH DONE, decision pending (user, tomorrow)
+## ✅ 6. `allow_dml` flag — REMOVED (user decision, 2026-08-24)
 
-Exhaustive research (verified): **dead config.**
+Research verdict: **dead config.** Read exactly twice (seed `'1'` + one gate in
+the agent's `execute_sql` UDF), zero write paths (no UI/settings/migration/CLI),
+gated only the agent tool (scratchpad/CSV/explorer all bypassed it), zero test
+coverage, docs contradicted the code. One late find during removal: the t27
+prototype probe (`docs/prototypes/`) captured+restored it — cleaned up too.
 
-- Read exactly twice: seed (`src/schema.js:208`, value `'1'`) + one gate
-  (`src/harness.js:936–946`).
-- **Zero write paths** — no UI toggle, no settings field, no migration, no CLI.
-  Only changeable by hand-running `UPDATE system_config …`. So it is a constant
-  `'1'` in practice.
-- Gates ONLY the agent's `execute_sql` tool; scratchpad bang-SQL, CSV ingestion,
-  and explorer DDL/DML all bypass it.
-- Zero test coverage of the `= '0'` path.
-- Docs disagree with the code (WAYFINDER T3 says "default OFF"; seed is `'1'`).
-
-Options when we get to it: **A) delete** (seed + gate + comments — matches the
-"full permission like always" stance) · **B) wire up** (settings toggle + fix
-docs/seed).
+Removed: seed + gate block + comments, plus an idempotent boot cleanup that
+sheds the orphan row from pre-existing brains (SCHEMA_SQL).
 
 ## ✅ 7. Favicon — DONE (earlier session)
 
 `public/favicon.svg` (brand mark in accent teal) + `<link rel="icon">`.
+
+---
+
+## Follow-ups (added after the dump)
+
+### ✅ Track the loaded model → export recommendation (2026-08-24)
+
+The plumbing existed but nothing wrote it: `system_config.llm_model` feeds
+`_manifest.recommended_model` at export, yet the real model lived only in
+localStorage profiles. Now boot records the running model's NAME (never keys —
+key-leak safety asserted by full-file scan in the test) into
+`system_config.llm_model`; exports carry it as `recommended_model`, so a
+cartridge knows which model was last loaded; `''` when nothing was ever
+configured (we never recommend a model). Portable host chain unchanged:
+`--model` → env → recommended_model → refuse loudly. Spec:
+`tests/specs/model-recommendation.spec.mjs`.
