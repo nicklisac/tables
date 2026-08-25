@@ -1,6 +1,6 @@
 # T38 Design: Portable Onboarding — `tables.py --setup`
 
-**Status:** DRAFT for user review (2026-08-24) — D1/D7 need confirmation; **D2 resolved** (AGY `agy-1787668835-614956` + tech lead: no in-file sealing, no hand-rolled crypto — keyring + 0600 local file), pending user sign-off since it revises the original brainstorm
+**Status:** ✅ **DECISIONS LOCKED (2026-08-24, user OK)** — D1–D7 confirmed; ready to start. D2 per AGY `agy-1787668835-614956` + tech lead (no in-file sealing, no hand-rolled crypto). Parked micro-decisions (§9/§10) are non-blocking.
 **Depends on:** T36 ✅ · T37 ✅ · model tracking (`85a9580` — `llm_model` → `recommended_model` already travels in exports)
 
 ---
@@ -155,17 +155,17 @@ is still no default model (T-batch decision, unchanged).
   (`llm_provider`, `llm_url` + profile set per D1). No secrets table — keys
   never touch the file (§4.1).
 
-## 7. Decisions — need user confirmation
+## 7. Decisions — LOCKED (user OK, 2026-08-24)
 
 | # | Decision | Recommendation |
 |---|---|---|
-| D1 | Profiles in the file: real table `llm_profiles(id, name, provider, url, model)` vs JSON blob in `system_config` | **Table** — "everything is a table" is the product's identity; setup lists them with plain SQL. (Blob is the cheap alternative if you want less schema surface.) |
-| D2 | Key backends: keyring + 0600 local-file fallback, **no in-file sealing, no hand-rolled crypto** (per §4.1 — AGY `agy-1787668835-614956` + tech lead) vs the original draft's sealed-in-file option | **Keyring + local file.** The original draft's sealed backend is killed: UX contradiction (passphrase per run breaks flagless use), contradicts our own key-leak invariant, no industry precedent, and a crypto surface that buys nothing the threat model needs. *Pending your sign-off — this reverses part of your original brainstorm, so it's yours to confirm.* |
+| D1 | Profiles in the file: real table `llm_profiles(id, name, provider, url, model)` vs JSON blob in `system_config` | **Table** ✅ locked — "everything is a table" is the product's identity; setup lists them with plain SQL. |
+| D2 | Key backends: keyring + 0600 local-file fallback, **no in-file sealing, no hand-rolled crypto** (per §4.1 — AGY `agy-1787668835-614956` + tech lead) vs the original draft's sealed-in-file option | **Keyring + local file** ✅ locked. The original draft's sealed backend is killed: UX contradiction (passphrase per run breaks flagless use), contradicts our own key-leak invariant, no industry precedent, and a crypto surface that buys nothing the threat model needs. User-confirmed 2026-08-24. |
 | D3 | Keyring discovery: our namespace only + paste, no prefix-sniffing foreign entries | **Yes** (privacy) |
 | D4 | Setup writes non-secret config **back into the cartridge** vs sidecar `.tables-config` file | **Into the cartridge** — T37 D6 already locked "the file is the user's agent, in-place always"; a sidecar breaks the one-file story. |
 | D5 | Connection test at end of setup (one tiny real completion) | **Yes** — "✓ works" beats "saved." |
 | D6 | Keyring convention: service `tables`, account = profile id | as stated |
-| D7 | Export scope: **all** saved profiles vs active-only | **All** (keys never) — matches "bring in any data from the web if it has already been established." |
+| D7 | Export scope: **all** saved profiles vs active-only | **All** ✅ locked (keys never) — matches "bring in any data from the web if it has already been established." |
 
 ## 8. Testing strategy (repo conventions)
 
