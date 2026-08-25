@@ -287,7 +287,17 @@ default names the fix — re-run `--setup` — and never re-guesses another file
 - Machine-local by design, same category as the paired key: a per-machine
   pointer that never travels in the file (a copied cartridge carries no one
   else's paths). Does not contradict D4 — D4 governs agent config traveling
-  WITH the file; this is the inverse direction.
+  WITH the file; this is the inverse direction. Test for what belongs where:
+  *"if I copy this file to a fresh machine, is this value still true?"* —
+  provider config: yes (in-file); key: no (machine); default path: no — it's
+  one machine's filesystem layout, and in-file it would be self-referential
+  garbage on every other machine the file visits.
+- Move-resilient (2026-08-25, user request): stored TWICE —
+  `default_cartridge_rel` (relative to tables.py; survives moving the folder
+  that holds BOTH host and cartridge, because the anchor moves with it) +
+  `default_cartridge` (absolute; survives moving just one of them). Resolution
+  tries rel first, then absolute; a stale default names both in the error.
+  Absolute-only configs (pre-refinement setups) keep working.
 - Explicit path always overrides; re-running `--setup` against another file
   moves the default (last setup wins).
 - Key-skip still binds the default: skipping the key doesn't unbind the file.

@@ -26,6 +26,7 @@ import { waitAgent } from '../helpers.mjs';
 
 const pExecFile = promisify(execFile);
 const HOST_FILE = path.resolve('host/tables.py');
+const HOST_DIR = path.dirname(HOST_FILE);
 const PY = process.env.PYTHON || 'python3';
 
 // ── Download capture + profile seeding (t36/t37/model-rec pattern) ─────────
@@ -138,9 +139,10 @@ function cleanEnv(extra = {}) {
 
 /** Run the host as a child process (piped stdin — NOT a TTY).
  *  file = null omits the cartridge arg; message = null omits the message
- *  (both null = bare invocation, exercises the machine-default path). */
-async function runHost(file, message, { env = {}, cwd, extraArgs = [] } = {}) {
-  const args = [HOST_FILE, ...(file ? [file] : []), ...(message ? [message] : []), ...extraArgs];
+ *  (both null = bare invocation, exercises the machine-default path).
+ *  hostFile runs a COPY of the host (the portable-layout move test). */
+async function runHost(file, message, { env = {}, cwd, extraArgs = [], hostFile = HOST_FILE } = {}) {
+  const args = [hostFile, ...(file ? [file] : []), ...(message ? [message] : []), ...extraArgs];
   try {
     const { stdout, stderr } = await pExecFile(PY, args,
       { timeout: 60_000, maxBuffer: 10 * 1024 * 1024, env: cleanEnv(env), cwd });
@@ -227,11 +229,11 @@ sys.exit(code)
  * @param {Array<[string, string[]]>} specs [prompt, answers...] pairs — the
  *   prompt must be the EXACT string the host prints (trailing space included).
  */
-async function runSetupPty(specs, { env = {}, cwd, cartridgeArg = null } = {}) {
+async function runSetupPty(specs, { env = {}, cwd, cartridgeArg = null, hostFile = HOST_FILE } = {}) {
   const driver = path.join(os.tmpdir(), `t38-pty-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.py`);
   fs.writeFileSync(driver, PTY_DRIVER);
   const specArgs = specs.map(([prompt, answers]) => `${prompt}|${answers.join(';')}`);
-  const args = [driver, ...specArgs, '--', PY, HOST_FILE, '--setup', ...(cartridgeArg ? [cartridgeArg] : [])];
+  const args = [driver, ...specArgs, '--', PY, hostFile, '--setup', ...(cartridgeArg ? [cartridgeArg] : [])];
   try {
     const { stdout, stderr } = await pExecFile(PY, args,
       { timeout: 60_000, maxBuffer: 10 * 1024 * 1024, env: cleanEnv(env), cwd });
@@ -792,11 +794,13 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
         expect(res.code, `driver output:\n${res.out}`).toBe(0);
         expect(res.out).toContain(`This machine now defaults to ${path.basename(file)}`);
 
-        // Machine-local pointer, next to the credentials — absolute, so daily
-        // runs work from any cwd. Never in the file itself.
+        // Machine-local pointer, next to the credentials — stored TWICE:
+        // relative to the host script (move-resilient) + absolute (any cwd).
+        // Never in the cartridge file itself.
         const cfgPath = path.join(xdg.dir, 'tables', 'config.json');
-        expect(JSON.parse(fs.readFileSync(cfgPath, 'utf8')).default_cartridge)
-          .toBe(path.resolve(file));
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+        expect(cfg.default_cartridge).toBe(path.resolve(file));
+        expect(path.resolve(HOST_DIR, cfg.default_cartridge_rel)).toBe(path.resolve(file));
         expect(fs.readFileSync(file).toString('latin1')).not.toContain(xdg.dir);
 
         // THE POINT: no path, no flags, no key env — from a DIFFERENT cwd.
@@ -809,6 +813,51 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
           expect(llm.seen.at(-1).model).toBe('fake-model');
         } finally { fs.rmSync(elsewhere, { recursive: true, force: true }); }
       } finally { fs.rmSync(file, { force: true }); }
+    } finally { await llm.close(); }
+  });
+
+  test('moving the folder that holds host + cartridge keeps the default working', async ({ page }) => {
+    const llm = await startFakeLlm();
+    try {
+      // The portable layout: one folder holding a copy of the host + the
+      // cartridge (the T37 "the file is the agent" story, made daily-usable).
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 't38-move-'));
+      const hostCopy = path.join(dir, 'tables.py');
+      fs.copyFileSync(HOST_FILE, hostCopy);
+      const carPath = path.join(dir, 'my-agent.sqlite3');
+      fs.writeFileSync(carPath, Buffer.from(await exportWithProfile(page, llm)));
+      const xdg = freshXdg();
+      const kr = mockKeyring(xdg.dir, {
+        [PROFILE_ID]: { key: 'sk-move', saved_at: '2026-08-20T10:00:00+00:00' },
+      });
+      try {
+        // Real setup on the host copy — binds the default (rel + absolute).
+        const res = await runSetupPty(
+          [['Use this? [Y/n/edit]: ', ['y']], ['Use it? [Y/n]: ', ['y']]],
+          { env: { ...kr.env, ...xdg.env }, cartridgeArg: carPath, hostFile: hostCopy });
+        expect(res.code, `driver output:\n${res.out}`).toBe(0);
+        // Sibling layout → the relative candidate is just the file name.
+        const cfg = JSON.parse(fs.readFileSync(path.join(xdg.dir, 'tables', 'config.json'), 'utf8'));
+        expect(cfg.default_cartridge_rel).toBe('my-agent.sqlite3');
+
+        // Works before the move (from an unrelated cwd).
+        let daily = await runHost(null, 'hi', { env: { ...kr.env, ...xdg.env }, hostFile: hostCopy });
+        expect(daily.code, `stderr:\n${daily.stderr}`).toBe(0);
+        expect(llm.seen.at(-1).auth).toBe('Bearer sk-move');
+
+        // MOVE the whole folder. The absolute candidate is now stale — the
+        // script-relative one must carry it (its anchor moved with it).
+        const moved = dir + '-moved';
+        fs.renameSync(dir, moved);
+        expect(fs.existsSync(carPath)).toBe(false); // old location really gone
+
+        daily = await runHost(null, 'hi', { env: { ...kr.env, ...xdg.env }, hostFile: path.join(moved, 'tables.py') });
+        expect(daily.code, `stderr:\n${daily.stderr}`).toBe(0);
+        expect(daily.stdout).toContain('pong');
+        expect(llm.seen.at(-1).auth).toBe('Bearer sk-move');
+      } finally {
+        for (const d of [dir, dir + '-moved']) fs.rmSync(d, { recursive: true, force: true });
+      }
     } finally { await llm.close(); }
   });
 
@@ -826,7 +875,9 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
         [PROFILE_ID]: { key: 'sk-def-res', saved_at: '2026-08-20T10:00:00+00:00' },
       });
       // Bind the machine default to A (the shape --setup writes — asserted in
-      // the previous test; here it's a fixture so we can exercise resolution).
+      // the tests above; here it's a fixture so we can exercise resolution.
+      // Absolute-only on purpose: also covers configs written before the
+      // relative candidate existed.)
       const cfgPath = path.join(xdg.dir, 'tables', 'config.json');
       fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
       fs.writeFileSync(cfgPath, JSON.stringify({ default_cartridge: fileA }));

@@ -54,7 +54,10 @@ you only get "✓ works" when the endpoint actually answered. It also records
 **this cartridge as your machine's default** (`~/.config/tables/config.json`,
 next to the key), so daily runs need no path at all — pass a different file's
 path explicitly to override it, or re-run `--setup` against another file to
-move the default. Re-run `--setup` anytime to change providers or keys.
+move the default. The pointer is stored relative to `tables.py` *and*
+absolute, so moving the folder that holds both keeps working (a stale
+default fails loudly and names what it looked for). Re-run `--setup`
+anymtime to change providers or keys.
 
 ### Setting up your API key and model (manual)
 

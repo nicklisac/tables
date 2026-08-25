@@ -63,7 +63,7 @@ travels in the file:
 
 | Setting    | Resolution order (first hit wins)                                        |
 |------------|--------------------------------------------------------------------------|
-| Cartridge  | positional path → machine default (`~/.config/tables/config.json`, set by `--setup`) → **refuse loudly** (a stale default never silently re-guesses) |
+| Cartridge  | positional path → machine default (`~/.config/tables/config.json`, set by `--setup` — stored relative-to-host AND absolute, so moving the folder that holds both still resolves) → **refuse loudly** (a stale default names what it tried; never re-guesses) |
 | Endpoint   | `--llm-url` → `TABLES_LLM_URL` → in-file `system_config.llm_url` → **refuse loudly** (auto-healed — bare base, `…/v1`, or the full `…/v1/chat/completions` all work) |
 | Model      | `--model` → `TABLES_LLM_MODEL` → in-file `system_config.llm_model` → manifest `recommended_model` → **refuse loudly** (no hardcoded default) |
 | API key    | `--api-key` → `TABLES_LLM_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY` → keyring(`tables`, profile id) → `~/.config/tables/credentials.json` → paste prompt (TTY) / fail closed |

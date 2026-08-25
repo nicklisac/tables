@@ -49,7 +49,9 @@ T38 — portable onboarding (--setup):
       file — keys NEVER travel in the file), run a real connection test, and
       write the non-secret config back into the cartridge. Setup also binds
       this machine to that cartridge (~/.config/tables/config.json, next to
-      the credentials) — after that, daily use is a flagless one-liner:
+      the credentials — stored relative to this script AND absolute, so
+      moving the folder that holds both still resolves) — after that, daily
+      use is a flagless one-liner:
           python3 tables.py "your question"
       Pass a different path explicitly to override the default; re-run
       --setup against another file to move it.
@@ -550,25 +552,57 @@ def _machine_config_read():
         return {}
 
 
+def _host_dir():
+    """Directory holding this script — the anchor for move-resilient paths."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def default_cartridge_candidates():
+    """Stored default-cartridge candidates, most move-resilient first:
+    relative to this script (survives moving the folder that holds BOTH the
+    host and the cartridge — the anchor moves with it), then absolute
+    (survives moving just the host). Neither is trusted until it exists."""
+    data = _machine_config_read()
+    out = []
+    rel = data.get("default_cartridge_rel")
+    if isinstance(rel, str) and rel:
+        out.append(os.path.normpath(os.path.join(_host_dir(), rel)))
+    p = data.get("default_cartridge")
+    if isinstance(p, str) and p and (not out or p != out[-1]):
+        out.append(p)
+    return out
+
+
 def default_cartridge():
-    """The cartridge --setup bound to this machine (absolute path), or None.
+    """The cartridge --setup bound to this machine, or None.
 
     Machine-local by design: it is a per-machine pointer (like the paired
     key), NOT agent state — it never travels in the file, so a copied
-    cartridge carries no one else's paths with it."""
-    p = _machine_config_read().get("default_cartridge")
-    return p if isinstance(p, str) and p else None
+    cartridge carries no one else's paths with it. Stored twice (relative to
+    this script + absolute) so moving the folder that holds both still works."""
+    for c in default_cartridge_candidates():
+        if os.path.exists(c):
+            return c
+    return None
 
 
 def set_default_cartridge(path):
     """Record this machine's default cartridge (end of a successful --setup).
-    Absolute so daily runs work from any cwd. Atomic write, same pattern as
-    creds_set — non-secret, 0644."""
+    Stored twice: absolute (works from any cwd) and relative to this script
+    (survives moving the folder that holds both — the portable layout).
+    Atomic write, same pattern as creds_set — non-secret, 0644."""
     target = config_file_path()
     directory = os.path.dirname(target)
     os.makedirs(directory, mode=0o700, exist_ok=True)
     data = _machine_config_read()
-    data["default_cartridge"] = os.path.abspath(path)
+    abs_path = os.path.abspath(path)
+    data["default_cartridge"] = abs_path
+    try:
+        rel = os.path.relpath(abs_path, _host_dir())
+        if not os.path.isabs(rel):  # cross-drive (Windows) falls back to abs
+            data["default_cartridge_rel"] = rel
+    except ValueError:
+        pass  # different drive — absolute only
     tmp = target + f".tmp.{os.getpid()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1726,23 +1760,33 @@ def main(argv=None):
         return run_setup(args, cartridge)
 
     # Cartridge resolution: explicit path > machine default (set by --setup).
-    # Fail loud on a stale default — never guess another file.
-    if cartridge is None and message is not None and not default_cartridge():
-        print("error: no default cartridge yet — that argument looks like a "
-              "message, but --setup hasn't bound a file to this machine. "
-              "Run --setup for guided onboarding (it remembers the file it set "
-              "up), or pass a .sqlite3 path.", file=sys.stderr)
-        return 2
-    path = cartridge or default_cartridge()
-    if not path:
-        print("error: no cartridge given — pass a .sqlite3 path, or run --setup "
-              "for guided onboarding (it remembers the file it set up)",
-              file=sys.stderr)
-        return 2
-    if not os.path.exists(path):
-        hint = "" if cartridge else " — it may have moved; pass a path, or re-run --setup"
-        print(f"error: cartridge not found: {path}{hint}", file=sys.stderr)
-        return 2
+    # The default is stored twice (relative to this script + absolute) so a
+    # moved folder still resolves; a stale default fails loud naming what it
+    # tried — never re-guessing another file.
+    if not cartridge:
+        candidates = default_cartridge_candidates()
+        path = next((c for c in candidates if os.path.exists(c)), None)
+        if path is None:
+            if message is not None and not candidates:
+                print("error: no default cartridge yet — that argument looks "
+                      "like a message, but --setup hasn't bound a file to this "
+                      "machine. Run --setup for guided onboarding (it remembers "
+                      "the file it set up), or pass a .sqlite3 path.",
+                      file=sys.stderr)
+            elif candidates:
+                print(f"error: default cartridge not found (tried: "
+                      f"{' · '.join(candidates)}) — it may have moved; pass a "
+                      "path, or re-run --setup", file=sys.stderr)
+            else:
+                print("error: no cartridge given — pass a .sqlite3 path, or run "
+                      "--setup for guided onboarding (it remembers the file it "
+                      "set up)", file=sys.stderr)
+            return 2
+    else:
+        path = cartridge
+        if not os.path.exists(path):
+            print(f"error: cartridge not found: {path}", file=sys.stderr)
+            return 2
 
     host = Host(path, None, None, None)
     try:
