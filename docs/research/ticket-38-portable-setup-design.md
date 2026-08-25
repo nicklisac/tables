@@ -222,6 +222,24 @@ Save it so future runs don't ask?
 ```
 No scanning of foreign keyring namespaces by prefix (D3).
 
+**S2b — keyring has OTHER Tables keys, but not this profile's.** Profile ids
+are per-browser UUIDs, so a usable key can sit in our namespace under a
+different account name (different browser/export). On an exact-match miss,
+offer candidates from OUR namespace only — explicit choice, no guessing:
+```
+◆ API key: none found for profile "groq-abc123".
+  You have other saved Tables keys:
+    1. tables/groq-xyz789    Groq · llama-3.3-70b-versatile · saved Aug 20
+    2. tables/or-def456      OpenRouter · claude-sonnet-4.5 · saved Jul 30
+  Use one of these? [1/2/n — n = paste a new key] > 1
+◆ Testing connection… ✓ works        ← a wrong pick is caught here, not by us
+                                       trying to be clever
+```
+Friendly name shows when the candidate's id resolves against the current file's
+profiles (or local config); otherwise raw account + date. Values never shown.
+Still D3-compliant: our namespace only, explicit choice. Foreign keychain
+entries stay invisible regardless of how full the keyring is.
+
 **S3 — missing everything** (no keyring package/backend, nothing saved; shown
 with a pre-T38 export that has no provider config):
 ```
@@ -240,8 +258,10 @@ Keyed variant: paste → save offer lists only available backends (local file wh
 keyring absent) → test. The `pip install keyring` hint lands at the END, never
 mid-flow. Local providers skip the key step entirely.
 
-**Open micro-decision:** keep "Skip — pair it later" (S2) with its honest
-end-state marker, or make setup refuse to finish without a working key?
+**Open micro-decisions:** keep "Skip — pair it later" (S2) with its honest
+end-state marker, or make setup refuse to finish without a working key? ·
+Stale-entry cleanup (`--setup --prune`: offer to remove `tables/*` entries whose
+id matches no known profile) — parked as v1.1.
 
 ## 10. Open questions (parked, not blocking)
 
