@@ -91,13 +91,20 @@ function mutateCartridge(bytes, fn) {
 }
 
 // ── fake LLM (t37 pattern + Authorization/model capture) ───────────────────
-function startFakeLlm({ failFirst = 0 } = {}) {
+// requireAuth: when set, every request must carry that Bearer token or gets
+// a 401 — simulates a local server that DOES require an API key.
+function startFakeLlm({ failFirst = 0, requireAuth = null } = {}) {
   let call = 0;
   const seen = [];
   const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c) => { body += c; });
     req.on('end', () => {
+      if (requireAuth && req.headers['authorization'] !== `Bearer ${requireAuth}`) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Invalid API key provided' } }));
+        return;
+      }
       call += 1;
       let model = null;
       try { model = JSON.parse(body).model ?? null; } catch { /* canned reply regardless */ }
@@ -393,8 +400,8 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
         const res = await runSetupPty(
           [
             ['Use this? [Y/n/edit]: ', ['y']],
-            ['> ', ['1', '1']],              // [1] paste · save offer: [1] keychain
-            ['API key: ', ['sk-pasted-s2']],
+            ['> ', ['1', '1']],              // [1] paste · save to: [1] OS keychain
+            ['API key → OS keychain: ', ['sk-pasted-s2']],  // destination stated pre-entry
           ],
           { env: { ...kr.env, ...xdg.env }, cartridgeArg: file });
         expect(res.code, `driver output:\n${res.out}`).toBe(0);
@@ -490,7 +497,7 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
             [`New URL [${llm.base}/v1]: `, ['~empty~']],
             ['New model [fake-model]: ', ['unverified-model']],
             ['> ', ['1', '3']],                     // paste · don't save
-            ['API key: ', ['sk-rollback']],
+            ["API key (not saved — you'll be asked again next run): ", ['sk-rollback']],
             ['Try again? [Y/n]: ', ['n']],          // decline the retry
           ],
           { env: { ...kr.env, ...xdg.env }, cartridgeArg: file });
@@ -525,8 +532,8 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
             ['> ', ['4']],                                   // [4] Groq
             [`Base URL [https://api.groq.com/openai/v1]: `, [llm.base]],
             ['Model [llama-3.3-70b-versatile]: ', ['fake-model']],
-            ['> ', ['1', '1']],                              // paste · save: local file
-            ['API key: ', ['sk-manual-key']],
+            ['> ', ['1', '1']],                              // paste · save to: local file
+            [`API key → local file (${path.join(xdg.dir, 'tables', 'credentials.json')}): `, ['sk-manual-key']],
           ],
           { env: { TABLES_KEYRING: 'absent', ...xdg.env }, cartridgeArg: file });
         expect(res.code, `driver output:\n${res.out}`).toBe(0);
@@ -553,7 +560,7 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
     } finally { await llm.close(); }
   });
 
-  test('S3 — missing everything: manual entry with auto-heal, local provider skips the key, pip hint at the end', async ({ page }) => {
+  test('S3 — missing everything: manual entry with auto-heal, local provider offers (never forces) a key, pip hint at the end', async ({ page }) => {
     const llm = await startFakeLlm();
     try {
       // Pre-T38 shape: no profile table, no provider config in system_config.
@@ -569,13 +576,14 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
             ['> ', ['2']],                                   // [2] Ollama (local)
             [`Base URL [http://localhost:11434/v1]: `, [llm.base]],
             ['Model [llama3.2]: ', ['fake-model']],
+            ['Does your server require one? [y/N]: ', ['n']], // keyless here
           ],
           { env: { TABLES_KEYRING: 'absent', ...xdg.env }, cartridgeArg: file });
         expect(res.code, `driver output:\n${res.out}`).toBe(0);
         expect(res.out).toContain('no saved provider config (older export)');
         expect(res.out).toContain(`→ healed to ${llm.base}/v1/chat/completions`);
-        // keyRequired=false from the registry → the key step is skipped.
-        expect(res.out).toContain('needs none — skipped');
+        // key_required=false from the registry → offered, not forced.
+        expect(res.out).toContain('usually needs none');
         expect(res.out).toContain('✓ works (ollama · fake-model)');
         // The hint lands at the END, never mid-flow.
         expect(res.out.indexOf('pip install keyring')).toBeGreaterThan(
@@ -597,6 +605,41 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
     } finally { await llm.close(); }
   });
 
+  test('local provider that DOES require a key: entry offered (dummy ok), saved, verified', async ({ page }) => {
+    const llm = await startFakeLlm({ requireAuth: 'sk-local-dummy' });
+    try {
+      // Pre-T38 shape → manual entry (the S3 path) with Ollama.
+      const bytes = mutateCartridge(await exportWithProfile(page, llm), (db) => {
+        db.exec('DROP TABLE IF EXISTS llm_profiles');
+        db.prepare("DELETE FROM system_config WHERE key IN ('llm_provider','llm_url')").run();
+      });
+      const file = writeCartridgeFile(bytes, 'localk');
+      const xdg = freshXdg();
+      const kr = mockKeyring(xdg.dir);
+      try {
+        const res = await runSetupPty(
+          [
+            ['> ', ['2']],                                   // [2] Ollama (local)
+            [`Base URL [http://localhost:11434/v1]: `, [llm.base]],
+            ['Model [llama3.2]: ', ['fake-model']],
+            ['Does your server require one? [y/N]: ', ['y']], // it does
+            ['> ', ['1']],                                    // save to: [1] OS keychain (mock)
+            ['API key → OS keychain: ', ['sk-local-dummy']],  // a dummy token is fine
+          ],
+          { env: { ...kr.env, ...xdg.env }, cartridgeArg: file });
+        expect(res.code, `driver output:\n${res.out}`).toBe(0);
+        expect(res.out).toContain('usually needs none');
+        expect(res.out).toContain('a dummy is fine');
+        expect(res.out).toContain('✓ works (ollama · fake-model)');
+        // The key reached the wire (the 401-gated fake LLM proved it) and was saved.
+        expect(llm.seen.at(-1).auth).toBe('Bearer sk-local-dummy');
+        const entries = Object.values(kr.read());
+        expect(entries).toHaveLength(1);
+        expect(entries[0].key).toBe('sk-local-dummy');
+      } finally { fs.rmSync(file, { force: true }); }
+    } finally { await llm.close(); }
+  });
+
   test('connection-test failure shows the provider’s real error and loops to re-enter', async ({ page }) => {
     const llm = await startFakeLlm({ failFirst: 1 }); // first call 500s, second works
     try {
@@ -607,8 +650,8 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
         const res = await runSetupPty(
           [
             ['Use this? [Y/n/edit]: ', ['y']],
-            ['> ', ['1', '3', '3']],           // paste · don't save · don't save
-            ['API key: ', ['sk-bad', 'sk-good']],
+            ['> ', ['1', '3', '3']],           // paste · don't save · don't save (re-asked on retry)
+            ["API key (not saved — you'll be asked again next run): ", ['sk-bad', 'sk-good']],
             ['Try again? [Y/n]: ', ['y']],
           ],
           { env: { ...kr.env, ...xdg.env }, cartridgeArg: file });
@@ -650,8 +693,8 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
 
         // First daily run (TTY): prompts for the key, offers to save, works.
         const daily = await runSetupPtyDaily(file, llm, [
-          ['API key: ', ['sk-late']],
           ['> ', ['3']], // don't save — just use it this run
+          ["API key (not saved — you'll be asked again next run): ", ['sk-late']],
         ], { ...kr.env, ...xdg.env });
         expect(daily.code, `driver output:\n${daily.out}`).toBe(0);
         expect(daily.out).toContain('No API key found for this profile');
@@ -671,8 +714,8 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
         const res = await runSetupPty(
           [
             ['Use this? [Y/n/edit]: ', ['y']],
-            ['> ', ['1', '1']],              // paste · save: [1] is now the local file
-            ['API key: ', ['sk-local-7']],
+            ['> ', ['1', '1']],              // paste · save to: [1] is now the local file
+            [`API key → local file (${path.join(xdg.dir, 'tables', 'credentials.json')}): `, ['sk-local-7']],
           ],
           { env: { TABLES_KEYRING: 'absent', ...xdg.env }, cartridgeArg: file });
         expect(res.code, `driver output:\n${res.out}`).toBe(0);

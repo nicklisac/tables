@@ -1,6 +1,6 @@
 # T38 Design: Portable Onboarding — `tables.py --setup`
 
-**Status:** ✅ **COMPLETE (2026-08-25)** — T38 spec 16/16, full suite 166 passed / 4 skipped / 0 failures. Decisions D1–D7 locked 2026-08-24 (user OK). D2 per AGY `agy-1787668835-614956` + tech lead (no in-file sealing, no hand-rolled crypto). AGY review `agy-1787673375-748762` findings applied. Post-lock amendment §11 (machine default cartridge) per user 2026-08-25. Parked: S2b candidate-key copy under current profile id → v1.1 `--rekey`.
+**Status:** ✅ **COMPLETE (2026-08-25)** — T38 spec 18/18, full suite 168 passed / 4 skipped / 0 failures. Decisions D1–D7 locked 2026-08-24 (user OK). D2 per AGY `agy-1787668835-614956` + tech lead (no in-file sealing, no hand-rolled crypto). AGY review `agy-1787673375-748762` findings applied. Post-lock amendments §11 (machine default cartridge) + §12 (local keys, save destination pre-entry) per user 2026-08-25. Parked: S2b candidate-key copy under current profile id → v1.1 `--rekey`.
 **Depends on:** T36 ✅ · T37 ✅ · model tracking (`85a9580` — `llm_model` → `recommended_model` already travels in exports)
 
 ---
@@ -249,14 +249,19 @@ with a pre-T38 export that has no provider config):
   Base URL: http://localhost:11434
     → healed to http://localhost:11434/v1/chat/completions
   Model: llama3.2
-◆ API key: Ollama needs none — skipped.      ← keyRequired=false from registry
+◆ API key: Ollama (local) usually needs none —
+  but some local servers require one (any non-empty token works if it
+  only checks presence — a dummy is fine).
+  Does your server require one? [y/N]: n
 ◆ Testing connection… ✓ works (ollama · llama3.2)
 ✓ Done. Config saved in the file.
 Tip: pip install keyring, then re-run --setup to use your OS keychain.
 ```
-Keyed variant: paste → save offer lists only available backends (local file when
-keyring absent) → test. The `pip install keyring` hint lands at the END, never
-mid-flow. Local providers skip the key step entirely.
+Keyed variant: choose WHERE it will be saved (only available backends — local
+file when keyring absent) → paste with the destination stated in the prompt →
+test. The `pip install keyring` hint lands at the END, never mid-flow. Local
+providers are ASKED whether their server requires a key (dummy tokens noted)
+— never hard-skipped (§12).
 
 **Open micro-decisions:** keep "Skip — pair it later" (S2) with its honest
 end-state marker, or make setup refuse to finish without a working key? ·
@@ -305,3 +310,23 @@ default names the fix — re-run `--setup` — and never re-guesses another file
   is a path if it ends `.sqlite3` or names an existing file, else (with a
 default) it's a message. Bare `tables.py` = REPL on the default; bare word
   with no default fails loud naming `--setup`.
+
+## 12. Post-lock amendment — local keys + save destination pre-entry (user OK, 2026-08-25)
+
+**Problem 1:** the registry hard-skipped the key step for `key_required=false`
+providers ("Ollama needs none — skipped") — but local servers CAN require keys
+(LM Studio with auth enabled, vLLM/LiteLLM tokens, any authenticated
+OpenAI-compatible proxy). A keyless setup against such a server 401s.
+**Fix:** local providers are ASKED instead of skipped: "Does your server
+require one? [y/N]" with the note that any non-empty token works if the server
+only checks presence (a dummy is fine). `n` keeps the keyless fast path; `y`
+enters the normal paste flow. The connection test still guards: a wrong/missing
+key fails loudly before anything is persisted (D5).
+
+**Problem 2:** the user pasted the key BEFORE learning where it would be saved.
+**Fix:** the save-destination choice moved BEFORE entry, and the getpass prompt
+states the destination: `API key → OS keychain: ` / `API key → local file
+(…credentials.json): ` / `API key (not saved — you'll be asked again next run):
+`. Applies to setup AND the daily-path paste fallback. The old post-paste save
+offer is gone (destination chosen up front); a failed keyring save still falls
+back to the local file with a notice.

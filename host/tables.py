@@ -1498,10 +1498,18 @@ def _manual_provider_entry(host):
 # ── step 3: pair the key (the 2×2 of §9) ────────────────────────────────────
 
 def _pair_key(host, profile):
-    """Returns a key string, '' when the provider needs none, or KEY_SKIPPED."""
+    """Returns a key string, '' when the provider runs keyless, or KEY_SKIPPED."""
     if not provider_requires_key(profile["provider"]):
+        # Local providers USUALLY need no key — but some local servers require
+        # one (LM Studio with auth enabled, vLLM/LiteLLM tokens). Never hard-
+        # skip: offer entry, and note that a dummy token satisfies servers
+        # that only check for a non-empty Authorization header.
         info = PROVIDERS.get(profile["provider"], {})
-        print(f"◆ API key: {info.get('label', profile['provider'])} needs none — skipped.")
+        print(f"◆ API key: {info.get('label', profile['provider'])} usually needs none —")
+        print("  but some local servers require one (any non-empty token works if it")
+        print("  only checks presence — a dummy is fine).")
+        if _confirm("Does your server require one?", default_yes=False):
+            return _paste_key_with_destination(profile["id"])
         return ""
     pid = profile["id"]
     # Exact match first, by profile id (§4 resolution order: keyring, then the
@@ -1560,7 +1568,7 @@ def _pair_key(host, profile):
         if ans == "s":
             return KEY_SKIPPED
         if ans == "n":
-            return _paste_and_offer_save(profile)
+            return _paste_key_with_destination(pid)
         label, k, _ = candidates[int(ans) - 1]
         print(f"◆ Using the key from {label}.")
         return k  # a wrong pick is caught by the connection test, not by us guessing
@@ -1570,48 +1578,56 @@ def _pair_key(host, profile):
     ans = _ask_choice("", ("1", "2"))
     if ans == "2":
         return KEY_SKIPPED
-    return _paste_and_offer_save(profile)
+    return _paste_key_with_destination(pid)
 
 
-def _paste_and_offer_save(profile):
+def _choose_save_backend(profile_id):
+    """Ask WHERE the key will be saved BEFORE entry — the user must know the
+    destination while typing it. Lists only AVAILABLE backends (local file
+    when the keyring package/backend is absent). Returns (label, backend)."""
+    options = []
+    if keyring_available():
+        options.append((f'OS keychain ("tables / {profile_id}", recommended)', "keyring"))
+    options.append((f"Local file ({cred_file_path()}, owner-only)", "file"))
+    options.append(("Don't save — ask again next run", ""))
+    print("Where should we save it?")
+    for i, (label, _b) in enumerate(options, 1):
+        print(f"  [{i}] {label}")
+    ans = _ask_choice("", [str(i) for i in range(1, len(options) + 1)])
+    return options[int(ans) - 1]
+
+
+def _paste_key_with_destination(profile_id):
+    """Paste the key with its destination stated in the prompt (S2), then save
+    it to the chosen backend — or not. Returns the key string, usable for this
+    run whether or not it was saved. Values are never echoed."""
+    _label, backend = _choose_save_backend(profile_id)
+    if backend == "keyring":
+        prompt = "API key → OS keychain: "
+    elif backend == "file":
+        prompt = f"API key → local file ({cred_file_path()}): "
+    else:
+        prompt = "API key (not saved — you'll be asked again next run): "
     while True:
         try:
-            key = getpass.getpass("API key: ").strip()
+            key = getpass.getpass(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             raise SetupCancelled()
         if key:
             break
         print("  the key is empty — paste it again")
-    _offer_save_key(profile["id"], key)
-    return key
-
-
-def _offer_save_key(profile_id, key):
-    """The save offer (S2). Lists only AVAILABLE backends — local file when
-    the keyring package/backend is absent. Returns the backend used ('' = not
-    saved). Values are never echoed."""
-    options = []
-    if keyring_available():
-        options.append(("OS keychain (recommended)", "keyring"))
-    options.append((f"Local file ({cred_file_path()}, owner-only)", "file"))
-    options.append(("Don't save", ""))
-    print("Save it so future runs don't ask?")
-    for i, (label, _b) in enumerate(options, 1):
-        print(f"  [{i}] {label}")
-    ans = _ask_choice("", [str(i) for i in range(1, len(options) + 1)])
-    _label, backend = options[int(ans) - 1]
-    if not backend:
-        return ""
     if backend == "keyring":
         try:
             keyring_set(profile_id, key)
             print(f'✓ Saved to your keychain ("tables / {profile_id}")')
-            return "keyring"
         except Exception as e:
             print(f"  keychain save failed ({e}) — saving to the local file instead.")
-    creds_set(profile_id, key)
-    print(f"✓ Saved to {cred_file_path()} (owner-only)")
-    return "file"
+            creds_set(profile_id, key)
+            print(f"✓ Saved to {cred_file_path()} (owner-only)")
+    elif backend == "file":
+        creds_set(profile_id, key)
+        print(f"✓ Saved to {cred_file_path()} (owner-only)")
+    return key
 
 
 # ── step 4: connection test (D5) ────────────────────────────────────────────
@@ -1633,7 +1649,7 @@ def _test_loop(profile, key):
         print(f" ✗ failed: {detail}")
         if not _confirm("Try again?", default_yes=True):
             return False
-        key = _paste_and_offer_save(profile)
+        key = _paste_key_with_destination(profile["id"])
 
 
 # ── the flow ────────────────────────────────────────────────────────────────
@@ -1817,8 +1833,14 @@ def main(argv=None):
     if not host.api_key and provider_requires_key(host.active_profile_provider()):
         if sys.stdin.isatty():
             print("No API key found for this profile — paste one:")
+            pid = host.active_profile_id()
             try:
-                pasted = getpass.getpass("API key: ").strip()
+                if pid:
+                    pasted = _paste_key_with_destination(pid)
+                else:
+                    # No profile id to pair under (pre-T38 export) — this run only.
+                    pasted = getpass.getpass(
+                        "API key (not saved — no profile id to pair under): ").strip()
             except (EOFError, KeyboardInterrupt):
                 pasted = ""
             if not pasted:
@@ -1826,12 +1848,6 @@ def main(argv=None):
                       "with --setup", file=sys.stderr)
                 return 2
             host.api_key = pasted
-            pid = host.active_profile_id()
-            if pid:
-                try:
-                    _offer_save_key(pid, pasted)
-                except SetupCancelled:
-                    pass  # Ctrl+C/EOF at the save offer — use the key for this run only
         else:
             print("error: no API key found — set TABLES_LLM_API_KEY, pass --api-key, "
                   "or run --setup to pair one", file=sys.stderr)
