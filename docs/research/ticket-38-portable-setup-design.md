@@ -1,6 +1,6 @@
 # T38 Design: Portable Onboarding — `tables.py --setup`
 
-**Status:** ✅ **DECISIONS LOCKED (2026-08-24, user OK)** — D1–D7 confirmed; ready to start. D2 per AGY `agy-1787668835-614956` + tech lead (no in-file sealing, no hand-rolled crypto). Parked micro-decisions (§9/§10) are non-blocking.
+**Status:** ✅ **COMPLETE (2026-08-25)** — implemented on `t38-portable-setup`; T38 spec 14/14, full suite 164 passed / 4 skipped / 0 failures. Decisions D1–D7 locked 2026-08-24 (user OK). D2 per AGY `agy-1787668835-614956` + tech lead (no in-file sealing, no hand-rolled crypto). AGY review `agy-1787673375-748762` findings applied. Parked: S2b candidate-key copy under current profile id → v1.1 `--rekey`.
 **Depends on:** T36 ✅ · T37 ✅ · model tracking (`85a9580` — `llm_model` → `recommended_model` already travels in exports)
 
 ---

@@ -31,7 +31,12 @@ function call, so the pure-SQL flagship loop runs natively.
 ## Usage
 
 ```sh
+# First run: guided setup — find the cartridge, pick a provider from the
+# file's saved profiles, pair an API key, verify the connection (T38).
+python3 host/tables.py --setup
+
 # One-shot: boot the cartridge, send one message, print the answer, exit.
+# After --setup this is flagless — url/model/key come from the file + keyring.
 python3 host/tables.py my-agent.sqlite3 "What tables do I have?"
 
 # Interactive REPL (omit the message).
@@ -43,15 +48,17 @@ echo "Summarize my data" | python3 host/tables.py my-agent.sqlite3
 
 ### Configuration (the keychain split)
 
-The cartridge carries the agent's **identity + data**; credentials and model
-config are supplied at boot and never travel in the file.
+The cartridge carries the agent's **identity + data + provider config**
+(the `llm_profiles` table and the active provider's endpoint, stamped by the
+web export); the **API key never travels in the file** — it is paired once per
+machine via `--setup` (or flags/env) and resolved at boot:
 
-| Setting    | Flag        | Env var(s)                                        | Default |
-|------------|-------------|---------------------------------------------------|---------|
-| Endpoint   | `--llm-url` | `TABLES_LLM_URL`                                  | *(required; auto-healed — bare base, `…/v1`, or the full `…/v1/chat/completions` all work)* |
-| Model      | `--model`   | `TABLES_LLM_MODEL`                                | the manifest's `recommended_model` (the exporting build's config) — **required**, no hardcoded default; boot refuses if none is found |
-| API key    | `--api-key` | `TABLES_LLM_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY` | *(none)* |
-| Fetch      | —           | `TABLES_ALLOW_FETCH=1`                                    | approval per fetch `[y/N/a]` (T37 L3) |
+| Setting    | Resolution order (first hit wins)                                        |
+|------------|--------------------------------------------------------------------------|
+| Endpoint   | `--llm-url` → `TABLES_LLM_URL` → in-file `system_config.llm_url` → **refuse loudly** (auto-healed — bare base, `…/v1`, or the full `…/v1/chat/completions` all work) |
+| Model      | `--model` → `TABLES_LLM_MODEL` → in-file `system_config.llm_model` → manifest `recommended_model` → **refuse loudly** (no hardcoded default) |
+| API key    | `--api-key` → `TABLES_LLM_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY` → keyring(`tables`, profile id) → `~/.config/tables/credentials.json` → paste prompt (TTY) / fail closed |
+| Fetch      | `TABLES_ALLOW_FETCH=1` — approval per fetch `[y/N/a]` by default (T37 L3) |
 
 Example with Gemini's OpenAI-compatible endpoint:
 
@@ -147,6 +154,11 @@ back-compat, LLM transport-error rollback + next-boot survival, full-permission
 writes landing in the cartridge. A live Gemini probe is included but gated behind
 `RUN_LIVE_PROBE=1` + `GEMINI_API_KEY`.
 
+`tests/specs/t38-portable-setup.spec.mjs` covers T38: export-side (profiles
+travel, sentinel keys never do) and the full `--setup` flow under a PTY with
+a fake LLM + injectable mock keyring (`TABLES_KEYRING=mock`) — the §9 UX
+scripts S1/S2/S2b/S3 are the acceptance tests.
+
 ## Self-booting cartridges (T37)
 
 The web engine stamps this loader into every export: the source lives in a
@@ -170,3 +182,36 @@ file you point the host at.
 Keep new host logic self-contained and stdlib-only — the in-file copy is
 regenerated from this file at every export, so it must stay exec-clean
 (`__future__` imports after the docstring, `__main__` guard, argv passthrough).
+
+## Portable onboarding (T38)
+
+`--setup` takes a user from "I have this `.sqlite3`" to a flagless daily
+one-liner. Design: `docs/research/ticket-38-portable-setup-design.md`
+(decisions D1–D7 locked). The flow:
+
+1. **Find the cartridge** — no arg → scan cwd for `*.sqlite3`, shape-check,
+   numbered list / `[Y/n]` / path prompt.
+2. **Pick the provider** — from the file's `llm_profiles` table (stamped by
+   the web export; D1 "everything is a table"); pre-T38 files fall back to
+   manual entry with URL auto-heal, and the result becomes a new profile row
+   so key pairing has a stable id.
+3. **Pair the key** — exact match by profile id (keyring first, then local
+   file); on a miss, candidates from OUR namespace only are offered for
+   explicit choice (D3: no foreign-entry sniffing), else paste (getpass,
+   never echoed) with a save offer listing only available backends.
+4. **Connection test** — one tiny real completion (`max_tokens=1`); failure
+   shows the provider's actual error and loops to re-enter. Setup never ends
+   on an unverified "saved" (D5).
+5. **Persist** — non-secret config written back INTO the cartridge
+   (`system_config.llm_provider/llm_url/llm_model/llm_profile_id`; D4);
+   the key goes to the chosen backend.
+
+Key storage is two machine-local backends, **no in-file sealing and no
+hand-rolled crypto** (D2 — see design §4.1): OS keyring (optional `keyring`
+package; service `tables`, account = profile id — D6) or an owner-only
+`~/.config/tables/credentials.json` (0600 enforced via fchmod, gh's
+hosts.yml pattern). The file carries everything EXCEPT identity secrets —
+same model as `gh auth login` / `aws configure` / `docker login`.
+
+Test seam: `TABLES_KEYRING=mock` (backing file `TABLES_KEYRING_FILE`) or
+`TABLES_KEYRING=absent` simulates the package missing.

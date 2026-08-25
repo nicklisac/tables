@@ -36,6 +36,10 @@
 // T26.3: shared result codes + query/ident helpers now live in src/utils.js.
 import { SQLITE_ROW, SQLITE_DONE, queryAll, quoteIdent, execParams } from './utils.js';
 import { isProtectedTable, getVirtualTableParents, ENGINE_MIN_VERSION, SYSTEM_PROMPT_VERSION } from './schema.js';
+// T38: the web's provider profile store (localStorage) — the source for the
+// llm_profiles export stamp. Keys are structurally excluded: this module only
+// ever reads name/provider/url/model off a profile.
+import { loadStore } from './provider-store.js';
 // T37: the standalone host source — single source of truth = host/tables.py (D1).
 // Vite's ?raw transform inlines the file as a string; stamped into every export.
 import hostPySource from '../host/tables.py?raw';
@@ -139,6 +143,11 @@ export async function exportCartridge(sqlite3, module, db, filename = 'tables-ca
     // the export carries its own engine ("agent on a keychain").
     step('host-stamp');
     await stampHost(sqlite3, pMemDb);
+
+    // T38: stamp the provider profiles (D1 table, D7 = all of them) so the
+    // portable host's --setup can offer them. Keys never travel (§2/§4.1).
+    step('profiles');
+    await stampProfiles(sqlite3, pMemDb);
 
     // 2. Serialize the in-memory DB into a malloc'd buffer
     step('serialize');
@@ -278,6 +287,35 @@ export async function stampHost(sqlite3, stagingDb) {
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
     [sha]);
   return sha;
+}
+
+/**
+ * T38: stamp the web's saved provider profiles into the export staging copy
+ * as the `llm_profiles` table (D1 — "everything is a table"). Mirrors
+ * stampHost: staging-only, so the live brain stays lean and a re-export always
+ * reflects the EXPORTING browser's store.
+ *
+ * Key-leak safety is structural (§2): provider-store.js is the only place
+ * keys live, and this function reads name/provider/url/model only — the
+ * export path never sees an apiKey. The sentinel-key spec (t38) scans the
+ * whole exported byte stream to assert it.
+ */
+export async function stampProfiles(sqlite3, stagingDb) {
+  await sqlite3.exec(stagingDb, `CREATE TABLE IF NOT EXISTS llm_profiles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    url TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT ''
+  )`);
+  const store = loadStore();
+  for (const p of store.profiles) {
+    await execParams(sqlite3, stagingDb,
+      `INSERT INTO llm_profiles (id, name, provider, url, model) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET name = excluded.name, provider = excluded.provider,
+         url = excluded.url, model = excluded.model`,
+      [p.id, p.name || '', p.provider || '', (p.url || '').trim(), (p.model || '').trim()]);
+  }
 }
 
 /**

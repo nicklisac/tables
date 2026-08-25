@@ -41,21 +41,47 @@ Trust model (T37, layered — no crypto in v1):
 Dashboard cards are inert by design (the optional `dashboard_html` feature is
 unimplemented here — not a bug).
 
+T38 — portable onboarding (--setup):
+  python3 host/tables.py --setup
+      Guided first run: find the cartridge (or take one as an argument), pick
+      the provider from the file's saved profiles (llm_profiles, stamped by
+      the web export), pair an API key (OS keyring or a 0600 local config
+      file — keys NEVER travel in the file), run a real connection test, and
+      write the non-secret config back into the cartridge. After that, daily
+      use is a flagless one-liner:
+          python3 tables.py my-agent.sqlite3 "your question"
+  Resolution chain for flagless runs (§5 of the T38 design):
+      url:   --llm-url → TABLES_LLM_URL → system_config.llm_url (in-file)
+            → refuse loudly
+      model: --model → TABLES_LLM_MODEL → system_config.llm_model →
+            manifest recommended_model → refuse loudly
+      key:   --api-key → env → keyring("tables", profile id) →
+            ~/.config/tables/credentials.json → paste (offers to save)
+  The key is paired once per machine, under the profile's id — the same model
+  as `gh auth login` / `aws configure` / `docker login`. Re-run --setup any
+  time to change providers or keys.
+
 Usage:
-  python3 host/tables.py CARTRIDGE.sqlite3 [message]
+  python3 host/tables.py [CARTRIDGE.sqlite3] [message]
+      --setup           guided first-run setup (no cartridge arg = discovery)
       --llm-url URL     OpenAI-compatible chat-completions endpoint
-                        (env TABLES_LLM_URL)
+                        (env TABLES_LLM_URL; falls back to the in-file config)
       --model MODEL     model name (env TABLES_LLM_MODEL). Required — there is
-                        no default; when omitted, the manifest's
-                        recommended_model (the exporting build's config) is
-                        used if present, otherwise boot refuses.
+                        no default; when omitted, the in-file config and then
+                        the manifest's recommended_model (the exporting build's
+                        config) are used if present, otherwise boot refuses.
       --api-key KEY     bearer key (env TABLES_LLM_API_KEY / OPENAI_API_KEY /
-                        GEMINI_API_KEY)
+                        GEMINI_API_KEY; falls back to the paired key)
 
 Environment:
   TABLES_ALLOW_FETCH=1  disable the fetch_url approval layer (free fetches).
                         Default: every fetch prompts [y]es/[N]o/[a]ll-for-run;
                         without a TTY, fetches fail closed with this hint.
+  TABLES_KEYRING        key backend seam for tests: "real" (default) uses the
+                        `keyring` package if installed; "mock" uses a JSON file
+                        (TABLES_KEYRING_FILE); "absent" simulates the package
+                        being missing. Never set in production use.
+  TABLES_KEYRING_FILE   backing file for TABLES_KEYRING=mock.
 
 If `message` is omitted and stdin is a pipe, stdin is used as the message;
 otherwise an interactive REPL starts.
@@ -63,15 +89,20 @@ otherwise an interactive REPL starts.
 from __future__ import annotations
 
 import argparse
+import getpass
+import glob
 import hashlib
 import json
 import os
 import re
 import sqlite3
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
+from uuid import uuid4
 
 HOST_NAME = "tables-standalone-host"
 # Tool name -> the UDF that executes it (mirrors cartridge.js TOOL_UDF_MAP):
@@ -240,6 +271,307 @@ def parse_llm_content(content):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# T38 — provider registry (host-side subset of the web's llm-provider.js).
+# Only the OpenAI-compatible family: this host speaks chat-completions only.
+# Mirrors the web registry's keyRequired / presetUrl fields so --setup can
+# skip the key step for local providers (S3) and pre-fill URLs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PROVIDERS = {
+    "openai":          {"label": "OpenAI Compatible (custom)", "key_required": False,
+                        "preset_url": "http://localhost:11434/v1", "model_placeholder": "llama3.2"},
+    "ollama":          {"label": "Ollama (local)", "key_required": False,
+                        "preset_url": "http://localhost:11434/v1", "model_placeholder": "llama3.2"},
+    "lm-studio":       {"label": "LM Studio (local)", "key_required": False,
+                        "preset_url": "http://localhost:1234/v1", "model_placeholder": "local-model"},
+    "groq":            {"label": "Groq", "key_required": True,
+                        "preset_url": "https://api.groq.com/openai/v1", "model_placeholder": "llama-3.3-70b-versatile"},
+    "mistral":         {"label": "Mistral", "key_required": True,
+                        "preset_url": "https://api.mistral.ai/v1", "model_placeholder": "mistral-large-latest"},
+    "openrouter":      {"label": "OpenRouter", "key_required": True,
+                        "preset_url": "https://openrouter.ai/api/v1", "model_placeholder": "anthropic/claude-sonnet-4.5"},
+    "gemini":          {"label": "Google Gemini API", "key_required": True,
+                        "fixed_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                        "model_placeholder": "gemini-2.5-flash"},
+    "openai-official": {"label": "OpenAI (official)", "key_required": True,
+                        "fixed_url": "https://api.openai.com/v1/chat/completions", "model_placeholder": "gpt-4o"},
+}
+
+
+def provider_requires_key(provider_id):
+    """True when a known provider needs an API key. Unknown ids → False
+    (backward compat: custom/self-hosted endpoints keep working keyless)."""
+    info = PROVIDERS.get((provider_id or "").strip())
+    return bool(info and info.get("key_required"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# T38 — key storage. Two backends, NO in-file sealing (D2/§4.1):
+#   A: OS keyring (optional `keyring` package) — service "tables" (D6),
+#      account = profile id. The key never exists in any file.
+#   B: machine-local config file at 0600 (gh's hosts.yml pattern) — the
+#      zero-dependency fallback.
+# Entry values are a small JSON object {"key", "saved_at"} so both backends
+# can show a save date; a hand-stored raw string is tolerated (whole value =
+# key, no date). Discovery is OUR namespace only — never foreign entries
+# (D3).
+# ─────────────────────────────────────────────────────────────────────────────
+
+KEYRING_SERVICE = "tables"  # D6
+
+
+def _keyring_mode():
+    return (os.environ.get("TABLES_KEYRING") or "real").strip().lower()
+
+
+def keyring_available():
+    """True when a usable OS-keyring backend exists. The `keyring` package is
+    an OPTIONAL import — the core stays zero-dependency. On headless Linux the
+    package raises RuntimeError("No recommended backend was available") at use
+    time (the plaintext-file fallback requires the separate keyrings.alt
+    package, so there is no silent weak fallback to guard against)."""
+    mode = _keyring_mode()
+    if mode == "absent":
+        return False
+    if mode == "mock":
+        return True
+    try:
+        import keyring  # optional dependency
+    except ImportError:
+        return False
+    try:
+        # Probe with a throwaway account: real backends return None, a missing
+        # backend raises. Cheap (setup / boot path, not hot).
+        keyring.get_password(KEYRING_SERVICE, "__tables_probe__")
+        return True
+    except Exception:
+        return False
+
+
+def _keyring_mock_file():
+    return os.environ.get("TABLES_KEYRING_FILE") or os.path.join(
+        tempfile.gettempdir(), "tables-keyring-mock.json")
+
+
+def _parse_key_entry(raw):
+    """(key, saved_at|None) from a stored entry value; None → (None, None).
+    Accepts the JSON object (mock backend file) or its string form (real
+    keyring values); a bare string is treated as the whole value = key."""
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return str(raw), None  # hand-stored raw string — whole value is the key
+        if isinstance(parsed, dict) and "key" in parsed:
+            return str(parsed["key"]), (parsed.get("saved_at") or None)
+        return str(raw), None  # parseable but not our format — whole value is the key
+    if isinstance(raw, dict) and "key" in raw:  # mock backend file entries
+        return str(raw["key"]), (raw.get("saved_at") or None)
+    return None, None
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _fmt_saved_date(saved_at):
+    """'2026-08-20T10:00:00+00:00' → 'Aug 20' (the S1/S2b display); '' if absent."""
+    try:
+        return datetime.fromisoformat(saved_at).strftime("%b %d")
+    except (ValueError, TypeError):
+        return ""
+
+
+def keyring_get(account):
+    """(key, saved_at) for our-namespace account; (None, None) on miss."""
+    if _keyring_mode() == "mock":
+        try:
+            with open(_keyring_mock_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None, None
+        return _parse_key_entry(data.get(account) if isinstance(data, dict) else None)
+    if not keyring_available():
+        return None, None
+    import keyring
+    try:
+        raw = keyring.get_password(KEYRING_SERVICE, account)
+    except Exception:
+        return None, None
+    return _parse_key_entry(raw)
+
+
+def keyring_set(account, key):
+    """Store under our namespace. Raises on failure (caller offers fallback)."""
+    value = json.dumps({"key": key, "saved_at": _now_iso()})
+    if _keyring_mode() == "mock":
+        path = _keyring_mock_file()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        data[account] = json.loads(value)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return
+    import keyring  # available() was checked by the caller; let errors surface
+    keyring.set_password(KEYRING_SERVICE, account, value)
+
+
+def keyring_accounts(probe_ids=()):
+    """[(account, saved_at|None)] for OUR namespace only (D3). Best-effort —
+    OS keyrings vary in how much they reveal:
+      1. enumeration via get_all_passwords, when the backend offers it
+         (Keychain / Credential Manager do; some Secret Service setups don't);
+      2. a guaranteed fallback: probe KNOWN profile ids via get_password,
+         which every backend supports.
+    Never foreign entries — only our service + explicitly probed accounts."""
+    if _keyring_mode() == "mock":
+        try:
+            with open(_keyring_mock_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return []
+        out = []
+        for account, entry in (data.items() if isinstance(data, dict) else []):
+            _, saved_at = _parse_key_entry(entry)
+            out.append((account, saved_at))
+        return out
+    if not keyring_available():
+        return []
+    import keyring
+    found = {}
+    get_all = getattr(keyring, "get_all_passwords", None)
+    if callable(get_all):
+        try:
+            for account, raw in (get_all(KEYRING_SERVICE, None) or {}).items():
+                found[account] = _parse_key_entry(raw)[1]
+        except Exception:
+            pass  # backend can't enumerate — fall through to probing
+    for account in probe_ids:
+        if not account or account in found:
+            continue
+        try:
+            raw = keyring.get_password(KEYRING_SERVICE, account)
+        except Exception:
+            raw = None
+        if raw is not None:
+            found[account] = _parse_key_entry(raw)[1]
+    return list(found.items())
+
+
+# ── Backend B: machine-local config file (0600, stdlib only) ────────────────
+
+def cred_file_path():
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "tables", "credentials.json")
+
+
+def _creds_read():
+    try:
+        with open(cred_file_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def creds_get(profile_id):
+    entry = _creds_read().get(profile_id)
+    if isinstance(entry, dict) and "key" in entry:
+        return str(entry["key"]), (entry.get("saved_at") or None)
+    return None, None
+
+
+def creds_set(profile_id, key):
+    """Write the 0600 local credential file (gh's hosts.yml pattern). The mode
+    is enforced with fchmod AFTER open so a permissive umask can't weaken it
+    (fchmod is POSIX-only — skipped on Windows, where the mode arg is a no-op
+    and ACLs govern). Written atomically: temp file + os.replace, so a crash
+    or concurrent read can never truncate the live credentials to zero bytes."""
+    path = cred_file_path()
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)  # our namespace dir — owner-only
+    except OSError:
+        pass
+    data = _creds_read()
+    data[profile_id] = {"key": key, "saved_at": _now_iso()}
+    tmp = path + f".tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        if hasattr(os, "fchmod"):  # POSIX — umask-proof the mode
+            os.fchmod(f.fileno(), 0o600)
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def creds_accounts():
+    out = []
+    for account, entry in _creds_read().items():
+        if isinstance(entry, dict) and "key" in entry:
+            out.append((account, entry.get("saved_at") or None))
+    return out
+
+
+# ── Shared chat-completions transport (turns + the T38 connection test) ─────
+
+def _post_chat(url, body, api_key):
+    """POST an OpenAI-compatible chat-completions body.
+    Returns (data, None) on success or (None, error_string) on failure."""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {api_key}"} if api_key else {}),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_S) as resp:
+            return json.loads(resp.read().decode("utf-8")), None
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        return None, f"LLM HTTP {e.code}: {detail or e.reason}"
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return None, f"LLM request failed: {e}"
+
+
+def connection_test(url, model, api_key):
+    """D5: one tiny REAL completion before declaring success — onboarding that
+    says 'saved' but never verified is how you debug at 2am. Returns
+    (ok, detail). A 200 with a non-chat-completions body still fails: the
+    endpoint must actually speak our protocol."""
+    body = {"model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1, "stream": False}
+    data, err = _post_chat(url, body, api_key)
+    if err:
+        return False, err
+    if not isinstance(data, dict) or "choices" not in data:
+        return False, (f"unexpected response from {url} — not an "
+                       "OpenAI-compatible chat-completions endpoint?")
+    return True, ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # The host
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -305,15 +637,118 @@ class Host:
         self.conn.commit()
 
     def _is_tables_database(self):
-        rows = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-            "('sessions','messages','system_config','tools')").fetchall()
-        return len(rows) >= 4
+        return is_tables_database(self.conn)
 
     def _cfg(self, key, default=None):
         row = self.conn.execute(
             "SELECT value FROM system_config WHERE key=?", (key,)).fetchone()
         return row[0] if row else default
+
+    def _table_exists(self, name):
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        return row is not None
+
+    # ── T38: config resolution (§5 chain) ────────────────────────────────
+    def resolve_config(self, args):
+        """Resolve url/model/key for a run. Order per the T38 design §5:
+          url:   --llm-url → TABLES_LLM_URL → system_config.llm_url (in-file)
+          model: --model → TABLES_LLM_MODEL → system_config.llm_model →
+                 manifest recommended_model
+          key:   --api-key → env → keyring(\"tables\", profile id) →
+                 local config file. A missing key is NOT an error here — the
+                 caller decides (known key-required providers prompt or fail
+                 closed; local endpoints run keyless). In-file system_config
+                 sits above the manifest because setup writes it and it's the
+                 same data, fresher."""
+        url = (args.llm_url or os.environ.get("TABLES_LLM_URL", "")
+               or self._cfg("llm_url") or "")
+        model = (args.model or os.environ.get("TABLES_LLM_MODEL", "")
+                 or self._cfg("llm_model")
+                 or (self.manifest or {}).get("recommended_model") or "")
+        key = (args.api_key
+               or os.environ.get("TABLES_LLM_API_KEY")
+               or os.environ.get("OPENAI_API_KEY")
+               or os.environ.get("GEMINI_API_KEY")
+               or "")
+        if not key:
+            profile_id = self.active_profile_id()
+            if profile_id:
+                k, _ = keyring_get(profile_id)
+                if k:
+                    key = k
+                else:
+                    k, _ = creds_get(profile_id)
+                    if k:
+                        key = k
+        return url, model, key
+
+    def active_profile_id(self):
+        """The profile id keys are paired under (D6). Recorded by --setup in
+        system_config.llm_profile_id; when absent, the file's single profile
+        row is unambiguous. '' = no pairing target (caller falls back to
+        paste)."""
+        pid = self._cfg("llm_profile_id") or ""
+        if pid and self._table_exists("llm_profiles"):
+            row = self.conn.execute(
+                "SELECT 1 FROM llm_profiles WHERE id=?", (pid,)).fetchone()
+            if row:
+                return pid
+        if self._table_exists("llm_profiles"):
+            rows = self.conn.execute("SELECT id FROM llm_profiles").fetchall()
+            if len(rows) == 1:
+                return rows[0][0]
+        return ""
+
+    def active_profile_provider(self):
+        """Provider id for the active profile (for keyRequired decisions);
+        '' when unknown."""
+        pid = self.active_profile_id()
+        if pid and self._table_exists("llm_profiles"):
+            row = self.conn.execute(
+                "SELECT provider FROM llm_profiles WHERE id=?", (pid,)).fetchone()
+            if row:
+                return row[0] or ""
+        return self._cfg("llm_provider") or ""
+
+    # ── T38: profile rows (D1 table) ─────────────────────────────────────
+    def read_profiles(self):
+        """All llm_profiles rows as dicts; [] when the table is absent
+        (pre-T38 export)."""
+        if not self._table_exists("llm_profiles"):
+            return []
+        rows = self.conn.execute(
+            "SELECT id, name, provider, url, model FROM llm_profiles ORDER BY rowid"
+        ).fetchall()
+        return [{"id": r[0], "name": r[1] or "", "provider": r[2] or "",
+                 "url": r[3] or "", "model": r[4] or ""} for r in rows]
+
+    def upsert_profile(self, profile):
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS llm_profiles ("
+            "id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL, "
+            "url TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '' )")
+        self.conn.execute(
+            "INSERT INTO llm_profiles (id, name, provider, url, model) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET name=excluded.name, "
+            "provider=excluded.provider, url=excluded.url, model=excluded.model",
+            (profile["id"], profile["name"], profile["provider"],
+             profile["url"], profile["model"]))
+
+    def write_setup_config(self, profile):
+        """D4: non-secret setup results written back INTO the cartridge.
+        The key itself never touches the file (§4.1)."""
+        for key, value in (("llm_provider", profile["provider"]),
+                           ("llm_url", profile["url"]),
+                           ("llm_model", profile["model"]),
+                           ("llm_profile_id", profile["id"])):
+            self.conn.execute(
+                "INSERT INTO system_config (key, value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value))
+        self.upsert_profile(profile)
+        self.conn.commit()
 
     # ── T37 trust layers ────────────────────────────────────────────────────
     def _check_embedded_host(self):
@@ -518,28 +953,9 @@ class Host:
             "messages": [{"role": "system", "content": system_prompt}, *api_messages],
             "stream": False,
         }
-        req = urllib.request.Request(
-            self.llm_url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_S) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = e.read().decode("utf-8", "replace")[:300]
-            except Exception:
-                pass
-            raise TurnError(f"LLM HTTP {e.code}: {detail or e.reason}")
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise TurnError(f"LLM request failed: {e}")
-
+        data, err = _post_chat(self.llm_url, body, self.api_key)
+        if err:
+            raise TurnError(err)
         msg = (data.get("choices") or [{}])[0].get("message") or {}
         usage = data.get("usage") or {}
         return (msg.get("content") or "",
@@ -757,47 +1173,511 @@ class Host:
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_config(args):
-    llm_url = args.llm_url or os.environ.get("TABLES_LLM_URL", "")
-    api_key = (args.api_key
-               or os.environ.get("TABLES_LLM_API_KEY")
-               or os.environ.get("OPENAI_API_KEY")
-               or os.environ.get("GEMINI_API_KEY")
-               or "")
-    model = args.model or os.environ.get("TABLES_LLM_MODEL", "")
-    return llm_url, model, api_key
+# ─────────────────────────────────────────────────────────────────────────────
+# T38 — --setup: guided first-run onboarding (design §3, UX scripts §9)
+#
+# One interaction idiom throughout: numbered list → type a number; single item
+# → [Y/n]. Setup ends in exactly one of two honest states: "✓ works"
+# (connection-tested) or "config saved, key not paired — you'll be asked on
+# first run" (skip chosen). A failed connection test is never papered over: it
+# shows the provider's real error and loops back to re-enter; setup never ends
+# on an unverified "saved".
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SetupCancelled(Exception):
+    """User interrupted (EOF / Ctrl+C) — nothing is committed."""
+
+
+KEY_SKIPPED = object()  # sentinel: the user chose "Skip — pair it later"
+
+
+def is_tables_database(conn):
+    """The existing shape check, module-level so --setup discovery can use it
+    without a full Host boot."""
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+        "('sessions','messages','system_config','tools')").fetchall()
+    return len(rows) >= 4
+
+
+def _open_readonly(path):
+    """Open an existing file read-only. The path is URI-quoted so names with
+    #, ?, % or spaces can't be misparsed (and existence is checked first, so a
+    bad name can never CREATE a file). Returns a connection or None."""
+    if not os.path.exists(path):
+        return None
+    uri = "file:" + urllib.parse.quote(os.path.abspath(path), safe="/") + "?mode=ro"
+    try:
+        return sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return None
+
+
+def is_tables_database_path(path):
+    conn = _open_readonly(path)
+    if conn is None:
+        return False
+    try:
+        return is_tables_database(conn)
+    finally:
+        conn.close()
+
+
+# ── prompt helpers (the numbered-list / [Y/n] idiom) ────────────────────────
+
+def _ask_line(prompt, default=None):
+    """input() with an optional bracketed default; empty answer → default.
+    Re-prompts on empty when there is no default."""
+    while True:
+        suffix = f" [{default}]" if default else ""
+        try:
+            raw = input(f"{prompt}{suffix}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise SetupCancelled()
+        if raw:
+            return raw
+        if default is not None:
+            return default
+
+
+def _confirm(prompt, default_yes=True):
+    label = "[Y/n]" if default_yes else "[y/N]"
+    while True:
+        try:
+            ans = input(f"{prompt} {label}: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SetupCancelled()
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("n", "no"):
+            return False
+        if ans == "":
+            return default_yes
+        print("  answer y or n")
+
+
+def _pick_numbered(n, prompt="> "):
+    while True:
+        try:
+            ans = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            raise SetupCancelled()
+        if ans.isdigit() and 1 <= int(ans) <= n:
+            return int(ans)
+        print(f"  enter a number between 1 and {n}")
+
+
+def _ask_choice(prefix, choices):
+    """A '[1/2/n]' style menu prompt ('> ' terminator, per the §9 scripts)."""
+    prompt = f"{prefix} > " if prefix else "> "
+    while True:
+        try:
+            ans = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SetupCancelled()
+        if ans in choices:
+            return ans
+        print(f"  choose from: {'/'.join(choices)}")
+
+
+# ── step 1: find the cartridge ──────────────────────────────────────────────
+
+def _scan_cartridges():
+    """[(path, description)] for valid Tables cartridges in the cwd."""
+    out = []
+    for name in sorted(glob.glob("*.sqlite3")):
+        conn = _open_readonly(name)
+        if conn is None:
+            continue
+        try:
+            if not is_tables_database(conn):
+                continue
+            desc = name
+            if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_manifest'"
+            ).fetchone():
+                m = dict(conn.execute("SELECT key, value FROM _manifest"))
+                fmt = m.get("format_version", "0")
+                created = (m.get("created_at") or "")[:10]
+                desc = f"{name}    Tables format v{fmt}" + (
+                    f" · exported {created}" if created else "")
+            out.append((name, desc))
+        finally:
+            conn.close()
+    return out
+
+
+def _discover_cartridge():
+    """Step 1 (no cartridge arg): scan cwd for *.sqlite3 and shape-check.
+    >1 valid → numbered list; exactly 1 → [Y/n]; 0 → ask for a path."""
+    found = _scan_cartridges()
+    if len(found) > 1:
+        print(f"◆ Cartridges in {os.getcwd()}:")
+        for i, (_, desc) in enumerate(found, 1):
+            print(f"  {i}. {desc}")
+        choice = _pick_numbered(len(found))
+        return found[choice - 1][0]
+    if len(found) == 1:
+        name, desc = found[0]
+        print(f"◆ Cartridges in {os.getcwd()}:")
+        print(f"  1. {desc}")
+        if _confirm("Is this the right one?", default_yes=True):
+            return name
+    else:
+        print(f"No Tables cartridges found in {os.getcwd()}.")
+    while True:
+        p = _ask_line("Path to a .sqlite3 file")
+        if is_tables_database_path(p):
+            return p
+        print(f"  not a Tables database: {p}")
+
+
+# ── step 2: pick the provider ───────────────────────────────────────────────
+
+def _choose_profile(host):
+    """Returns a profile dict {id, name, provider, url, model}."""
+    profiles = host.read_profiles()
+    if not profiles:
+        return _manual_provider_entry(host)
+    if len(profiles) == 1:
+        p = profiles[0]
+        print("◆ Provider (saved in the file):")
+        print(f"  {p['name'] or p['provider']} — {p['provider']} at {p['url']} · model {p['model']}")
+        while True:
+            try:
+                ans = input("Use this? [Y/n/edit]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                raise SetupCancelled()
+            if ans in ("", "y", "yes"):
+                return p
+            if ans in ("e", "edit"):
+                p = dict(p)
+                # default=... (not baked into the prompt): Enter keeps the
+                # current value — _ask_line re-prompts on empty otherwise.
+                p["url"] = _ask_line("New URL", default=p["url"]) or p["url"]
+                p["model"] = _ask_line("New model", default=p["model"]) or p["model"]
+                return p
+            if ans in ("n", "no"):
+                return _manual_provider_entry(host)
+            print("  answer Y, n, or edit")
+    print("◆ Provider (saved in the file):")
+    for i, p in enumerate(profiles, 1):
+        print(f"  {i}. {p['name'] or p['provider']} — {p['provider']} at {p['url']} · model {p['model']}")
+    choice = _pick_numbered(len(profiles))
+    return profiles[choice - 1]
+
+
+def _manual_provider_entry(host):
+    """S3: no saved provider config (pre-T38 export) — manual entry with the
+    existing URL auto-heal. The result is persisted as a NEW profile row so
+    key pairing has a stable id to pair under (§4/D6); the row commits only if
+    setup completes (D4)."""
+    print("◆ Provider: this file has no saved provider config (older export).")
+    ids = list(PROVIDERS)
+    for i, pid in enumerate(ids, 1):
+        print(f"  [{i}] {PROVIDERS[pid]['label']}")
+    choice = _pick_numbered(len(ids))
+    pid = ids[choice - 1]
+    info = PROVIDERS[pid]
+    if info.get("fixed_url"):
+        url = info["fixed_url"]
+        print(f"  Endpoint: {url} (fixed for this provider)")
+    else:
+        preset = info.get("preset_url", "")
+        raw = _ask_line("Base URL", default=preset or None)
+        healed = _normalize_llm_url(raw)
+        if healed and healed != raw.rstrip("/"):
+            print(f"    → healed to {healed}")
+        # Store the RAW input (web parity: localStorage keeps what the user
+        # typed; normalization happens at every use site). Storing the healed
+        # form would desync from re-exports, which upsert the raw values.
+        url = raw
+    model = _ask_line("Model", default=info.get("model_placeholder") or None)
+    profile = {"id": uuid4().hex[:12], "name": info["label"], "provider": pid,
+               "url": url, "model": model}
+    host.upsert_profile(profile)  # uncommitted until write_setup_config
+    return profile
+
+
+# ── step 3: pair the key (the 2×2 of §9) ────────────────────────────────────
+
+def _pair_key(host, profile):
+    """Returns a key string, '' when the provider needs none, or KEY_SKIPPED."""
+    if not provider_requires_key(profile["provider"]):
+        info = PROVIDERS.get(profile["provider"], {})
+        print(f"◆ API key: {info.get('label', profile['provider'])} needs none — skipped.")
+        return ""
+    pid = profile["id"]
+    # Exact match first, by profile id (§4 resolution order: keyring, then the
+    # local file). One pairing covers every cartridge sharing the profile id.
+    checked = []
+    found = None
+    if keyring_available():
+        checked.append("keychain")
+        k, saved_at = keyring_get(pid)
+        if k:
+            found = ("your keychain", k, saved_at)
+    if not found:
+        checked.append("local config")
+        k, saved_at = creds_get(pid)
+        if k:
+            found = ("your local config", k, saved_at)
+    if found:
+        where, k, saved_at = found
+        d = _fmt_saved_date(saved_at)
+        print(f'◆ API key: found in {where} — "tables / {pid}"'
+              + (f" (saved {d})" if d else ""))
+        if _confirm("Use it?", default_yes=True):
+            return k
+    # No exact match (or declined) — S2b: offer candidates from OUR namespace
+    # only (D3: never foreign entries, no prefix-sniffing); explicit choice.
+    known = {p["id"]: p for p in host.read_profiles()}
+    candidates = []  # (label, key, saved_at)
+    if keyring_available():
+        # Probe the file's own profile ids + local-config accounts: backends
+        # that can't enumerate still answer get_password for a known account.
+        probe_ids = [p["id"] for p in host.read_profiles()] + \
+                    [a for a, _ in creds_accounts()]
+        for account, saved_at in keyring_accounts(probe_ids=probe_ids):
+            if account == pid:
+                continue
+            k, _ = keyring_get(account)
+            if k:
+                candidates.append((f"tables/{account}", k, saved_at))
+    for account, saved_at in creds_accounts():
+        if account == pid:
+            continue
+        k, _ = creds_get(account)
+        if k:
+            candidates.append((f"file/{account}", k, saved_at))
+    if candidates:
+        print(f'◆ API key: none found for profile "{pid}".')
+        print("  You have other saved Tables keys:")
+        for i, (label, _k, saved_at) in enumerate(candidates, 1):
+            p = known.get(label.split("/", 1)[1])
+            friendly = f"{p['name'] or p['provider']} · {p['model']}" if p else "(unknown profile)"
+            d = _fmt_saved_date(saved_at)
+            print(f"    {i}. {label}    {friendly}" + (f" · saved {d}" if d else ""))
+        opts = [str(i) for i in range(1, len(candidates) + 1)] + ["n", "s"]
+        ans = _ask_choice(
+            f"Use one of these? [{'/'.join(opts)} — n = paste a new key, s = skip]", opts)
+        if ans == "s":
+            return KEY_SKIPPED
+        if ans == "n":
+            return _paste_and_offer_save(profile)
+        label, k, _ = candidates[int(ans) - 1]
+        print(f"◆ Using the key from {label}.")
+        return k  # a wrong pick is caught by the connection test, not by us guessing
+    print(f"◆ API key: none found for this profile ({' + '.join(checked)}).")
+    print("  [1] Paste your API key")
+    print("  [2] Skip — pair it later")
+    ans = _ask_choice("", ("1", "2"))
+    if ans == "2":
+        return KEY_SKIPPED
+    return _paste_and_offer_save(profile)
+
+
+def _paste_and_offer_save(profile):
+    while True:
+        try:
+            key = getpass.getpass("API key: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise SetupCancelled()
+        if key:
+            break
+        print("  the key is empty — paste it again")
+    _offer_save_key(profile["id"], key)
+    return key
+
+
+def _offer_save_key(profile_id, key):
+    """The save offer (S2). Lists only AVAILABLE backends — local file when
+    the keyring package/backend is absent. Returns the backend used ('' = not
+    saved). Values are never echoed."""
+    options = []
+    if keyring_available():
+        options.append(("OS keychain (recommended)", "keyring"))
+    options.append((f"Local file ({cred_file_path()}, owner-only)", "file"))
+    options.append(("Don't save", ""))
+    print("Save it so future runs don't ask?")
+    for i, (label, _b) in enumerate(options, 1):
+        print(f"  [{i}] {label}")
+    ans = _ask_choice("", [str(i) for i in range(1, len(options) + 1)])
+    _label, backend = options[int(ans) - 1]
+    if not backend:
+        return ""
+    if backend == "keyring":
+        try:
+            keyring_set(profile_id, key)
+            print(f'✓ Saved to your keychain ("tables / {profile_id}")')
+            return "keyring"
+        except Exception as e:
+            print(f"  keychain save failed ({e}) — saving to the local file instead.")
+    creds_set(profile_id, key)
+    print(f"✓ Saved to {cred_file_path()} (owner-only)")
+    return "file"
+
+
+# ── step 4: connection test (D5) ────────────────────────────────────────────
+
+def _test_loop(profile, key):
+    """One tiny REAL completion before declaring success. On failure shows the
+    provider's actual error and loops back to re-enter; returns True on '✓
+    works', False when the user declines to retry after a failure."""
+    url = _normalize_llm_url(profile["url"])
+    while True:
+        print("◆ Testing connection…", end="", flush=True)
+        if not url:
+            ok, detail = False, "no endpoint configured"
+        else:
+            ok, detail = connection_test(url, profile["model"], key)
+        if ok:
+            print(f" ✓ works ({profile['provider']} · {profile['model']})")
+            return True
+        print(f" ✗ failed: {detail}")
+        if not _confirm("Try again?", default_yes=True):
+            return False
+        key = _paste_and_offer_save(profile)
+
+
+# ── the flow ────────────────────────────────────────────────────────────────
+
+def run_setup(args):
+    """T38 --setup. Returns a process exit code: 0 = works / honest skip,
+    1 = cancelled or unverified failure, 2 = usage error."""
+    host = None
+    try:
+        path = args.cartridge or _discover_cartridge()
+        if not path:
+            print("setup cancelled — no changes saved", file=sys.stderr)
+            return 1
+        host = Host(path, None, None, None)
+        # Deliberately NOT host.boot(): setup is config-only. Boot restores the
+        # active session and clears suppression flags — turn-time state that
+        # onboarding must not touch.
+        if not os.path.exists(host.path):
+            print(f"error: cartridge not found: {host.path}", file=sys.stderr)
+            return 2
+        try:
+            host.conn = sqlite3.connect(host.path)
+        except sqlite3.Error as e:
+            print(f"error: could not open cartridge: {e}", file=sys.stderr)
+            return 2
+        if not is_tables_database(host.conn):
+            print("error: not a Tables database — the sessions/messages/"
+                  "system_config/tools tables are missing", file=sys.stderr)
+            host.close()
+            return 2
+        keyring_was_available = keyring_available()
+
+        profile = _choose_profile(host)          # step 2
+        key = _pair_key(host, profile)           # step 3
+
+        if key is not KEY_SKIPPED:
+            # Step 4 (D5): connection-tested before anything is persisted.
+            # §9: setup ends in exactly one of two honest states — a declined
+            # retry after failure rolls back: no unverified "saved" ever lands
+            # in the file.
+            if not _test_loop(profile, key):
+                host.conn.rollback()
+                host.close()
+                print("✗ Connection test failed and you chose not to retry — "
+                      "nothing was saved. Re-run --setup when ready.")
+                return 1
+
+        # Step 5 (D4): non-secret config written back INTO the cartridge.
+        host.write_setup_config(profile)
+        one_liner = f'python3 tables.py {path} "your question"'
+        if key is KEY_SKIPPED:
+            print("✓ Done. Config saved in the file — key not paired; "
+                  "you'll be asked on first run.")
+            print(f"  Daily use: {one_liner}")
+            print("  Pair the key now or later with --setup.")
+        else:
+            print(f"✓ Done. Daily use: {one_liner}")
+            print("  Re-run --setup anytime to change providers or keys.")
+        if not keyring_was_available:
+            print("Tip: pip install keyring, then re-run --setup to use your OS keychain.")
+        host.close()
+        return 0
+    except SetupCancelled:
+        print("\nsetup cancelled — no changes saved", file=sys.stderr)
+        if host:
+            host.close()
+        return 1
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Boot a Tables cartridge and chat with its agent (standalone host v1).")
-    ap.add_argument("cartridge", help="path to the .sqlite3 cartridge")
+    ap.add_argument("cartridge", nargs="?", default=None,
+                    help="path to the .sqlite3 cartridge (omit with --setup for discovery)")
     ap.add_argument("message", nargs="?", default=None,
                     help="a single message (omit for a REPL, or pipe via stdin)")
+    ap.add_argument("--setup", action="store_true",
+                    help="guided first-run setup: find the cartridge, pick a provider, "
+                         "pair a key, verify the connection (T38)")
     ap.add_argument("--llm-url", default=None, help="OpenAI-compatible chat-completions endpoint")
     ap.add_argument("--model", default=None, help="model name")
     ap.add_argument("--api-key", default=None, help="bearer API key")
     args = ap.parse_args(argv)
 
-    llm_url, model, api_key = resolve_config(args)
+    if args.setup:
+        return run_setup(args)
 
-    # A manifest-recommended model is a sensible default when the user gave none.
-    host = Host(args.cartridge, llm_url, model, api_key)
+    if not args.cartridge:
+        print("error: no cartridge given — pass a .sqlite3 path, or run --setup "
+              "for guided onboarding", file=sys.stderr)
+        return 2
+
+    host = Host(args.cartridge, None, None, None)
     try:
         host.boot()
     except HostError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    # Fill in a model from the manifest (the exporting build's config) when
-    # the user gave none. There is NO hardcoded default — a missing model is
-    # a configuration error, refused loudly rather than guessed.
-    if not host.llm_model and host.manifest and host.manifest.get("recommended_model"):
-        host.llm_model = host.manifest["recommended_model"]
-    if not host.llm_model:
-        print("error: no model configured — pass --model or set TABLES_LLM_MODEL "
-              "(there is no default)", file=sys.stderr)
+    # T38 §5 resolution chain — in-file system_config sits above the manifest
+    # (setup wrote it; same data, fresher). Refuse loudly: there is still no
+    # default endpoint or model.
+    url, model, key = host.resolve_config(args)
+    if not url:
+        print("error: no LLM endpoint configured — pass --llm-url, set TABLES_LLM_URL, "
+              "or run --setup (the file carries the web app's provider config)",
+              file=sys.stderr)
         return 2
+    if not model:
+        print("error: no model configured — pass --model, set TABLES_LLM_MODEL, or "
+              "run --setup (there is no default)", file=sys.stderr)
+        return 2
+    host.llm_url = _normalize_llm_url(url)
+    host.llm_model = model
+    host.api_key = key
+
+    # A known key-required provider with no resolved key: prompt on a TTY
+    # (offering to save — §4's terminal step), fail closed without one.
+    if not host.api_key and provider_requires_key(host.active_profile_provider()):
+        if sys.stdin.isatty():
+            print("No API key found for this profile — paste one:")
+            try:
+                pasted = getpass.getpass("API key: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                pasted = ""
+            if not pasted:
+                print("error: no API key — re-run with --api-key or pair one "
+                      "with --setup", file=sys.stderr)
+                return 2
+            host.api_key = pasted
+            pid = host.active_profile_id()
+            if pid:
+                try:
+                    _offer_save_key(pid, pasted)
+                except SetupCancelled:
+                    pass  # Ctrl+C/EOF at the save offer — use the key for this run only
+        else:
+            print("error: no API key found — set TABLES_LLM_API_KEY, pass --api-key, "
+                  "or run --setup to pair one", file=sys.stderr)
+            return 2
 
     host.report()
 

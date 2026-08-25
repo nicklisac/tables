@@ -574,6 +574,21 @@ async function bootAgent() {
     // that). Exports carry it as _manifest.recommended_model, so a cartridge
     // knows which model was last loaded. '' when nothing is configured.
     await upsertSystemConfig(agent.sqlite3, agent.db, 'llm_model', model);
+    // T38: record the active provider's id + resolved endpoint too (same
+    // key-leak boundary — the URL is not a secret). The portable host's
+    // --setup and flagless runs read these from the cartridge; the full
+    // profile set is stamped into exports at export time (cartridge.js).
+    // Only when a real active profile exists: an unconfigured boot must stay
+    // '' — we never recommend a provider any more than we recommend a model.
+    if (cfg.id) {
+      await upsertSystemConfig(agent.sqlite3, agent.db, 'llm_provider', provider);
+      await upsertSystemConfig(agent.sqlite3, agent.db, 'llm_url', p.endpoint(cfg) || '');
+      // The active profile's id — the portable host pairs API keys under
+      // profile ids (D6), so a multi-profile export resolves its key on a
+      // fresh machine without --setup. --setup overwrites this when the user
+      // picks a different profile.
+      await upsertSystemConfig(agent.sqlite3, agent.db, 'llm_profile_id', cfg.id);
+    }
 
     // Debug/test handle (used by the cartridge round-trip tests & console).
     window.__agent = agent;

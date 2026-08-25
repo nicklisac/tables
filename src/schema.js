@@ -219,6 +219,17 @@ INSERT OR IGNORE INTO system_config (key, value) VALUES
   -- No default model: an empty value means "not configured" (the portable
   -- host refuses to boot without one; the web harness warns at boot).
   ('llm_model', ''),
+  -- T38: the active provider's id + resolved endpoint, recorded at boot like
+  -- llm_model (provider-store.js is still the single source of truth — keys
+  -- never touch the file). The portable host's --setup reads these from the
+  -- cartridge; the FULL profile set travels in exports as the llm_profiles
+  -- table, stamped into the export staging copy at export time (cartridge.js
+  -- stampProfiles) so a re-export always reflects the exporting browser.
+  ('llm_provider', ''),
+  ('llm_url', ''),
+  -- T38: the active profile's id (recorded at boot; the portable host pairs
+  -- API keys under profile ids — D6). '' until a profile exists.
+  ('llm_profile_id', ''),
   -- T2: fallback effective context window (tau's DEFAULT_CONTEXT_WINDOW_TOKENS).
   -- The LIVE window resolves as: user override (settings field, written to this
   -- same key) -> cloud model-name lookup -> this fallback. The 85% compaction
@@ -1215,6 +1226,8 @@ export const INTERNAL_TABLES = new Set([
   'system_config',
   'system_files', // T37: in-file standalone host (class-4 scaffolding — no capture
                   // triggers, DDL refused, invisible to user-data counts)
+  'llm_profiles', // T38: provider profiles stamped into exports (host-side config
+                  // carrier — agent DML must not mutate provider setup)
   'tools',
   'turn_changesets',
   'turn_ddl_log',
