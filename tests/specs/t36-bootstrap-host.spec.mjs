@@ -243,6 +243,66 @@ test.describe('T36 — standalone cartridge host (Python-first)', () => {
     }
   });
 
+  // T9 parity — the direct SQL scratchpad (! / !!). Runs SQL straight against
+  // the cartridge, bypassing the LLM. The one-shot form is handled before
+  // endpoint/model/key resolution, so a dummy URL (never contacted) suffices.
+  const DUMMY_URL = 'http://127.0.0.1:1/v1/chat/completions';
+
+  test('!SELECT runs a read with no LLM config and stores it in_context=1', async ({ page }) => {
+    await boot(page);
+    const file = writeCartridge(await exportCurrent(page), 'scratch-read');
+    try {
+      const res = await runHost(file, '!SELECT id FROM sessions LIMIT 1', DUMMY_URL);
+      expect(res.code, `host stderr:\n${res.stderr}`).toBe(0);
+      expect(res.stdout).toContain('tables>');
+      withCartridgeDb(file, (db) => {
+        const user = db.prepare(
+          "SELECT in_context FROM messages WHERE role='user' AND content LIKE '!SELECT%' ORDER BY id DESC LIMIT 1").get();
+        expect(user, 'no scratchpad user row stored').toBeTruthy();
+        expect(user.in_context).toBe(1); // `!` = shared
+      });
+    } finally { fs.rmSync(file, { force: true }); }
+  });
+
+  test('!!SELECT is private — stored in_context=0 (out of the agent context)', async ({ page }) => {
+    await boot(page);
+    const file = writeCartridge(await exportCurrent(page), 'scratch-private');
+    try {
+      const res = await runHost(file, '!!SELECT id FROM sessions LIMIT 1', DUMMY_URL);
+      expect(res.code, `host stderr:\n${res.stderr}`).toBe(0);
+      withCartridgeDb(file, (db) => {
+        const user = db.prepare(
+          "SELECT in_context FROM messages WHERE role='user' AND content LIKE '!!SELECT%' ORDER BY id DESC LIMIT 1").get();
+        expect(user, 'no scratchpad user row stored').toBeTruthy();
+        expect(user.in_context).toBe(0); // `!!` = private
+      });
+    } finally { fs.rmSync(file, { force: true }); }
+  });
+
+  test('the protected-object guard refuses DDL on the cartridge internals', async ({ page }) => {
+    await boot(page);
+    const file = writeCartridge(await exportCurrent(page), 'scratch-protected');
+    try {
+      const res = await runHost(file, '!!DROP TABLE messages', DUMMY_URL);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toContain('protected object');
+      withCartridgeDb(file, (db) => {
+        const still = db.prepare("SELECT 1 FROM sqlite_master WHERE name='messages'").get();
+        expect(still, 'messages table was dropped!').toBeTruthy();
+      });
+    } finally { fs.rmSync(file, { force: true }); }
+  });
+
+  test('transaction control is refused (would break the scratchpad savepoint)', async ({ page }) => {
+    await boot(page);
+    const file = writeCartridge(await exportCurrent(page), 'scratch-txn');
+    try {
+      const res = await runHost(file, '!BEGIN', DUMMY_URL);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toContain('Transaction-control');
+    } finally { fs.rmSync(file, { force: true }); }
+  });
+
   // Pre-fix, v_active_context emitted a system row ONLY for the session
   // owning messages.id=0 ('default' — id is a global PK). Every other session
   // ran with no persona at all. The view now falls back to the canonical

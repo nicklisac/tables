@@ -51,6 +51,27 @@ python3 host/tables.py other-agent.sqlite3 "..."
 echo "Summarize my data" | python3 host/tables.py
 ```
 
+### Direct SQL (`!` / `!!`) — the scratchpad
+
+A leading bang runs SQL **directly against the cartridge, bypassing the LLM**
+(no tokens, no turn). Type it in the REPL, or pass it as a one-shot message:
+
+```sh
+python3 host/tables.py "!SELECT * FROM sessions"
+```
+
+| Prefix  | Meaning                                                        |
+|---------|----------------------------------------------------------------|
+| `!SQL`  | **shared** — the command + result are stored `in_context=1`, so the agent SEES them in its context and can build on them |
+| `!!SQL` | **private** — stored `in_context=0`; kept OUT of the agent's context (the agent never sees the command or its result) |
+
+- **Reads** (`SELECT`/`WITH`/`EXPLAIN`) run immediately.
+- **Writes** (DML + DDL) ask for confirmation `[y/N]` before executing; without a TTY they fail closed (reads still work headless).
+- Multi-statement input is split on real statement boundaries (a `;` inside a string literal does not split).
+- **Protected objects**: you cannot DML/DDL the cartridge's own internal tables (`messages`, `sessions`, `system_config`, …) from the console — the same boundary the web engine enforces. Reads on them are fine.
+- Transaction control (`BEGIN`/`COMMIT`/…) is refused (it would break the scratchpad savepoint).
+- Results print to the terminal (capped at 200 rows per set) and are stored as a transcript row, so `!` commands show up in the conversation just like the web engine's.
+
 ### Configuration (the keychain split)
 
 The cartridge carries the agent's **identity + data + provider config**
@@ -144,8 +165,9 @@ stuck suppression flag.
   engine to summarize, then re-export.
 - **Streaming output** — turns are blocking; the final answer prints when the
   cascade completes (tool activity prints to stderr as it happens).
-- **Bang commands** (`!SQL`, `!!SQL`, `/compact`) — chat-input interception is
-  a web-engine concern; in the REPL, ask the agent to run SQL instead.
+- **`/compact`** — chat-input compaction stays a web-engine concern (the `!`/`!!`
+  SQL scratchpad IS implemented here, above); in the REPL, ask the agent to
+  summarize instead.
 
 ## Testing
 

@@ -72,6 +72,10 @@ class TurnError(Exception):
     """A turn failed (e.g. LLM transport error) after the T3 rollback dance."""
 
 
+class ScratchpadError(Exception):
+    """A scratchpad (! / !!) command was refused or failed before commit."""
+
+
 # --- prompt + message framing (ported from src/harness.js + src/llm-provider.js) ---
 
 def _normalize_llm_url(url):
@@ -545,6 +549,102 @@ def connection_test(url, model, api_key):
         return False, (f"unexpected response from {url} — not an "
                        "OpenAI-compatible chat-completions endpoint?")
     return True, ""
+
+
+# --- T9 parity: direct SQL scratchpad (! / !!) ---
+#
+# A leading bang runs SQL directly, bypassing the LLM trigger cascade:
+#   !SQL  -> shared:  stored in_context=1 — the agent SEES it and can build on it
+#   !!SQL -> private: stored in_context=0 — kept OUT of the agent's context
+# Reads run immediately; every write (DML/DDL) confirms first. The protected-
+# object guard mirrors the web engine's scratchpad boundary (schema.js): you
+# cannot DML/DDL the cartridge's own internal objects from the console.
+
+SCRATCH_ROW_CAP = 200  # rows kept per result set (bounds LLM context, as in T9)
+
+# Cartridge-owned objects — the boundary from schema.js INTERNAL_TABLES +
+# SYSTEM_VIEWS. DML/DDL on these is refused; reads are allowed (inspecting your
+# own conversation is legitimate).
+_PROTECTED_OBJECTS = frozenset({
+    "messages", "sessions", "session_context", "system_config", "system_files",
+    "llm_profiles", "tools", "turn_changesets", "turn_ddl_log", "compactions",
+    "tool_approvals", "dashboard_cards", "documents", "documents_fts",
+    "v_active_context", "v_schema_catalog", "v_turn_boundaries",
+    "v_tool_call_queries", "v_grid_matrix", "v_session_summary",
+})
+
+
+def parse_scratchpad(text):
+    """Parse a leading-bang scratchpad command. Returns None for normal chat."""
+    m = re.match(r"^(!+)([\s\S]*)$", text.strip())
+    if not m:
+        return None
+    sql = m.group(2).strip()
+    if not sql:
+        return None  # bare "!" -> treat as a normal (weird) chat message
+    return {"bangs": len(m.group(1)), "sql": sql, "in_context": len(m.group(1)) == 1}
+
+
+def _split_sql_statements(sql):
+    """Split SQL into individual statements using SQLite's own completeness rule
+    (sqlite3.complete_statement), scanning character-by-character so it works
+    for multiple statements on one line AND does not split on a semicolon inside
+    a string literal (SQLite's parser knows the difference)."""
+    stmts, buf = [], ""
+    for ch in sql:
+        buf += ch
+        if sqlite3.complete_statement(buf):
+            s = buf.strip().rstrip(";").strip()
+            if s:
+                stmts.append(s)
+            buf = ""
+    tail = buf.strip().rstrip(";").strip()
+    if tail:
+        stmts.append(tail)
+    return stmts
+
+
+def _scratch_target(stmt):
+    """Primary target object of a single write statement (for the protected-
+    object guard). Returns a lowercase name, or None."""
+    s = stmt.strip()
+    m = re.match(
+        r"^(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|REPLACE\s+INTO|UPDATE|"
+        r"DELETE\s+FROM)\s+([`\"\[]?\w+[`\"\]]?)", s, re.I)
+    if m:
+        return m.group(1).strip("`\"[]").lower()
+    m = re.match(
+        r"^(?:CREATE|DROP|ALTER)\s+(?:OR\s+REPLACE\s+)?"
+        r"(?:TEMP(?:ORARY)?\s+)?(?:UNIQUE\s+)?(?:TABLE|VIEW|INDEX)\s+"
+        r"(?:IF\s+(?:NOT\s+)?EXISTS\s+)?([`\"\[]?\w+[`\"\]]?)", s, re.I)
+    if m:
+        return m.group(1).strip("`\"[]").lower()
+    return None
+
+
+def _scratch_classify(stmt):
+    """Classify one statement (mirrors scratchpad.js classifyStatement).
+    Returns {kind, target} where kind is read/dml/ddl/forbidden/other."""
+    s = stmt.strip().rstrip(";").strip()
+    words = s.split()
+    first = words[0].upper() if words else ""
+    if first in ("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "END"):
+        return {"kind": "forbidden", "target": None,
+                "reason": f"Transaction-control statements ({first}) cannot run "
+                          f"inside the scratchpad savepoint."}
+    target = _scratch_target(s)
+    if first in ("SELECT", "EXPLAIN"):
+        kind = "read"
+    elif first == "WITH":
+        # A data-modifying CTE is a WRITE — the keyword heuristic errs safe.
+        kind = "dml" if re.search(r"\b(INSERT|UPDATE|DELETE|REPLACE)\b", s, re.I) else "read"
+    elif first in ("INSERT", "UPDATE", "DELETE", "REPLACE"):
+        kind = "dml"
+    elif first in ("CREATE", "DROP", "ALTER"):
+        kind = "ddl"
+    else:
+        kind = "other"  # PRAGMA, VACUUM, ... — run as-is; SQLite errors surface
+    return {"kind": kind, "target": target}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1085,6 +1185,145 @@ class Host:
             "SELECT content FROM messages WHERE session_id=? AND role='assistant' "
             "AND id > ? ORDER BY id DESC LIMIT 1", (self.session_id, before_id)).fetchone()
         return (row[0] if row else "") or ""
+
+    # ── T9 parity: direct SQL scratchpad (! / !!) ────────────────────────
+    def _confirm_scratch_write(self, cls, stmt):
+        """Confirm a write command before it executes (reads skip this).
+        Returns True to proceed. Without a TTY there is no one to ask — fail
+        closed with an actionable error (the same idiom as fetch_url)."""
+        if cls["kind"] == "ddl":
+            first = stmt.strip().split(None, 1)[0].upper()
+            what = f"{first} {cls.get('target') or '(…)'}".strip()
+        else:
+            what = stmt.splitlines()[0][:120]
+        if not sys.stdin.isatty():
+            raise ScratchpadError(
+                "scratchpad writes need an interactive terminal to confirm — no TTY "
+                "in this run. Reads (!SELECT …) work headless; re-run attached to a "
+                "terminal for writes.")
+        try:
+            ans = input(f"  ⚠ scratchpad write: {what}\n  Run it? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return ans in ("y", "yes")
+
+    def _scratch_fail(self, cmd, raw_text, in_context, err):
+        """Roll back a failed scratchpad and keep the transcript honest: the
+        user row + an error result land (cascade suppressed), mirroring send()."""
+        conn = self.conn
+        try:
+            conn.execute("ROLLBACK TO SAVEPOINT scratch_sp")
+            conn.execute("RELEASE SAVEPOINT scratch_sp")
+        except sqlite3.Error:
+            pass
+        conn.execute("UPDATE session_context SET value='1' WHERE key='suppress_cascade'")
+        try:
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, in_context) VALUES (?,?,?,?)",
+                (self.session_id, "user", raw_text, in_context))
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, in_context) VALUES (?,?,?,?)",
+                (self.session_id, "assistant",
+                 json.dumps({"scratchpad": True, "sql": cmd["sql"],
+                             "bangs": cmd["bangs"], "error": err}), in_context))
+        finally:
+            conn.execute("UPDATE session_context SET value='0' WHERE key='suppress_cascade'")
+        conn.commit()
+        print(f"tables> ⚠ scratchpad error: {err}\n", file=sys.stderr)
+
+    def scratchpad(self, raw_text):
+        """Run a leading-bang SQL command directly (bypasses the LLM). `!` =
+        shared (in_context=1), `!!` = private (in_context=0). Prints results to
+        the terminal and stores user + result rows in the transcript. Returns
+        True on success, False on cancel/refusal/error."""
+        cmd = parse_scratchpad(raw_text)
+        if not cmd:
+            return False  # not a scratchpad command — caller handles it
+        conn = self.conn
+        in_context = 1 if cmd["in_context"] else 0
+        results, infos = [], []
+        cancelled = None
+        conn.execute("SAVEPOINT scratch_sp")
+        try:
+            # Suppress the cascade so the user-row insert does NOT fire agent_think.
+            conn.execute("UPDATE session_context SET value='1' WHERE key='suppress_cascade'")
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, in_context) VALUES (?,?,?,?)",
+                (self.session_id, "user", raw_text, in_context))
+            for stmt in _split_sql_statements(cmd["sql"]):
+                cls = _scratch_classify(stmt)
+                if cls["kind"] == "forbidden":
+                    raise ScratchpadError(cls["reason"])
+                # Protected-object boundary (schema.js parity): no DML/DDL on the
+                # cartridge's own internal objects from the console.
+                if cls["kind"] in ("dml", "ddl") and cls.get("target") in _PROTECTED_OBJECTS:
+                    raise ScratchpadError(
+                        f"Operation rejected: direct {cls['kind'].upper()} of protected "
+                        f"object \"{cls['target']}\" is not permitted.")
+                if cls["kind"] != "read" and not self._confirm_scratch_write(cls, stmt):
+                    cancelled = stmt
+                    break
+                cur = conn.execute(stmt)
+                if cls["kind"] in ("read", "other") and cur.description:
+                    cols = [d[0] for d in cur.description]
+                    values = []
+                    for row in cur:
+                        values.append(list(row))
+                        if len(values) >= SCRATCH_ROW_CAP:
+                            break
+                    results.append({"columns": cols, "values": values,
+                                    "truncated": len(values) >= SCRATCH_ROW_CAP})
+                elif cls["kind"] == "ddl":
+                    verb = {"DROP": "dropped", "ALTER": "altered"}.get(
+                        stmt.strip().split(None, 1)[0].upper(), "created")
+                    infos.append(f"✓ {verb} {cls.get('target') or 'object'}")
+                else:
+                    changes = max(0, cur.rowcount)
+                    infos.append(f"✓ {changes} row{'s' if changes != 1 else ''} affected")
+            if cancelled is not None:
+                # User declined a write — roll back everything (incl. the user row).
+                conn.execute("ROLLBACK TO SAVEPOINT scratch_sp")
+                conn.execute("RELEASE SAVEPOINT scratch_sp")
+                conn.commit()
+                print(f"tables> cancelled — “{cancelled.splitlines()[0][:80]}” was not executed.\n")
+                return False
+            envelope = {"scratchpad": True, "sql": cmd["sql"], "bangs": cmd["bangs"],
+                        "results": results, "infos": infos}
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, in_context) VALUES (?,?,?,?)",
+                (self.session_id, "assistant", json.dumps(envelope), in_context))
+            conn.execute("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id=?",
+                         (self.session_id,))
+            conn.execute("RELEASE SAVEPOINT scratch_sp")
+            conn.commit()
+        except ScratchpadError as e:
+            self._scratch_fail(cmd, raw_text, in_context, str(e))
+            return False
+        except sqlite3.Error as e:
+            self._scratch_fail(cmd, raw_text, in_context, str(e))
+            return False
+        self._print_scratch_results(results, infos)
+        return True
+
+    def _print_scratch_results(self, results, infos):
+        for info in infos:
+            print(f"tables> {info}")
+        for r in results:
+            cols = r["columns"]
+            if not cols:
+                continue
+            widths = [len(str(c)) for c in cols]
+            for row in r["values"]:
+                for i, cell in enumerate(row):
+                    widths[i] = max(widths[i], len(str(cell)))
+            print("tables> " + "  ".join(str(c).ljust(widths[i]) for i, c in enumerate(cols)))
+            for row in r["values"]:
+                print("tables>   " + "  ".join(
+                    str(v).ljust(widths[i]) for i, v in enumerate(row)))
+            if r.get("truncated"):
+                print(f"tables>   … (capped at {SCRATCH_ROW_CAP} rows)")
+        if not results and not infos:
+            print("tables> (no rows)")
 
     # ── boot report ─────────────────────────────────────────────────────────
     def report(self):
@@ -1686,6 +1925,16 @@ def main(argv=None):
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    # Scratchpad (! / !!) runs SQL directly — it needs no LLM endpoint/model/key.
+    # Handle a one-shot scratchpad command here, before the config resolution that
+    # chat mode requires, so `tables.py cartrd.sqlite3 "!SELECT …"` works with no
+    # provider configured at all. (Interactive REPL + piped scratchpads are handled
+    # after boot; they run in a session that already has a working endpoint.)
+    if message is not None and parse_scratchpad(message):
+        ok = host.scratchpad(message)
+        host.close()
+        return 0 if ok else 1
+
     # T38 §5 resolution chain — in-file system_config sits above the manifest
     # (setup wrote it; same data, fresher). Refuse loudly: there is still no
     # default endpoint or model.
@@ -1738,6 +1987,8 @@ def main(argv=None):
         if not sys.stdin.isatty():
             piped = sys.stdin.read().strip()
             if piped:
+                if parse_scratchpad(piped):
+                    return 0 if host.scratchpad(piped) else 1
                 answer = host.send(piped)
                 print("\n" + (answer or "(no response)"))
                 return 0
@@ -1752,6 +2003,9 @@ def main(argv=None):
                 continue
             if line in (".exit", ".quit", "exit", "quit"):
                 break
+            if parse_scratchpad(line):
+                host.scratchpad(line)
+                continue
             try:
                 answer = host.send(line)
                 print(f"tables> {answer or '(no response)'}\n")
