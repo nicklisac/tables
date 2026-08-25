@@ -114,22 +114,31 @@ async function backupFull(module, destDb, srcDb) {
  * @param {object} module  - raw WASM module (bootSqliteAgent return value)
  * @param {number} db      - Database handle pointer
  * @param {string} filename - Suggested download filename
+ * @param {(step: string) => void} [onStep] - optional phase reporter; the UI
+ *   shows it in the status bar. DIAGNOSTIC (2026-08-24): added to localize a
+ *   field freeze — if export hangs, the last painted step names the culprit.
  */
-export async function exportCartridge(sqlite3, module, db, filename = 'tables-cartridge.sqlite3') {
+export async function exportCartridge(sqlite3, module, db, filename = 'tables-cartridge.sqlite3', onStep = () => {}) {
+  const step = (s) => { console.info('[export]', s); onStep(s); };
+
   // 1. Snapshot the live DB into an in-memory DB (safe with active statements)
+  step('snapshot');
   const pMemDb = await openMemoryDb(sqlite3);
   try {
     await backupFull(module, pMemDb, db);
 
     // T33b (Phase 3): stamp _manifest v1 into the staging copy before serialize
     // — the exported file is self-consistent by construction.
+    step('manifest');
     await writeManifest(sqlite3, pMemDb);
 
     // T37: stamp the in-file host (system_files + host_sha256 manifest key) —
     // the export carries its own engine ("agent on a keychain").
+    step('host-stamp');
     await stampHost(sqlite3, pMemDb);
 
     // 2. Serialize the in-memory DB into a malloc'd buffer
+    step('serialize');
     let zSchema;
     let pSize;
     let bytes;
@@ -149,6 +158,7 @@ export async function exportCartridge(sqlite3, module, db, filename = 'tables-ca
     }
 
     // 3. Trigger download
+    step('save-dialog');
     const saveResult = await saveFile(bytes, filename);
     if (saveResult?.cancelled) {
       return { cancelled: true };
@@ -482,23 +492,50 @@ function sqlLiteral(v) {
 
 // ── File I/O Helpers ────────────────────────────────────────────────
 
+// Field bug (2026-08-24): on at least one machine/Chrome build the native
+// save picker neither surfaces a dialog nor settles — export wedged forever
+// at 'save-dialog' with no error (the whole browser appeared frozen). A
+// picker that cannot produce a dialog must not be allowed to wedge the
+// export: race it against a watchdog and fall back to a plain blob download.
+// Once FSA has failed this way, remember it (per machine, in localStorage)
+// so we never make the user wait out the watchdog again — clear the key
+// `sql-agent-fsa-save-broken` to re-enable the native picker.
+const FSA_BROKEN_KEY = 'sql-agent-fsa-save-broken';
+let fsaSaveBroken = (() => {
+  try { return localStorage.getItem(FSA_BROKEN_KEY) === '1'; } catch { return false; }
+})();
+function markFsaSaveBroken() {
+  fsaSaveBroken = true;
+  try { localStorage.setItem(FSA_BROKEN_KEY, '1'); } catch { /* ignore */ }
+}
+const PICKER_TIMEOUT_MS = 10_000;
+
 async function saveFile(data, suggestedName) {
-  // Try File System Access API first
-  if ('showSaveFilePicker' in window) {
+  // Try File System Access API first (watchdog-guarded — see above)
+  if ('showSaveFilePicker' in window && !fsaSaveBroken) {
+    let pickerTimedOut = false;
     try {
-      const handle = await window.showSaveFilePicker({
-        suggestedName,
-        types: [{
-          description: 'SQLite 3 Database',
-          accept: { 'application/x-sqlite3': ['.sqlite3', '.db', '.sqlite'] },
-        }],
-      });
+      const handle = await Promise.race([
+        window.showSaveFilePicker({
+          suggestedName,
+          types: [{
+            description: 'SQLite 3 Database',
+            accept: { 'application/x-sqlite3': ['.sqlite3', '.db', '.sqlite'] },
+          }],
+        }),
+        new Promise((resolve) => setTimeout(
+          () => { pickerTimedOut = true; resolve(null); }, PICKER_TIMEOUT_MS)),
+      ]);
+      if (!handle) {
+        throw new Error(`save picker produced no dialog within ${PICKER_TIMEOUT_MS}ms`);
+      }
       const writable = await handle.createWritable();
       await writable.write(data);
       await writable.close();
       return { success: true };
     } catch (err) {
       if (err.name === 'AbortError') return { cancelled: true };
+      if (pickerTimedOut) markFsaSaveBroken();
       console.warn('[cartridge] showSaveFilePicker failed, falling back to blob download', err);
     }
   }
@@ -778,7 +815,9 @@ export function initCartridgeUi(context) {
     try {
       cartridgeStatusBar.textContent = 'Exporting cartridge…';
       cartridgeStatusBar.style.color = '#d29922';
-      const result = await exportCartridge(agent.sqlite3, agent.module, agent.db, `tables-cartridge-${new Date().toISOString().slice(0, 10)}.sqlite3`);
+      const result = await exportCartridge(agent.sqlite3, agent.module, agent.db,
+        `tables-cartridge-${new Date().toISOString().slice(0, 10)}.sqlite3`,
+        (s) => { cartridgeStatusBar.textContent = `Exporting cartridge… (${s})`; });
       if (result?.cancelled) {
         cartridgeCtx.updateReadyStatus();
         return;
@@ -912,7 +951,9 @@ export function initCartridgeUi(context) {
     closeImportWarning();
     try {
       setCartridgeStatus('Exporting backup…', '#d29922');
-      const result = await exportCartridge(agent.sqlite3, agent.module, agent.db, `tables-backup-${new Date().toISOString().slice(0, 10)}.sqlite3`);
+      const result = await exportCartridge(agent.sqlite3, agent.module, agent.db,
+        `tables-backup-${new Date().toISOString().slice(0, 10)}.sqlite3`,
+        (s) => { setCartridgeStatus(`Exporting backup… (${s})`, '#d29922'); });
       if (result?.cancelled) {
         cartridgeCtx.updateReadyStatus(); // save canceled → abort the whole flow quietly
         return;
