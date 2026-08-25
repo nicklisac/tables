@@ -1,109 +1,5 @@
 #!/usr/bin/env python3
-"""
-Tables standalone host — boot a cartridge without the web engine.
-
-A Tables cartridge is an exported .sqlite3 file whose ENTIRE agent state —
-conversations, data, identity, and the ReAct trigger cascade — lives in the
-file itself. This host is deliberately thin: it does NOT re-implement the
-agent loop. It opens the file, checks the compatibility contract (_manifest),
-registers the UDFs the cartridge's triggers call, and then lets the file's OWN
-triggers drive the whole conversation. One user-row INSERT fires
-
-    agent_turn_init -> agent_think (ask_llm) -> execute_tool (<tool UDF>)
-        -> agent_think -> ... until an assistant row with no tool_calls.
-
-In a CLI there is no JSPI / UI-thread: a blocking UDF callback is just a
-function call, so the pure-SQL flagship loop runs natively on stdlib sqlite3.
-
-Keychain split (the file = the agent; the key = where you plug it in):
-  * The cartridge carries identity + data + the prompt bundle (persona).
-  * Credentials + model config are supplied at boot, from env or flags —
-    they never travel in the file.
-
-v1 tool matrix (thin on purpose — T37 lifts this loader into an in-file host):
-  ask_llm            full   OpenAI-compatible chat completions, JSON-in-content
-  execute_sql        full   DML + DDL — writes commit in place to the cartridge
-  fetch_url          gated  HTTP(S) fetch + HTML->text (SSRF-blocked); every call
-                            asks for interactive approval (y/N/a). Set
-                            TABLES_ALLOW_FETCH=1 to disable the approval layer
-                            (free fetches — unattended runs).
-  search_web         stub   registered, returns a clear "not in v1" error
-  materialize        stub   registered, returns a clear "not in v1" error
-  search_documents   stub   registered, returns a clear "not in v1" error
-  ingest_document    stub   registered, returns a clear "not in v1" error
-
-Trust model (T37, layered — no crypto in v1):
-  L0 consent at boot: the report below states host hash + fetch mode before any turn.
-  L1 integrity: if the cartridge embeds its own host (system_files), the stored
-     sha256 is verified against the body BEFORE anything runs; mismatch = refuse.
-  L3 capability: fetch_url approval layer (above) — per-action consent, the one
-     UDF whose egress destination is chosen by the model at runtime.
-Dashboard cards are inert by design (the optional `dashboard_html` feature is
-unimplemented here — not a bug).
-
-T38 — portable onboarding (--setup):
-  python3 host/tables.py --setup
-      Guided first run: find the cartridge (or take one as an argument), pick
-      the provider from the file's saved profiles (llm_profiles, stamped by
-      the web export), pair an API key (OS keyring or a 0600 local config
-      file — keys NEVER travel in the file), run a real connection test, and
-      write the non-secret config back into the cartridge. Setup also binds
-      this machine to that cartridge (~/.config/tables/config.json, next to
-      the credentials — stored relative to this script AND absolute, so
-      moving the folder that holds both still resolves) — after that, daily
-      use is a flagless one-liner:
-          python3 tables.py "your question"
-      Pass a different path explicitly to override the default; re-run
-      --setup against another file to move it.
-  Resolution chain for flagless runs (§5 of the T38 design):
-      cartridge: positional path → machine default (set by --setup) → refuse
-      url:   --llm-url → TABLES_LLM_URL → system_config.llm_url (in-file)
-            → refuse loudly
-      model: --model → TABLES_LLM_MODEL → system_config.llm_model →
-            manifest recommended_model → refuse loudly
-      key:   --api-key → TABLES_LLM_API_KEY → keyring("tables", profile id) →
-            ~/.config/tables/credentials.json → paste (offers to save)
-            (ambient OPENAI_API_KEY/GEMINI_API_KEY are deliberately NOT
-            consulted — they're set for other tools and would silently
-            shadow a paired key)
-  The key is paired once per machine, under the profile's id — the same model
-  as `gh auth login` / `aws configure` / `docker login`. Re-run --setup any
-  time to change providers or keys.
-
-Usage:
-  python3 host/tables.py [CARTRIDGE.sqlite3] [message]
-  python3 host/tables.py "your question"     # after --setup: a message to the
-                                             # machine's default cartridge
-      CARTRIDGE         the .sqlite3 file to boot (recognized by .sqlite3
-                        extension or existing file); default: the one --setup
-                        bound to this machine (an explicit path overrides it)
-      message           a single message; bare `tables.py` is the REPL on the
-                        default cartridge
-      --setup           guided first-run setup (no cartridge arg = discovery);
-                        binds this machine's default cartridge on success
-      --llm-url URL     OpenAI-compatible chat-completions endpoint
-                        (env TABLES_LLM_URL; falls back to the in-file config)
-      --model MODEL     model name (env TABLES_LLM_MODEL). Required — there is
-                        no default; when omitted, the in-file config and then
-                        the manifest's recommended_model (the exporting build's
-                        config) are used if present, otherwise boot refuses.
-      --api-key KEY     bearer key (env TABLES_LLM_API_KEY, else the
-                        profile-paired key; ambient OPENAI/GEMINI env vars
-                        are never consulted)
-
-Environment:
-  TABLES_ALLOW_FETCH=1  disable the fetch_url approval layer (free fetches).
-                        Default: every fetch prompts [y]es/[N]o/[a]ll-for-run;
-                        without a TTY, fetches fail closed with this hint.
-  TABLES_KEYRING        key backend seam for tests: "real" (default) uses the
-                        `keyring` package if installed; "mock" uses a JSON file
-                        (TABLES_KEYRING_FILE); "absent" simulates the package
-                        being missing. Never set in production use.
-  TABLES_KEYRING_FILE   backing file for TABLES_KEYRING=mock.
-
-If `message` is omitted and stdin is a pipe, stdin is used as the message;
-otherwise an interactive REPL starts.
-"""
+"""Tables standalone host — usage and design in host/README.md."""
 from __future__ import annotations
 
 import argparse
@@ -176,12 +72,7 @@ class TurnError(Exception):
     """A turn failed (e.g. LLM transport error) after the T3 rollback dance."""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt + message framing (ported from src/harness.js + src/llm-provider.js).
-# The agent protocol is JSON-in-content: buildSystemPrompt forces the model to
-# answer {"content","tool_calls"}, so no native function-calling is required —
-# this works against any OpenAI-compatible endpoint.
-# ─────────────────────────────────────────────────────────────────────────────
+# --- prompt + message framing (ported from src/harness.js + src/llm-provider.js) ---
 
 def _normalize_llm_url(url):
     """Auto-heal common user input mistakes: a bare base (http://host:port),
@@ -288,12 +179,7 @@ def parse_llm_content(content):
     return text, None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# T38 — provider registry (host-side subset of the web's llm-provider.js).
-# Only the OpenAI-compatible family: this host speaks chat-completions only.
-# Mirrors the web registry's keyRequired / presetUrl fields so --setup can
-# skip the key step for local providers (S3) and pre-fill URLs.
-# ─────────────────────────────────────────────────────────────────────────────
+# --- T38: provider registry (host-side subset of the web's llm-provider.js) ---
 
 PROVIDERS = {
     "openai":          {"label": "OpenAI Compatible (custom)", "key_required": False,
@@ -323,17 +209,7 @@ def provider_requires_key(provider_id):
     return bool(info and info.get("key_required"))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# T38 — key storage. Two backends, NO in-file sealing (D2/§4.1):
-#   A: OS keyring (optional `keyring` package) — service "tables" (D6),
-#      account = profile id. The key never exists in any file.
-#   B: machine-local config file at 0600 (gh's hosts.yml pattern) — the
-#      zero-dependency fallback.
-# Entry values are a small JSON object {"key", "saved_at"} so both backends
-# can show a save date; a hand-stored raw string is tolerated (whole value =
-# key, no date). Discovery is OUR namespace only — never foreign entries
-# (D3).
-# ─────────────────────────────────────────────────────────────────────────────
+# --- T38: key storage backends (OS keyring or 0600 local file; D2/§4.1) ---
 
 KEYRING_SERVICE = "tables"  # D6
 
@@ -1277,16 +1153,7 @@ class Host:
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# T38 — --setup: guided first-run onboarding (design §3, UX scripts §9)
-#
-# One interaction idiom throughout: numbered list → type a number; single item
-# → [Y/n]. Setup ends in exactly one of two honest states: "✓ works"
-# (connection-tested) or "config saved, key not paired — you'll be asked on
-# first run" (skip chosen). A failed connection test is never papered over: it
-# shows the provider's real error and loops back to re-enter; setup never ends
-# on an unverified "saved".
-# ─────────────────────────────────────────────────────────────────────────────
+# --- T38: --setup guided onboarding (design §3, UX scripts §9) ---
 
 class SetupCancelled(Exception):
     """User interrupted (EOF / Ctrl+C) — nothing is committed."""

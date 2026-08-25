@@ -192,6 +192,11 @@ Keep new host logic self-contained and stdlib-only — the in-file copy is
 regenerated from this file at every export, so it must stay exec-clean
 (`__future__` imports after the docstring, `__main__` guard, argv passthrough).
 
+The embedded copy is a **snapshot of the exporting build**. A cartridge
+exported before an update carries that older host — if behavior looks wrong,
+re-export from the current site (a re-export converges to this build's host;
+importing into the web engine also reports host drift).
+
 ## Portable onboarding (T38)
 
 `--setup` takes a user from "I have this `.sqlite3`" to a flagless daily

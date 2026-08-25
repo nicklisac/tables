@@ -106,8 +106,8 @@ function startFakeLlm(script) {
 }
 
 /** Run the host as a child process; return { code, stdout, stderr }. */
-async function runHost(file, message, llmUrl, { model = 'fake-model', apiKey = 'test-key-000' } = {}) {
-  const args = [HOST, file];
+async function runHost(file, message, llmUrl, { model = 'fake-model', apiKey = 'test-key-000', hostPath = HOST } = {}) {
+  const args = [hostPath, file];
   if (message != null) args.push(message);
   args.push('--llm-url', llmUrl, '--model', model, '--api-key', apiKey);
   try {
@@ -201,6 +201,44 @@ test.describe('T36 — standalone cartridge host (Python-first)', () => {
       });
     } finally {
       await llm.close();
+      fs.rmSync(file, { force: true });
+    }
+  });
+
+  // The literal user flow (T37 self-boot): open the exported .sqlite3, copy
+  // the embedded tables.py out to a plain file, run THAT. Pins two things:
+  // the export embeds the repo's host byte-for-byte (?raw import — single
+  // source of truth; drift here is how a stale key chain shipped to a real
+  // user's cartridge), and the extracted copy runs as a standalone file.
+  test('the embedded host extracts to a runnable file identical to host/tables.py', async ({ page }) => {
+    await boot(page);
+    const file = writeCartridge(await exportCurrent(page), 'extract');
+    try {
+      // Extract exactly the way a user would: read system_files.body, write it out.
+      let body;
+      withCartridgeDb(file, (db) => {
+        body = db.prepare(
+          "SELECT body FROM system_files WHERE name = 'tables.py'"
+        ).get()?.body;
+      });
+      expect(body, 'export does not embed tables.py').toBeTruthy();
+
+      // Single source of truth: the embedded copy IS the repo file.
+      expect(body).toBe(fs.readFileSync(HOST, 'utf8'));
+
+      // Run the EXTRACTED file (not the repo path) against a fake LLM.
+      const extracted = `${file}.extracted.py`;
+      fs.writeFileSync(extracted, body);
+      const llm = await startFakeLlm([FINAL_REPLY]);
+      try {
+        const res = await runHost(file, 'How many sessions are there?', llm.url, { hostPath: extracted });
+        expect(res.code, `host stderr:\n${res.stderr}`).toBe(0);
+        expect(res.stdout).toContain('Done — I counted the sessions.');
+      } finally {
+        await llm.close();
+        fs.rmSync(extracted, { force: true });
+      }
+    } finally {
       fs.rmSync(file, { force: true });
     }
   });
