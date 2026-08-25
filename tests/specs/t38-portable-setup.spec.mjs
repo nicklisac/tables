@@ -136,9 +136,11 @@ function cleanEnv(extra = {}) {
   return { ...env, ...extra };
 }
 
-/** Run the host as a child process (piped stdin — NOT a TTY). */
+/** Run the host as a child process (piped stdin — NOT a TTY).
+ *  file = null omits the cartridge arg; message = null omits the message
+ *  (both null = bare invocation, exercises the machine-default path). */
 async function runHost(file, message, { env = {}, cwd, extraArgs = [] } = {}) {
-  const args = [HOST_FILE, file, message, ...extraArgs];
+  const args = [HOST_FILE, ...(file ? [file] : []), ...(message ? [message] : []), ...extraArgs];
   try {
     const { stdout, stderr } = await pExecFile(PY, args,
       { timeout: 60_000, maxBuffer: 10 * 1024 * 1024, env: cleanEnv(env), cwd });
@@ -637,8 +639,12 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
           expect(db.prepare("SELECT value FROM system_config WHERE key='llm_profile_id'").get().value)
             .toBe(PROFILE_ID);
         });
+        // No key anywhere (keyring empty, no local credentials file) — but the
+        // machine default IS bound: skipping the key doesn't unbind the file.
         expect(Object.keys(kr.read())).toHaveLength(0);
-        expect(fs.existsSync(path.join(xdg.dir, 'tables'))).toBe(false);
+        expect(fs.existsSync(path.join(xdg.dir, 'tables', 'credentials.json'))).toBe(false);
+        expect(JSON.parse(fs.readFileSync(path.join(xdg.dir, 'tables', 'config.json'), 'utf8'))
+          .default_cartridge).toBe(path.resolve(file));
 
         // First daily run (TTY): prompts for the key, offers to save, works.
         const daily = await runSetupPtyDaily(file, llm, [
@@ -767,6 +773,97 @@ test.describe('T38 (host side) — the --setup flow (§9 scripts are acceptance)
         for (const p of [carA, carB, carC]) fs.rmSync(p, { force: true });
         fs.rmSync(dirA, { recursive: true, force: true });
         fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    } finally { await llm.close(); }
+  });
+
+  test('setup binds this machine\'s default cartridge — daily runs are flagless, path included', async ({ page }) => {
+    const llm = await startFakeLlm();
+    try {
+      const file = writeCartridgeFile(await exportWithProfile(page, llm), 'def');
+      const xdg = freshXdg();
+      const kr = mockKeyring(xdg.dir, {
+        [PROFILE_ID]: { key: 'sk-stored-def', saved_at: '2026-08-20T10:00:00+00:00' },
+      });
+      try {
+        const res = await runSetupPty(
+          [['Use this? [Y/n/edit]: ', ['y']], ['Use it? [Y/n]: ', ['y']]],
+          { env: { ...kr.env, ...xdg.env }, cartridgeArg: file });
+        expect(res.code, `driver output:\n${res.out}`).toBe(0);
+        expect(res.out).toContain(`This machine now defaults to ${path.basename(file)}`);
+
+        // Machine-local pointer, next to the credentials — absolute, so daily
+        // runs work from any cwd. Never in the file itself.
+        const cfgPath = path.join(xdg.dir, 'tables', 'config.json');
+        expect(JSON.parse(fs.readFileSync(cfgPath, 'utf8')).default_cartridge)
+          .toBe(path.resolve(file));
+        expect(fs.readFileSync(file).toString('latin1')).not.toContain(xdg.dir);
+
+        // THE POINT: no path, no flags, no key env — from a DIFFERENT cwd.
+        const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 't38-elsewhere-'));
+        try {
+          const daily = await runHost(null, 'hi', { env: { ...xdg.env, ...kr.env }, cwd: elsewhere });
+          expect(daily.code, `stderr:\n${daily.stderr}`).toBe(0);
+          expect(daily.stdout).toContain('pong');
+          expect(llm.seen.at(-1).auth).toBe('Bearer sk-stored-def');
+          expect(llm.seen.at(-1).model).toBe('fake-model');
+        } finally { fs.rmSync(elsewhere, { recursive: true, force: true }); }
+      } finally { fs.rmSync(file, { force: true }); }
+    } finally { await llm.close(); }
+  });
+
+  test('cartridge resolution: explicit path overrides the machine default; stale/missing defaults fail loudly', async ({ page }) => {
+    const llm = await startFakeLlm();
+    try {
+      const bytes = await exportWithProfile(page, llm);
+      const fileA = writeCartridgeFile(bytes, 'defa');
+      // B is the same brain under a different model name — observable on the wire.
+      const fileB = writeCartridgeFile(mutateCartridge(bytes, (db) => {
+        db.prepare("INSERT OR REPLACE INTO system_config VALUES ('llm_model', 'fake-model-b')").run();
+      }), 'defb');
+      const xdg = freshXdg();
+      const kr = mockKeyring(xdg.dir, {
+        [PROFILE_ID]: { key: 'sk-def-res', saved_at: '2026-08-20T10:00:00+00:00' },
+      });
+      // Bind the machine default to A (the shape --setup writes — asserted in
+      // the previous test; here it's a fixture so we can exercise resolution).
+      const cfgPath = path.join(xdg.dir, 'tables', 'config.json');
+      fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
+      fs.writeFileSync(cfgPath, JSON.stringify({ default_cartridge: fileA }));
+      try {
+        const base = { ...kr.env, ...xdg.env };
+
+        // No path → the machine default (A).
+        const bare = await runHost(null, 'hi', { env: base });
+        expect(bare.code, `stderr:\n${bare.stderr}`).toBe(0);
+        expect(llm.seen.at(-1).model).toBe('fake-model');
+
+        // Explicit path → overrides the default (B).
+        const explicit = await runHost(fileB, 'hi', { env: base });
+        expect(explicit.code, `stderr:\n${explicit.stderr}`).toBe(0);
+        expect(llm.seen.at(-1).model).toBe('fake-model-b');
+
+        // Stale default (file moved/deleted) → refuse loudly, name the fix.
+        fs.writeFileSync(cfgPath, JSON.stringify({ default_cartridge: '/nonexistent/gone.sqlite3' }));
+        const stale = await runHost(null, 'hi', { env: base });
+        expect(stale.code).toBe(2);
+        expect(stale.stderr).toContain('cartridge not found');
+        expect(stale.stderr).toContain('re-run --setup');
+
+        // No default at all → the onboarding pointer (names what it saw + fix).
+        const xdg2 = freshXdg();
+        const none = await runHost(null, 'hi', { env: { ...kr.env, ...xdg2.env } });
+        expect(none.code).toBe(2);
+        expect(none.stderr).toContain('no default cartridge yet');
+        expect(none.stderr).toContain('--setup');
+
+        // Bare invocation, no default → the plain onboarding pointer.
+        const noArgs = await runHost(null, null, { env: { ...kr.env, ...xdg2.env } });
+        expect(noArgs.code).toBe(2);
+        expect(noArgs.stderr).toContain('no cartridge given');
+      } finally {
+        fs.rmSync(fileA, { force: true });
+        fs.rmSync(fileB, { force: true });
       }
     } finally { await llm.close(); }
   });

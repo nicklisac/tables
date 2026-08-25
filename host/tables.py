@@ -47,10 +47,14 @@ T38 — portable onboarding (--setup):
       the provider from the file's saved profiles (llm_profiles, stamped by
       the web export), pair an API key (OS keyring or a 0600 local config
       file — keys NEVER travel in the file), run a real connection test, and
-      write the non-secret config back into the cartridge. After that, daily
-      use is a flagless one-liner:
-          python3 tables.py my-agent.sqlite3 "your question"
+      write the non-secret config back into the cartridge. Setup also binds
+      this machine to that cartridge (~/.config/tables/config.json, next to
+      the credentials) — after that, daily use is a flagless one-liner:
+          python3 tables.py "your question"
+      Pass a different path explicitly to override the default; re-run
+      --setup against another file to move it.
   Resolution chain for flagless runs (§5 of the T38 design):
+      cartridge: positional path → machine default (set by --setup) → refuse
       url:   --llm-url → TABLES_LLM_URL → system_config.llm_url (in-file)
             → refuse loudly
       model: --model → TABLES_LLM_MODEL → system_config.llm_model →
@@ -63,7 +67,15 @@ T38 — portable onboarding (--setup):
 
 Usage:
   python3 host/tables.py [CARTRIDGE.sqlite3] [message]
-      --setup           guided first-run setup (no cartridge arg = discovery)
+  python3 host/tables.py "your question"     # after --setup: a message to the
+                                             # machine's default cartridge
+      CARTRIDGE         the .sqlite3 file to boot (recognized by .sqlite3
+                        extension or existing file); default: the one --setup
+                        bound to this machine (an explicit path overrides it)
+      message           a single message; bare `tables.py` is the REPL on the
+                        default cartridge
+      --setup           guided first-run setup (no cartridge arg = discovery);
+                        binds this machine's default cartridge on success
       --llm-url URL     OpenAI-compatible chat-completions endpoint
                         (env TABLES_LLM_URL; falls back to the in-file config)
       --model MODEL     model name (env TABLES_LLM_MODEL). Required — there is
@@ -468,12 +480,16 @@ def keyring_accounts(probe_ids=()):
 
 # ── Backend B: machine-local config file (0600, stdlib only) ────────────────
 
-def cred_file_path():
+def _tables_config_dir():
     if os.name == "nt":
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
     else:
         base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "tables", "credentials.json")
+    return os.path.join(base, "tables")
+
+
+def cred_file_path():
+    return os.path.join(_tables_config_dir(), "credentials.json")
 
 
 def _creds_read():
@@ -516,6 +532,52 @@ def creds_set(profile_id, key):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+# ── Machine-local default cartridge (setup binds the machine) ───────────────
+
+def config_file_path():
+    """Non-secret machine state, next to the 0600 credentials file."""
+    return os.path.join(_tables_config_dir(), "config.json")
+
+
+def _machine_config_read():
+    try:
+        with open(config_file_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def default_cartridge():
+    """The cartridge --setup bound to this machine (absolute path), or None.
+
+    Machine-local by design: it is a per-machine pointer (like the paired
+    key), NOT agent state — it never travels in the file, so a copied
+    cartridge carries no one else's paths with it."""
+    p = _machine_config_read().get("default_cartridge")
+    return p if isinstance(p, str) and p else None
+
+
+def set_default_cartridge(path):
+    """Record this machine's default cartridge (end of a successful --setup).
+    Absolute so daily runs work from any cwd. Atomic write, same pattern as
+    creds_set — non-secret, 0644."""
+    target = config_file_path()
+    directory = os.path.dirname(target)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    data = _machine_config_read()
+    data["default_cartridge"] = os.path.abspath(path)
+    tmp = target + f".tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        if hasattr(os, "fchmod"):  # POSIX — umask-proof the mode
+            os.fchmod(f.fileno(), 0o644)
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
 
 
 def creds_accounts():
@@ -1542,12 +1604,12 @@ def _test_loop(profile, key):
 
 # ── the flow ────────────────────────────────────────────────────────────────
 
-def run_setup(args):
+def run_setup(args, cartridge):
     """T38 --setup. Returns a process exit code: 0 = works / honest skip,
     1 = cancelled or unverified failure, 2 = usage error."""
     host = None
     try:
-        path = args.cartridge or _discover_cartridge()
+        path = cartridge or _discover_cartridge()
         if not path:
             print("setup cancelled — no changes saved", file=sys.stderr)
             return 1
@@ -1585,17 +1647,25 @@ def run_setup(args):
                       "nothing was saved. Re-run --setup when ready.")
                 return 1
 
-        # Step 5 (D4): non-secret config written back INTO the cartridge.
+        # Step 5 (D4): non-secret config written back INTO the cartridge, and
+        # this machine binds that cartridge as its default — daily runs need
+        # no path at all. An explicit path always overrides; re-running
+        # --setup against another file moves the default.
         host.write_setup_config(profile)
-        one_liner = f'python3 tables.py {path} "your question"'
+        set_default_cartridge(path)
+        name = os.path.basename(os.path.abspath(path))
         if key is KEY_SKIPPED:
             print("✓ Done. Config saved in the file — key not paired; "
                   "you'll be asked on first run.")
-            print(f"  Daily use: {one_liner}")
+            print(f"  This machine now defaults to {name}.")
+            print('  Daily use: python3 tables.py "your question" (no path needed)')
             print("  Pair the key now or later with --setup.")
         else:
-            print(f"✓ Done. Daily use: {one_liner}")
-            print("  Re-run --setup anytime to change providers or keys.")
+            print(f"✓ Done. This machine now defaults to {name}.")
+            print('  Daily use: python3 tables.py "your question" '
+                  '(or just python3 tables.py for the REPL)')
+            print("  A different cartridge: pass its path — it overrides the default.")
+            print("  Re-run --setup anytime to change providers, keys, or the default file.")
         if not keyring_was_available:
             print("Tip: pip install keyring, then re-run --setup to use your OS keychain.")
         host.close()
@@ -1607,13 +1677,21 @@ def run_setup(args):
         return 1
 
 
+def _looks_like_cartridge(s):
+    """Positional disambiguation for the bare one-liner: an argument is a
+    cartridge path if it ends in .sqlite3 or names an existing file; anything
+    else is a message (valid only when a machine default exists)."""
+    return s.endswith(".sqlite3") or os.path.exists(s)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Boot a Tables cartridge and chat with its agent (standalone host v1).")
-    ap.add_argument("cartridge", nargs="?", default=None,
-                    help="path to the .sqlite3 cartridge (omit with --setup for discovery)")
-    ap.add_argument("message", nargs="?", default=None,
-                    help="a single message (omit for a REPL, or pipe via stdin)")
+    ap.add_argument("positional", nargs="*", metavar="ARG",
+                    help="a .sqlite3 path and/or a message — the path is "
+                         "recognized by extension or existing file; after --setup, "
+                         "a bare argument is a message to this machine's default "
+                         "cartridge (tables.py \"your question\")")
     ap.add_argument("--setup", action="store_true",
                     help="guided first-run setup: find the cartridge, pick a provider, "
                          "pair a key, verify the connection (T38)")
@@ -1622,15 +1700,51 @@ def main(argv=None):
     ap.add_argument("--api-key", default=None, help="bearer API key")
     args = ap.parse_args(argv)
 
-    if args.setup:
-        return run_setup(args)
+    # Positional disambiguation: [CARTRIDGE] [MESSAGE], where CARTRIDGE is
+    # recognized by .sqlite3 extension or existing file. A bare non-path
+    # argument with a machine default is a MESSAGE to that default — this is
+    # what makes `tables.py "question"` work flagless after --setup.
+    pos = args.positional
+    cartridge, message = None, None
+    if len(pos) == 1:
+        if _looks_like_cartridge(pos[0]):
+            cartridge = pos[0]
+        else:
+            message = pos[0]  # bare word: a message (needs a default to land on)
+    elif len(pos) == 2:
+        if _looks_like_cartridge(pos[0]):
+            cartridge, message = pos[0], pos[1]
+        else:
+            ap.error("expected a .sqlite3 path first (or run --setup to set a "
+                     "default cartridge)")
+    elif len(pos) > 2:
+        ap.error(f"too many arguments: {' '.join(pos)}")
 
-    if not args.cartridge:
+    if args.setup:
+        if message is not None:
+            ap.error("--setup takes at most one argument: the cartridge path")
+        return run_setup(args, cartridge)
+
+    # Cartridge resolution: explicit path > machine default (set by --setup).
+    # Fail loud on a stale default — never guess another file.
+    if cartridge is None and message is not None and not default_cartridge():
+        print("error: no default cartridge yet — that argument looks like a "
+              "message, but --setup hasn't bound a file to this machine. "
+              "Run --setup for guided onboarding (it remembers the file it set "
+              "up), or pass a .sqlite3 path.", file=sys.stderr)
+        return 2
+    path = cartridge or default_cartridge()
+    if not path:
         print("error: no cartridge given — pass a .sqlite3 path, or run --setup "
-              "for guided onboarding", file=sys.stderr)
+              "for guided onboarding (it remembers the file it set up)",
+              file=sys.stderr)
+        return 2
+    if not os.path.exists(path):
+        hint = "" if cartridge else " — it may have moved; pass a path, or re-run --setup"
+        print(f"error: cartridge not found: {path}{hint}", file=sys.stderr)
         return 2
 
-    host = Host(args.cartridge, None, None, None)
+    host = Host(path, None, None, None)
     try:
         host.boot()
     except HostError as e:
@@ -1682,8 +1796,8 @@ def main(argv=None):
     host.report()
 
     try:
-        if args.message is not None:
-            answer = host.send(args.message)
+        if message is not None:
+            answer = host.send(message)
             print("\n" + (answer or "(no response)"))
             return 0
         if not sys.stdin.isatty():

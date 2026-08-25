@@ -33,17 +33,22 @@ function call, so the pure-SQL flagship loop runs natively.
 ```sh
 # First run: guided setup — find the cartridge, pick a provider from the
 # file's saved profiles, pair an API key, verify the connection (T38).
+# It also binds this machine to that cartridge as the default.
 python3 host/tables.py --setup
 
-# One-shot: boot the cartridge, send one message, print the answer, exit.
-# After --setup this is flagless — url/model/key come from the file + keyring.
-python3 host/tables.py my-agent.sqlite3 "What tables do I have?"
+# One-shot: boot your default cartridge, send one message, print the answer.
+# Flagless — url/model/key come from the file + keyring, and the file is the
+# one --setup bound to this machine (pass a path to use a different one).
+python3 host/tables.py "What tables do I have?"
 
-# Interactive REPL (omit the message).
-python3 host/tables.py my-agent.sqlite3
+# Interactive REPL on the default cartridge (omit the message).
+python3 host/tables.py
+
+# A different cartridge: pass its path explicitly — overrides the default.
+python3 host/tables.py other-agent.sqlite3 "..."
 
 # Piped input is treated as a single message (scripting-friendly).
-echo "Summarize my data" | python3 host/tables.py my-agent.sqlite3
+echo "Summarize my data" | python3 host/tables.py
 ```
 
 ### Configuration (the keychain split)
@@ -51,10 +56,14 @@ echo "Summarize my data" | python3 host/tables.py my-agent.sqlite3
 The cartridge carries the agent's **identity + data + provider config**
 (the `llm_profiles` table and the active provider's endpoint, stamped by the
 web export); the **API key never travels in the file** — it is paired once per
-machine via `--setup` (or flags/env) and resolved at boot:
+machine via `--setup` (or flags/env) and resolved at boot. Setup also records
+**which cartridge this machine set up** (`~/.config/tables/config.json`) so
+daily runs need no path — like the key, a per-machine pointer that never
+travels in the file:
 
 | Setting    | Resolution order (first hit wins)                                        |
 |------------|--------------------------------------------------------------------------|
+| Cartridge  | positional path → machine default (`~/.config/tables/config.json`, set by `--setup`) → **refuse loudly** (a stale default never silently re-guesses) |
 | Endpoint   | `--llm-url` → `TABLES_LLM_URL` → in-file `system_config.llm_url` → **refuse loudly** (auto-healed — bare base, `…/v1`, or the full `…/v1/chat/completions` all work) |
 | Model      | `--model` → `TABLES_LLM_MODEL` → in-file `system_config.llm_model` → manifest `recommended_model` → **refuse loudly** (no hardcoded default) |
 | API key    | `--api-key` → `TABLES_LLM_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY` → keyring(`tables`, profile id) → `~/.config/tables/credentials.json` → paste prompt (TTY) / fail closed |

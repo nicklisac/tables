@@ -44,14 +44,17 @@ after that is a flagless one-liner:
 ```sh
 python3 tables/host/tables.py --setup        # find the cartridge, pick a provider,
                                              # pair a key, verify the connection
-python3 tables/host/tables.py my-agent.sqlite3 "What tables do I have?"   # just works
+python3 tables/host/tables.py "What tables do I have?"   # just works — no path needed
 ```
 
 Setup stores the API key in your OS keychain (`keyring` package —
 `pip install keyring`) or, when that isn't available, in an owner-only file at
 `~/.config/tables/credentials.json`. It ends with a real connection test —
-you only get "✓ works" when the endpoint actually answered. Re-run `--setup`
-anymtime to change providers or keys.
+you only get "✓ works" when the endpoint actually answered. It also records
+**this cartridge as your machine's default** (`~/.config/tables/config.json`,
+next to the key), so daily runs need no path at all — pass a different file's
+path explicitly to override it, or re-run `--setup` against another file to
+move the default. Re-run `--setup` anytime to change providers or keys.
 
 ### Setting up your API key and model (manual)
 

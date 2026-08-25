@@ -1,6 +1,6 @@
 # T38 Design: Portable Onboarding — `tables.py --setup`
 
-**Status:** ✅ **COMPLETE (2026-08-25)** — implemented on `t38-portable-setup`; T38 spec 14/14, full suite 164 passed / 4 skipped / 0 failures. Decisions D1–D7 locked 2026-08-24 (user OK). D2 per AGY `agy-1787668835-614956` + tech lead (no in-file sealing, no hand-rolled crypto). AGY review `agy-1787673375-748762` findings applied. Parked: S2b candidate-key copy under current profile id → v1.1 `--rekey`.
+**Status:** ✅ **COMPLETE (2026-08-25)** — T38 spec 16/16, full suite 166 passed / 4 skipped / 0 failures. Decisions D1–D7 locked 2026-08-24 (user OK). D2 per AGY `agy-1787668835-614956` + tech lead (no in-file sealing, no hand-rolled crypto). AGY review `agy-1787673375-748762` findings applied. Post-lock amendment §11 (machine default cartridge) per user 2026-08-25. Parked: S2b candidate-key copy under current profile id → v1.1 `--rekey`.
 **Depends on:** T36 ✅ · T37 ✅ · model tracking (`85a9580` — `llm_model` → `recommended_model` already travels in exports)
 
 ---
@@ -270,3 +270,28 @@ id matches no known profile) — parked as v1.1.
 - Whether the local-file backend should store per-profile entries keyed by the
   SAME profile ids as the in-file profiles (so a re-exported cartridge's
   profiles line up with the machine's stored keys) — leaning yes.
+
+## 11. Post-lock amendment — machine default cartridge (user OK, 2026-08-25)
+
+**Problem found in review:** the "flagless daily one-liner" still required the
+filename (`python3 tables.py my-agent.sqlite3 "q"`). Setup had already
+discovered and confirmed that exact file — making the user retype it every day
+undercut the ticket's point.
+
+**Decision (D8):** a successful `--setup` binds this machine to that cartridge:
+`~/.config/tables/config.json` → `{ "default_cartridge": "/abs/path" }` (next
+to the 0600 credentials; non-secret, 0644, atomic write). Daily resolution
+becomes: **positional path → machine default → refuse loudly** (a stale
+default names the fix — re-run `--setup` — and never re-guesses another file).
+
+- Machine-local by design, same category as the paired key: a per-machine
+  pointer that never travels in the file (a copied cartridge carries no one
+  else's paths). Does not contradict D4 — D4 governs agent config traveling
+  WITH the file; this is the inverse direction.
+- Explicit path always overrides; re-running `--setup` against another file
+  moves the default (last setup wins).
+- Key-skip still binds the default: skipping the key doesn't unbind the file.
+- Positional disambiguation makes `python3 tables.py "question"` real: an arg
+  is a path if it ends `.sqlite3` or names an existing file, else (with a
+default) it's a message. Bare `tables.py` = REPL on the default; bare word
+  with no default fails loud naming `--setup`.
