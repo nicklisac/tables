@@ -140,47 +140,258 @@ def format_flattened(messages):
     return out
 
 
+def format_openai(messages):
+    """Port of llm-provider.js formatOpenAi (the OpenAI-family framing).
+
+    assistant tool_calls and tool rows are kept as NATIVE messages — used when
+    the request also carries body.tools, so native-capable endpoints (llama.cpp,
+    Ollama, ...) emit well-formed native tool_calls instead of JSON-in-content.
+    """
+    out = []
+    for m in messages:
+        role = m.get("role")
+        msg = {"role": "tool" if role == "tool" else role, "content": m.get("content") or ""}
+        tool_calls = m.get("tool_calls")
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except Exception:
+                tool_calls = None
+        if role == "assistant" and tool_calls:
+            msg["tool_calls"] = tool_calls
+        if role == "tool" and m.get("tool_call_id"):
+            msg["tool_call_id"] = m["tool_call_id"]
+        out.append(msg)
+    return out
+
+
+def _strip_code_fences(text):
+    """Strip a leading/trailing markdown code fence (```json ... ```)."""
+    s = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    return re.sub(r"\s*```$", "", s)
+
+
+def _first_json_object(text):
+    """Return the first balanced top-level {...} substring, or None.
+
+    Local models often pad their protocol JSON with a preamble, a reasoning /
+    thinking block, or trailing commentary. Requiring the WHOLE string to be one
+    object (the old behavior) then fell through to 'raw text = final answer' and
+    tool calls were silently dropped. Scanning for the first balanced object —
+    respecting string literals so braces inside quotes don't miscount — recovers
+    the call in all those cases.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _normalize_tool_calls(tcs):
+    """Normalize an OpenAI-style tool_calls array to the protocol shape stored in
+    messages.tool_calls (arguments always a JSON string)."""
+    norm = []
+    for i, tc in enumerate(tcs or []):
+        fn = tc.get("function") or {}
+        args = fn.get("arguments")
+        if not isinstance(args, str):
+            args = json.dumps(args if args is not None else {})
+        norm.append({
+            "id": tc.get("id") or f"call_{i}",
+            "type": "function",
+            "function": {"name": fn.get("name") or tc.get("name") or "",
+                         "arguments": args},
+        })
+    return norm
+
+
+def _repair_json(text):
+    """Best-effort repair for truncated JSON from local models. If the string has
+    unclosed {/[ openers (outside string literals), append the missing closers in
+    reverse order and return that candidate; None when there is nothing to repair.
+    Only tried after standard parsing fails, so well-formed output is untouched."""
+    stack = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+    if not stack:
+        return None
+    repaired = text + ('"' if in_str else "")
+    for opener in reversed(stack):
+        repaired += "}" if opener == "{" else "]"
+    return repaired
+
+
+def _match_brace(s, start):
+    """Given s[start] == '{', return (balanced_substring, index_just_after_close)
+    via string-aware brace matching. If unbalanced (truncated), returns the rest
+    of the string and len(s)."""
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1], i + 1
+    return s[start:], len(s)
+
+
+def _extract_tool_calls_lenient(text):
+    """Last-resort recovery for a mangled tool_calls array where the OUTER wrapper
+    lost or misordered closers but the per-call "function": {...} objects are still
+    intact. For each function object, parse it (or regex out name + arguments) and
+    build a normalized call. Returns a list, or None if no calls found."""
+    idx = text.find('"tool_calls"')
+    region = text[idx:] if idx != -1 else ""
+    calls = []
+    pos = 0
+    while True:
+        fm = region.find('"function"', pos)
+        if fm == -1:
+            break
+        b = region.find("{", fm)
+        if b == -1:
+            break
+        obj, end = _match_brace(region, b)
+        name = args_str = None
+        try:
+            o = json.loads(obj)
+            name = o.get("name")
+            a = o.get("arguments")
+            args_str = a if isinstance(a, str) else (json.dumps(a) if a is not None else "{}")
+        except Exception:
+            nm = re.search(r'"name"\s*:\s*"([^"]*)"', obj)
+            am = obj.find('"arguments"')
+            name = nm.group(1) if nm else None
+            if am != -1:
+                k = obj.find(":", am) + 1
+                while k < len(obj) and obj[k] in " \t":
+                    k += 1
+                if k < len(obj) and obj[k] == "{":
+                    args_str, _ = _match_brace(obj, k)
+        if name:
+            calls.append({"id": f"call_{len(calls)}", "type": "function",
+                          "function": {"name": name, "arguments": args_str or "{}"}})
+        pos = end if end > b else fm + 10
+    return calls or None
+
+
 def parse_llm_content(content):
     """Robustly parse the model's JSON-in-content reply -> (text, tool_calls).
 
-    Mirrors ask_llm's fallback: try a direct parse, then strip markdown code
-    fences. If it is not our protocol object, treat the whole thing as plain
-    final text (no tool calls).
+    Tries, in order: the whole string, a fence-stripped version, a brace-repaired
+    version (local models drop trailing closers), and the first balanced {...}
+    object (models pad their JSON with preambles / thinking / trailing text). A
+    candidate only counts if it parses to our protocol object (carries "content"
+    or "tool_calls"); otherwise keep searching. If none does, treat the whole
+    thing as plain final text (no tool calls).
     """
     if not content:
         return "", None
     text = content.strip()
-    parsed = None
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        # Case-insensitive, matching the web engine's /i-flagged strip.
-        stripped = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-        stripped = re.sub(r"\s*```$", "", stripped)
+    for candidate in (text, _strip_code_fences(text), _repair_json(text),
+                      _first_json_object(text)):
+        if not candidate:
+            continue
         try:
-            parsed = json.loads(stripped)
+            parsed = json.loads(candidate)
         except Exception:
-            parsed = None
-    if isinstance(parsed, dict):
-        c = parsed.get("content", content)
-        c = c if isinstance(c, str) else ("" if c is None else str(c))
-        tcs = parsed.get("tool_calls")
-        if isinstance(tcs, list) and tcs:
-            norm = []
-            for i, tc in enumerate(tcs):
-                fn = tc.get("function") or {}
-                args = fn.get("arguments")
-                if not isinstance(args, str):
-                    args = json.dumps(args if args is not None else {})
-                norm.append({
-                    "id": tc.get("id") or f"call_{i}",
-                    "type": "function",
-                    "function": {"name": fn.get("name") or tc.get("name") or "",
-                                 "arguments": args},
-                })
-            return c, norm
-        return c, None
+            continue
+        # Only a dict carrying our protocol keys is a reply; a nested arguments
+        # object or stray JSON keeps us searching.
+        if isinstance(parsed, dict) and ("tool_calls" in parsed or "content" in parsed):
+            c = parsed.get("content", "")
+            c = c if isinstance(c, str) else ("" if c is None else str(c))
+            tcs = parsed.get("tool_calls")
+            if isinstance(tcs, list) and tcs:
+                return c, _normalize_tool_calls(tcs)
+            return c, None
+    # Final fallback: the outer wrapper is mangled beyond JSON repair, but the
+    # per-call function objects may still be intact — pull them out directly.
+    calls = _extract_tool_calls_lenient(text)
+    if calls:
+        return "", calls
+    # No candidate parsed as our protocol object -> plain final text.
     return text, None
+
+
+def _extract_reply(msg):
+    """Given a raw OpenAI-compatible response message, return (text, tool_calls).
+
+    Mirrors the web's ask_llm (harness.js): native message.tool_calls is the fast
+    path for the OpenAI family — use it directly when present. JSON-in-content is
+    only the fallback for models that don't emit native tool calls. Local models
+    sometimes emit BOTH and mangle the content string; preferring the well-formed
+    native field is what makes the web catch calls the old content-only parse
+    dropped.
+    """
+    content = msg.get("content") or ""
+    if isinstance(content, str):
+        content = content.strip()
+    native = msg.get("tool_calls")
+    if native:
+        # Prose comes from the protocol object if the content parses; a tool-
+        # call turn is otherwise prose-less.
+        text = ""
+        try:
+            obj = json.loads(content)
+            if isinstance(obj, dict) and isinstance(obj.get("content"), str):
+                text = obj["content"]
+        except Exception:
+            pass
+        return text, _normalize_tool_calls(native)
+    return parse_llm_content(content)
 
 
 # --- T38: provider registry (host-side subset of the web's llm-provider.js) ---
@@ -204,6 +415,15 @@ PROVIDERS = {
     "openai-official": {"label": "OpenAI (official)", "key_required": True,
                         "fixed_url": "https://api.openai.com/v1/chat/completions", "model_placeholder": "gpt-4o"},
 }
+
+
+def _provider_request_flags(provider_id):
+    """(flatten, json_object) per provider — mirrors llm-provider.js. Only gemini
+    flattens (its OpenAI-compat endpoint wants JSON-object mode, not native
+    tools); every other OpenAI-compatible provider sends native body.tools."""
+    if (provider_id or "").strip() == "gemini":
+        return True, True
+    return False, False
 
 
 def provider_requires_key(provider_id):
@@ -1009,10 +1229,13 @@ class Host:
                                                 "neither the context nor system_config.system_prompt "
                                                 "carries one. Re-export from a trusted Tables build."})
             system_prompt = build_system_prompt(tools, base_prompt)
-            api_messages = format_flattened([m for m in messages if m.get("role") != "system"])
+            flatten, json_object = _provider_request_flags(self.active_profile_provider())
+            ctx = [m for m in messages if m.get("role") != "system"]
+            api_messages = format_flattened(ctx) if flatten else format_openai(ctx)
 
-            content, prompt_tokens, completion_tokens = self._llm_request(system_prompt, api_messages)
-            text, tool_calls = parse_llm_content(content)
+            msg, prompt_tokens, completion_tokens = self._llm_request(
+                system_prompt, api_messages, tools=tools, flatten=flatten, json_object=json_object)
+            text, tool_calls = _extract_reply(msg)
             if not prompt_tokens and not completion_tokens and text:
                 completion_tokens = max(1, -(-len(text) // 4))  # ceil(len/4)
             return json.dumps({
@@ -1025,7 +1248,7 @@ class Host:
             self._turn_error = str(e)
             raise
 
-    def _llm_request(self, system_prompt, api_messages):
+    def _llm_request(self, system_prompt, api_messages, tools=None, flatten=False, json_object=False):
         if not self.llm_url:
             raise TurnError("no LLM endpoint configured (set --llm-url or TABLES_LLM_URL)")
         body = {
@@ -1033,12 +1256,16 @@ class Host:
             "messages": [{"role": "system", "content": system_prompt}, *api_messages],
             "stream": False,
         }
+        if tools and len(tools) and not flatten:
+            body["tools"] = tools
+        if json_object:
+            body["response_format"] = {"type": "json_object"}
         data, err = _post_chat(self.llm_url, body, self.api_key)
         if err:
             raise TurnError(err)
         msg = (data.get("choices") or [{}])[0].get("message") or {}
         usage = data.get("usage") or {}
-        return (msg.get("content") or "",
+        return (msg,
                 int(usage.get("prompt_tokens") or 0),
                 int(usage.get("completion_tokens") or 0))
 
