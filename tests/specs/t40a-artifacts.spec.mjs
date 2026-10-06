@@ -52,6 +52,7 @@ test.describe('T40a — artifacts and the style library', () => {
         stylesProtected: isProtectedTable('artifact_styles'),
         cardsProtected: isProtectedTable('dashboard_cards'),
         artifactsObjectProtected: isProtectedObject('artifacts'),
+        stylesObjectProtected: isProtectedObject('artifact_styles'),
       };
     });
     expect(boundary).toEqual({
@@ -59,6 +60,7 @@ test.describe('T40a — artifacts and the style library', () => {
       stylesProtected: false,
       cardsProtected: true,
       artifactsObjectProtected: false,
+      stylesObjectProtected: false,
     });
 
     // ...and the invariant boot asserts: capture triggers on both, none on cards.
@@ -83,24 +85,49 @@ test.describe('T40a — artifacts and the style library', () => {
     expect(complaints, complaints.join('\n')).toEqual([]);
   });
 
-  test('an artifact write is captured, so it is rewindable data', async ({ page }) => {
+  test('an artifact write is captured, and a rewind actually undoes it', async ({ page }) => {
     await bootPage(page);
 
-    const before = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
-    await page.evaluate(async () => {
+    // Artifacts are claimed to be rewindable data, so the proof is a rewind,
+    // not a row in turn_changesets — a captured row that nothing replays would
+    // satisfy the weaker assertion and still be worthless to a user.
+    const TURN = 950; // above any real turn id in a fresh brain
+    const session = await queryValue(page,
+      `SELECT value FROM session_context WHERE key = 'active_session_id'`);
+
+    await page.evaluate(async ([turn]) => {
       const { sqlite3, db } = window.__agent;
+      const { setCurrentTurnId } = await import('/src/schema.js');
+      await setCurrentTurnId(sqlite3, db, turn);
       for await (const stmt of sqlite3.statements(db,
         `INSERT INTO artifacts (name, sql, kind) VALUES ('Probe artifact', 'SELECT 1', 'cssv')`)) {
         await sqlite3.step(stmt);
       }
-    });
-    const after = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
-    expect(after).toBeGreaterThan(before);
+      for await (const stmt of sqlite3.statements(db,
+        `UPDATE artifacts SET name = 'Renamed in the same turn'`)) {
+        await sqlite3.step(stmt);
+      }
+    }, [TURN]);
 
-    const stamped = await queryAll(page, `
-      SELECT table_name, op FROM turn_changesets WHERE table_name = 'artifacts'`);
-    expect(stamped).toEqual([['artifacts', 'I']],
-      "op is the changeset alphabet: I / U / D");
+    expect(await queryAll(page, `SELECT table_name, op FROM turn_changesets WHERE table_name = 'artifacts'`))
+      .toEqual([['artifacts', 'I'], ['artifacts', 'U']], 'op is the changeset alphabet: I / U / D');
+    expect(await queryValue(page, `SELECT COUNT(*) FROM artifacts WHERE name = 'Renamed in the same turn'`)).toBe(1);
+
+    await page.evaluate(async ([turn, sessionId]) => {
+      const { sqlite3, db } = window.__agent;
+      const { rewindToBeforeTurn } = await import('/src/rewind.js');
+      await rewindToBeforeTurn(sqlite3, db, sessionId, turn);
+    }, [TURN, session]);
+
+    expect(await queryValue(page, `SELECT COUNT(*) FROM artifacts`)).toBe(0);
+    expect(await queryValue(page, `SELECT COUNT(*) FROM turn_changesets WHERE table_name = 'artifacts'`)).toBe(0);
+
+    // Still gone after a reload, and the style library survived the rewind too.
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await bootPage(page);
+    expect(await queryValue(page, `SELECT COUNT(*) FROM artifacts`)).toBe(0);
+    expect(await queryValue(page, `SELECT COUNT(*) FROM artifact_styles`))
+      .toBeGreaterThanOrEqual(STYLE_NAMES.length);
   });
 
   test('boot migrates dashboard_cards into artifacts exactly once, stamping no changesets', async ({ page }) => {
@@ -116,7 +143,10 @@ test.describe('T40a — artifacts and the style library', () => {
         DELETE FROM dashboard_cards;
         INSERT INTO dashboard_cards (title, sql, row, col) VALUES
           ('Regional revenue', 'SELECT region, revenue FROM sales', 0, 0),
-          ('   ',              'SELECT 1', 1, 1);
+          ('   ',              'SELECT 1', 1, 1),
+          ('No query',         '   ',     2, 2),
+          ('Duplicate name',   'SELECT 2', 0, 0),
+          ('Duplicate name',   'SELECT 3', 0, 0);
       `;
       for await (const stmt of sqlite3.statements(db, sql)) await sqlite3.step(stmt);
     });
@@ -125,9 +155,23 @@ test.describe('T40a — artifacts and the style library', () => {
     await page.reload({ waitUntil: 'domcontentloaded' });
     await bootPage(page);
 
-    const names = await queryAll(page, `SELECT name FROM artifacts ORDER BY name`);
-    expect(names.flat()).toEqual(['Regional revenue'],
-      'only the titled card converts; layout columns are discarded');
+    const names = await queryAll(page, `SELECT name, sql FROM artifacts ORDER BY name, sql`);
+    // Both same-titled cards convert: artifacts.name is not unique by design,
+    // and dropping one of them to enforce a name would silently lose something
+    // the user built. NOT EXISTS guards against re-converting, not against
+    // legitimate collisions.
+    expect(names).toEqual([
+      ['Duplicate name', 'SELECT 2'],
+      ['Duplicate name', 'SELECT 3'],
+      ['Regional revenue', 'SELECT region, revenue FROM sales'],
+    ], 'an untitled card and a card with no query are skipped; layout columns are discarded');
+
+    // The one-shot flag is an optimisation, not the safety mechanism: with it
+    // gone, NOT EXISTS must still keep the conversion from duplicating.
+    await queryAll(page, `DELETE FROM system_config WHERE key = 'artifacts_migrated_from_cards'`);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await bootPage(page);
+    expect(await queryValue(page, `SELECT COUNT(*) FROM artifacts`)).toBe(3);
 
     const changesAfter = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
     expect(changesAfter, 'boot must not invent changesets no turn performed').toBe(changesBefore);
@@ -154,8 +198,15 @@ test.describe('T40a — artifacts and the style library', () => {
       for await (const stmt of sqlite3.statements(db, sql)) await sqlite3.step(stmt);
     });
 
+    const changesBefore = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await bootPage(page);
+
+    // Re-seeding a deleted style is a BOOT write, so it must be as quiet as the
+    // card conversion: unsuppressed, the re-seed would stamp a changeset that
+    // the rewind ring then offers to undo.
+    const changesAfter = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
+    expect(changesAfter, 're-seeding a style must not invent a turn').toBe(changesBefore);
 
     const kept = await queryValue(page, `SELECT css FROM artifact_styles WHERE name = 'ledger'`);
     expect(kept).toContain('user hand');

@@ -2035,8 +2035,9 @@ export async function seedHouseStyles(sqlite3, db) {
  * capture every row anyway. The previous flag value is restored rather than
  * cleared, so this is safe to call while a rewind replay is suppressing.
  *
- * The card conversion is one-shot per database, recorded in system_config, so a
- * boot never re-converts. An imported pre-T40 cartridge carries the cards and
+ * The card conversion is one-shot per database, recorded in system_config, and
+ * independently guarded by NOT EXISTS on the artifact name — the flag is what
+ * makes it cheap to skip, not what makes it safe to run. An imported pre-T40 cartridge carries the cards and
  * not the flag, which is what makes it show artifacts instead of an empty
  * canvas. Layout columns are discarded on purpose: an artifact has no grid
  * position.
@@ -2046,8 +2047,8 @@ export async function migrateArtifactsTable(sqlite3, db) {
     `SELECT value FROM session_context WHERE key = 'suppress_capture'`);
   const prior = rows.length ? rows[0][0] : '0';
 
-  await setSuppressCapture(sqlite3, db, true);
   try {
+    await setSuppressCapture(sqlite3, db, true);
     await seedHouseStyles(sqlite3, db);
 
     const done = await queryAll(sqlite3, db,
@@ -2064,11 +2065,17 @@ export async function migrateArtifactsTable(sqlite3, db) {
 
       // A card with no title has no name to inherit, and an artifact is
       // addressed by name — skip it rather than mint an untitled one.
+      // NOT EXISTS on the name, so the conversion is idempotent on its own
+      // terms. The system_config flag below only makes it cheap to skip; a flag
+      // is not a correctness mechanism. Delete that row, or lose it to a rewind
+      // (which is precisely what this app lets people do), and a guard-less
+      // INSERT would duplicate every surviving card.
       await execParams(sqlite3, db, `
         INSERT INTO artifacts (name, sql, kind)
-        SELECT TRIM(title), sql, 'cssv' FROM dashboard_cards
-        WHERE sql IS NOT NULL AND TRIM(sql) != ''
-          AND title IS NOT NULL AND TRIM(title) != ''
+        SELECT TRIM(d.title), d.sql, 'cssv' FROM dashboard_cards d
+        WHERE d.sql IS NOT NULL AND TRIM(d.sql) != ''
+          AND d.title IS NOT NULL AND TRIM(d.title) != ''
+          AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.name = TRIM(d.title))
       `);
 
       const converted = (await countArtifacts()) - before;
