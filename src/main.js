@@ -28,6 +28,7 @@ import * as gridUi from './grid-ui.js';
 import * as gridEngine from './grid.js';
 import * as explorerEngine from './explorer.js';
 import * as explorerUi from './explorer-ui.js';
+import * as referenceIntegrity from './reference-integrity.js';
 import { initPaneResizers } from './panes.js';
 import { SqlAutocompleteController, globalSchemaIndex } from './sql-autocomplete.js';
 import {
@@ -689,6 +690,11 @@ async function bootAgent() {
     } catch (e) {
       console.warn('[main] T8 explorer init failed (non-fatal):', e);
     }
+
+    // T22: reference integrity — the extractor, the rewriter, the dry-run and
+    // the dependents-provider seam. Boot only publishes the handle; nothing
+    // in this module mutates until a DDL path calls into it.
+    window.__agent.referenceIntegrity = referenceIntegrity;
 
     // T16: Documents corpus pane (FTS5 full-text search)
     try {
