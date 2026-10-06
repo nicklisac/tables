@@ -27,3 +27,15 @@ _Avoid_: server/client (wrong connotation), source/target
 **Boot**:
 The engine taking over a Tables database at load: schema migrations, seed fills, and refresh of engine-owned surfaces.
 _Avoid_: init, startup (in boundary discussions — "at boot" is the term of art)
+
+**Artifact**:
+Something the user put together for themselves out of their own data — a saved question plus a note about how its answer should look. Data, not interface: it belongs to the database, is rewound with it, and travels in the cartridge.
+_Avoid_: Card (the retired grid-era *container*; an artifact is what would have gone inside it), widget, panel, report
+
+**House Style**:
+A named appearance for an artifact, written so it holds for any answer whatever columns that answer turns out to have.
+_Avoid_: template, theme, stock CSS, default styling
+
+**Style Library**:
+The set of house styles an artifact can wear, each carrying a description of when to use it, so the agent can choose one the way a person reads a menu.
+_Avoid_: style pack, presets, CSS store

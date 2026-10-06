@@ -101,6 +101,12 @@ graph TD
     T34 --> T39
     T35 --> T39
 
+    T11 --> T40[Ticket 40: Artifact Layer — CSSV artifacts replace the grid canvas]
+    T21 --> T40
+    T22 --> T40
+    T18 --> T40
+    T33 --> T40
+
     T4[Ticket 4: Live Event Streaming & Token Pipe - DONE]
     T5[Ticket 5: Native Vector Search sqlite-vec - DONE]
     T5 --> T20[Ticket 20: Vector Search App Layer]
@@ -130,7 +136,7 @@ graph TD
     classDef blocked fill:#21262d,stroke:#30363d,color:#8b949e;
 
     class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T16,T17,T21,T24,T25,T26,T261,T262,T263,T264,T265,T27,T28,T29,T33,T36,T37 done;
-    class T14,T15,T18,T19,T20,T22,T23,T30,T31,T32,T34,T35 frontier;
+    class T14,T15,T18,T19,T20,T22,T23,T30,T31,T32,T34,T35,T40 frontier;
 ```
 
 ---
@@ -382,7 +388,7 @@ graph TD
 
 ### Ticket 18: Self-Rendering Reactive Dashboards via SQL Views
 * **Label:** `wayfinder:prototype` (HITL)
-* **Status:** Open (Frontier)
+* **Status:** Open (Frontier) — **recommend closing as absorbed into [Ticket 40](#ticket-40-artifact-layer--cssv-rendered-artifacts-replace-the-grid-canvas)** (2026-10-06): artifacts are exactly this — live SQL-backed rendering over views — plus an appearance. `resolveCardTables` carries over unchanged. Awaiting user confirmation.
 * **Question:** How should the UI listen to agent-created SQL Views (`v_dashboard_*`) to render dynamic bar charts, line graphs, and metric widgets automatically?
 
 ---
@@ -419,7 +425,7 @@ graph TD
 
 ### Ticket 22: Reference Integrity for Dashboard Cards
 * **Label:** `wayfinder:prototype` (HITL)
-* **Status:** Open (Frontier) — unblocked by T21 completion
+* **Status:** Open (Frontier) — unblocked by T21 completion. **Recommend re-scoping from cards to artifacts and making it a blocker for [Ticket 40](#ticket-40-artifact-layer--cssv-rendered-artifacts-replace-the-grid-canvas)** (2026-10-06): the locked semantics carry over unchanged, and the dry-run backstop is what makes an artifact's stylesheet checkable against the columns its query actually returns. Awaiting user confirmation.
 * **Question:** How do rename / delete / alter of named objects (materialized tables, CSV-ingested tables, T18 views) keep referencing cards correct — given that a card's `sql` is an ad-hoc string with **no native dependency tracking** in SQLite?
 * **Semantics locked (2026-08-15, user-confirmed):** **Rename** → rewrite referencing cards' SQL (emulating SQLite's native view-rewrite under `ALTER TABLE … RENAME TO`, 3.25+) + report "updated N cards". **Delete** → extract references first → confirm popup lists the N cards that will be removed → cascade-delete cards + object. **Alter** → apply in a savepoint → **dry-run** each referencing card (read-only by construction, so it's safe to run) → alert on breakage, keep or ⟲.
 * **Design agenda:** (1) the shared `extractReferencedObjects(cardSql) → [names]` primitive (table/view identifiers in FROM/JOIN; traps: substring collisions — `users` inside `user_sessions` — string literals & comments, quoted identifiers, CTE aliases; reuse T11's `isReadOnlySql` comment/string stripping; the same primitive serves T21's write-path target check); (2) token-level identifier rewrite, not string replace; (3) the dry-run backstop — a false negative in the extractor degrades to "a card shows an error", never silent corruption; (4) scope: user data tables/views only — never protected tables (T21); (5) the "source missing" card UX — a card whose object was rewound/dropped renders a hint ("re-materialize or re-pin"), not a mystery error (T11's `runCardSql` already reports errors without throwing).
@@ -993,6 +999,51 @@ graph TD
   * **Config-in-cartridge × artifacts.** This ticket puts provider profiles **including the API key** into the DB; T40 makes artifacts *data* that travel in the cartridge — and artifacts are exactly what a user shows another person (a report, a status board). More shareable exports + credentials in the file is a worse combination than either decision alone. The map already notes the key-leak export test may need re-scoping; T40 raises that from "maybe" to **decide before the launcher does**.
   * **Dependency bookkeeping is stale.** T31 is still marked 🟡 IN PROGRESS on branch `t31-t32-providers`, but that branch exists neither locally nor on `origin` — it either merged without its status line moving, or the work is gone (cf. the lost T36 prototypes). T39's main blocker is unresolved until this is reconciled.
 * **Source:** 2026-09-27 architecture discussion (user): GUI-depth direction chosen over deeper-CLI; Open WebUI/Unsloth "run a command, get localhost" UX named as the target shape; folder-based brains, config-in-cartridge, live VFS write-through, and port 7481 all user-settled in discussion.
+
+### Ticket 40: Artifact Layer — CSSV-Rendered Artifacts Replace the Grid Canvas
+
+* **Label:** `wayfinder:prototype` (HITL)
+* **Status:** 🔵 Open (Frontier) — charted 2026-10-06 out of a user design discussion. Positions marked *user-locked* are settled; everything else is open.
+* **Question:** What *is* an artifact, and what does the right pane become once artifacts replace the 3×3 card canvas? Covers what an artifact stores, how its appearance is chosen and merged, how the grid era (T11/T12 cards, T18, T22) is retired or absorbed, and how existing brains migrate.
+* **Why now (user framing, 2026-10-06):** "Grid cards were a UI element. Artifacts are closer to whatever would have gone INTO that UI element. It is data. It is what the user put together for themselves — not UI code to configure the macro display of a section of the app."
+
+* **User-locked positions (2026-10-06 discussion):**
+  * **Artifacts are data, not UI state.** Therefore **not** in `INTERNAL_TABLES`: agent-writable through ordinary `execute_sql` DML, captured into `turn_changesets`, **rewindable** (T3), visible in the explorer. This deliberately **departs from the T11 precedent** for `dashboard_cards` ("UI state, not data state — no capture triggers, never rewound").
+  * **An artifact stores no data.** A pointer (one read-only `SELECT`) plus how to render it; rendering re-queries live. A few hundred bytes per artifact — the numbers exist once, in the user's tables.
+  * **No `builtin` flag, and the engine never overwrites a user's style.** Ship a default `tables` house style seeded **once** (`INSERT OR IGNORE` on the style name); no `UPDATE` of a style row the engine did not create in that boot. A release that adds styles adds only the missing names.
+  * **The style library is a table carrying a `description` of when to use each style** — the agent reads descriptions to choose, and the artifact stores a *reference* (~10 bytes) rather than a stylesheet. Custom CSS may sit on top of a referenced style.
+  * **Artifacts are a *kind*.** v1 ships one kind, a CSS-rendered table (`cssv`); a later kind writes data (a form). Name the table for the concept, not the first implementation.
+
+* **Rendering substrate:** CSSV (`@rhpaiva/cssv` 0.2.1, MIT, 2 files / ~1,030 lines, zero deps, no build step), vendored pinned as `vendor/cssv/`. Verified empirically 2026-10-06 (Node core + headless Chromium against the vendored element; re-commit the probes under `docs/prototypes/` when claimed):
+  * **No iframe** — two nested shadow roots + `contain: paint`; cells via `textContent` (0 `innerHTML`, 0 `eval`); `<script>` / `<img onerror>` in a cell renders as escaped text. Hostile file setting `html{background:lime}`, `body::after{position:fixed;inset:0}`, `*{color:lime}` left host background and colour unchanged, 0 fixed overlays outside the element.
+  * Renders from **text** via `element.update(text)` — no URL, no fetch. Matches "the data lives in SQLite".
+  * **Live re-render < 1 ms with existing row nodes reused** (no flicker). 5,000 rows carrying `--cssv-key` + `--cssv-format`: **135 ms**; 1,000 rows: 27 ms — linear, no reflow pathology.
+  * Numbers get sign classes + locale formatting free (`1200.5` → `1,200.50`); **72% fewer bytes than the equivalent HTML table** on a 20-row report, ≈ Markdown's size with real styling attached.
+  * **Style merge:** base rules in an `@layer` + artifact CSS unlayered ⇒ artifact wins on the same property (padding 4px → 20px, colour overridden). One base sheet applied unchanged to 1-, 2-, 3- and 4-column results.
+  * **Panel context crosses the shadow boundary only through inherited custom properties** — verified: identical stylesheet, `--cell-pad` 1px in one panel and 9px in another.
+
+* **Known risks (each verified, each bounded):**
+  * **The style block is unsanitized and is a network channel.** A hostile artifact fetches arbitrary URLs: remote `@import` **fired**, and `td::after{content:url()}`, `td{background:url()}`, `border-image`, `cursor`, `list-style-image` all fired. Two regexes stripping `@import` + `url(…)` ⇒ **zero remote requests, styling intact**. Sanitise-on-render is mandatory for anything not created in the current session (imported cartridges → T33/T37 trust boundary).
+  * **Silent style death on rename.** The CSS↔data link is a *string match on output column names*, re-evaluated every render. Verified: `ALTER TABLE sales RENAME COLUMN region TO territory` succeeds, SQLite rewrites the dependent view's stored text, the view's **output column name changes**, and `[data-col="region"]` silently matches nothing — no error anywhere in the stack. Renaming a column a view uses but does not project leaves output names alone. See T22 for the mitigation.
+  * **Key-column drift *is* reported** (column drift is not): `{section:"9.1", message:"No column is named \"status\", so rows get no data-key.", fatal:false}` on `el.errors` / the `cssv-error` event.
+  * **Unaliased expression columns** take the expression as their name (`ROUND(revenue-target,2)`) — "always alias" is a rule, not a preference.
+  * **Number sniff is strict** (`^-?(0|[1-9][0-9]*)(\.[0-9]+)?$`): `$-45.50`, `007`, `1,200`, `50%`, `1e3`, `+5`, `NaN` are all *text* and lose `.number` and their sign class (verified `007` → no class). SQL emits bare numbers; `--cssv-format` formats for display.
+  * **Delimiters: `,` and `;` only** (tab/pipe undetected). **Zero-row** results render a bare ~27 px header strip with no empty state — the pane must supply one.
+  * **Maturity:** v0.2.1; repo created 2026-10-02; 4 npm versions in 4 days; ~11 stars, 0 forks, 0 releases; single maintainer; spec "open for review — breaking changes are possible"; Chromium-only test suite, Safari untested. Mitigation: vendor a pinned copy plus the spec's conformance suite, update on our schedule. **CSP landmine:** without `style-src 'unsafe-inline'` all artifact styling dies silently (verified) — matters if the launcher (T39) or the hosted surface ever ships a CSP.
+
+* **Absorbs / supersedes (the cleanup the user signed up for):**
+  * **Keep** the engine half of `src/grid.js`: `isReadOnlySql`, `runCardSql` (its `{columns, values, truncated, ms, error}` is exactly the artifact renderer's input), `resolveCardTables` (view→base-table expansion, cycle-guarded — its own comment already names `v_dashboard_*` as the intended consumer), `affectedCards`. Dependency machinery, not UI.
+  * **Retire** the card/grid UI half: `src/grid-ui.js`, `dashboard_cards`, `v_grid_matrix` (+ its `SYSTEM_VIEWS` entry), `#canvas-pane` / `#dashboard-grid` / `#card-dialog` / `#rail-canvas` (Ctrl+J) in `index.html`, grid CSS in `src/styles.css`, `tests/specs/t26.5-grid.spec.mjs`, `tests/probes/t26.5-grid.mjs`, and the ROADMAP rows for grid pinning / reactive dashboard engine.
+  * **T18** (self-rendering reactive dashboards via `v_dashboard_*`) is subsumed — artifacts *are* that, plus an appearance. Recommend closing as absorbed into T40.
+  * **T22** (reference integrity for cards) **is the artifact lint, retargeted.** Its locked semantics — rename rewrites referencing SQL, delete confirms with a list, alter dry-runs, shared `extractReferencedObjects`, dry-run as the backstop, "source missing" UX — carry over unchanged. The artifact check is *easier* than the card case: a dry-run hands back the result's column names, so the `[data-col="…"]` / `data-key` names a stylesheet depends on can be checked against them. This honours T22's own note that static column analysis is out of reach — the dry-run is what makes it checkable. Recommend keeping T22 open, re-scoped from cards to artifacts, as a **blocker** for T40's write path.
+
+* **Migration (no users yet — smash through, but keep old brains bootable):** idempotent Boot migration in the house pattern, converting each `dashboard_cards` row into an `artifacts` row (`title` → `title`, `sql` → `sql`; layout columns discarded — an artifact has no grid position). Because artifacts are capture-captured *data* while the migration writes them at boot, the conversion must run under `setSuppressCascade` (`src/schema.js:1577`) so it stamps no changesets and cannot be rewound. Leave `dashboard_cards` in place, **inert** — still in `INTERNAL_TABLES`, no UI reads it, `sweepCaptureTriggers` keeps it trigger-free — for one release, then drop it in a follow-up. Old cartridges keep importing; this migration is what makes them show artifacts instead of an empty canvas.
+
+* **Open questions (fog):** (a) Does an artifact belong to the brain or to a session? T11 settled this for cards (global); worth revisiting now that it is rewindable data. (b) Names for the two style layers (house style vs the artifact's own delta), and whether `artifact_css` stays the right table name once kinds other than `cssv` exist. (c) Does the agent write free CSS, or compose against a documented vocabulary (custom properties + the four sign classes) so artifacts keep looking like Tables? The upstream skill file is ~3.3k tokens / 13.6 KB — material against the compaction budget; a distilled in-app subset is preferred. (d) Row cap for a full-pane artifact (cards used 100) and what happens to a SQL-computed `Total` row that falls outside it. (e) Guard needed for an artifact whose `SELECT` reads the `artifacts` table itself? (f) Should the rename check *refuse* the write or leave a badge until someone re-checks? (g) Is the CSS ever surfaced for human editing, and does the stored text stay diffable the way a cartridge README is? (h) The write-form kind is the first artifact kind that mutates — where do T17 approvals and the T37 trust layers attach?
+
+* **Depends on:** T22 (re-scoped: reference integrity / dry-run lint) · T21 (protected-tables boundary — artifacts are deliberately *not* protected, which changes what `assertProtectedTablesInvariant` expects) · T3/T27 (rewind + capture semantics now apply to artifacts) · T10/T33 (artifacts travel in cartridges; the four-class split must say which class an artifact is). Independent of T39.
+
+* **Source:** 2026-10-06 design discussion (user) + empirical probes of `@rhpaiva/cssv@0.2.1` (Node core and headless Chromium against the vendored element) + AGY review of the proposal. Glossary terms added to `CONTEXT.md` the same day: **Artifact**, **House Style**, **Style Library**.
 
 ---
 
