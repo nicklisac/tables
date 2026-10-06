@@ -591,6 +591,59 @@ WHERE m.session_id = a.session_id
  END;
 
  -- =====================================================================
+ -- 4i2. Artifacts + Style Library (T40a: the artifact layer)
+ --
+ -- An artifact is one read-only SELECT plus an appearance: a pointer and a
+ -- look, never the data. Rendering re-queries live, so the numbers exist once,
+ -- in the user's tables.
+ --
+ -- DEPARTURE FROM T11, deliberate: dashboard_cards above is UI state and lives
+ -- in INTERNAL_TABLES. Artifacts are DATA. They are therefore NOT protected:
+ -- capture triggers attach at boot (sweepCaptureTriggers), the agent may write
+ -- them with ordinary execute_sql DML, a T3 rewind reverts them, they show in
+ -- the explorer, and they travel in cartridges. Consequence: assertProtected-
+ -- TablesInvariant demands cap_artifacts_ins/upd/del, so these tables and the
+ -- boot sweep ship in the same release.
+ --
+ -- 'style' is a reference into artifact_styles (~10 bytes), not a copy of a
+ -- stylesheet; 'css' is the artifact's own layer on top, stored verbatim so it
+ -- stays diffable. 'kind' is the artifact kind — v1 ships one, 'cssv'; a later
+ -- kind writes data. 'id' is INTEGER PRIMARY KEY (a rowid alias) and the table
+ -- is deliberately not WITHOUT ROWID: rewind.js reinserts captured rows by
+ -- rowid, and capture triggers log NEW.rowid / OLD.rowid.
+ -- =====================================================================
+ CREATE TABLE IF NOT EXISTS artifacts (
+     id         INTEGER PRIMARY KEY,
+     name       TEXT NOT NULL,
+     sql        TEXT NOT NULL,
+     kind       TEXT NOT NULL DEFAULT 'cssv',
+     style      TEXT,
+     css        TEXT,
+     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+ );
+
+ -- The Style Library: the menu the agent reads. Each row is a named House
+ -- Style plus a description of when to use it, so picking one is reading a
+ -- menu rather than guessing at a name. Data too, for the same reason —
+ -- "no builtin flag, the engine never overwrites a user's style" only means
+ -- something if a style can be written. The engine seeds missing names once
+ -- (seedHouseStyles, INSERT OR IGNORE) and never UPDATEs a row it did not
+ -- create in that boot, so a release that adds styles adds only the names.
+ --
+ -- A House Style is written to hold for any answer whatever columns that
+ -- answer turns out to have, which is why none of them selects on
+ -- [data-col="…"]: a house style whose selector matches nothing is the design
+ -- working, not breakage. Column-keyed styling belongs in an artifact's css.
+ -- =====================================================================
+ CREATE TABLE IF NOT EXISTS artifact_styles (
+     name        TEXT PRIMARY KEY,
+     description TEXT NOT NULL,
+     css         TEXT NOT NULL,
+     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+ );
+
+ -- =====================================================================
  -- 4h. SQL-native subsystem views (T26.4)
 --
 -- The "push everything into SQLite" views: schema introspection,
@@ -1855,5 +1908,178 @@ export async function migrateDashboardCardsTable(sqlite3, db) {
     }
   } catch (e) {
     console.warn('[schema] migrateDashboardCardsTable failed (non-fatal):', e.message);
+  }
+}
+
+/* ── T40a: the Style Library seed ─────────────────────────────────────── */
+
+/**
+ * The House Styles shipped with the engine. Kept in JS rather than inlined in
+ * SCHEMA_SQL for the same reason SYSTEM_PROMPT is: long text is easier to read
+ * and diff here, and it reaches the database as a bound parameter instead of
+ * surviving a template-literal parse (see the T16 lesson on JSON-in-a-template-
+ * literal escaping).
+ *
+ * Two rules every sheet here obeys, because a House Style is worn by artifacts
+ * whose columns nobody knows yet:
+ *
+ *  1. Never select on [data-col="…"]. That is a column reference, and an
+ *     artifact's own `css` is where column-keyed styling belongs. CONTEXT.md
+ *     defines a House Style as one that "holds for any answer whatever columns
+ *     that answer turns out to have".
+ *  2. Say what it does to numbers. Sign classes and the locale decimal
+ *     separator are free, but grouping and fixed decimals are NOT — they are
+ *     opt-in per CSSV (SPEC 9.2 "Default: None", 10.2 "uses no grouping"),
+ *     verified by docs/prototypes/ticket-40-cssv-probe.mjs. A style that wants
+ *     thousands separators has to declare --cssv-format, and the description
+ *     has to say so, or the agent picks one expecting currency handling and
+ *     gets raw digits.
+ *
+ * Each sheet reads --cell-pad with a fallback, which is the only way panel
+ * context crosses the two shadow roots (probe check 9).
+ */
+export const HOUSE_STYLES = [
+  {
+    name: 'plain',
+    description:
+      'Default. A tidy readable table with no opinion about the content: ' +
+      'headers dimmed, numbers right-aligned with tabular figures, row hover. ' +
+      'Numbers are shown exactly as the query returns them — no thousands ' +
+      'separators, no forced decimals. Use when nothing else fits.',
+    css: `@layer house {
+  table { font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; border-collapse: collapse; width: 100%; }
+  th, td { padding: var(--cell-pad, 6px) 10px; text-align: left; border-bottom: 1px solid color-mix(in srgb, currentColor 14%, transparent); }
+  th { font-weight: 600; opacity: .7; }
+  td.number, th.number { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr:hover td { background: color-mix(in srgb, currentColor 5%, transparent); }
+}`,
+  },
+  {
+    name: 'report',
+    description:
+      'For a result meant to be read as a report: zebra striping, a rule under ' +
+      'the header, and numbers grouped with thousands separators and up to two ' +
+      'decimals (1200 shows as 1,200 and 1200.5 as 1,200.5). Good default for ' +
+      'mixed counts and amounts. Do not use when exact stored decimals must ' +
+      'survive unchanged, or for identifiers that merely look numeric.',
+    css: `@layer house {
+  table { font: 13px/1.55 ui-sans-serif, system-ui, sans-serif; border-collapse: collapse; width: 100%; }
+  td { --cssv-format: "useGrouping: true, maximumFractionDigits: 2"; }
+  th, td { padding: var(--cell-pad, 7px) 12px; text-align: left; }
+  thead th { border-bottom: 2px solid currentColor; font-weight: 650; opacity: .85; }
+  tbody tr:nth-child(even) td { background: color-mix(in srgb, currentColor 4%, transparent); }
+  td.number, th.number { text-align: right; font-variant-numeric: tabular-nums; }
+}`,
+  },
+  {
+    name: 'ledger',
+    description:
+      'For money. Every number is forced to two decimals with thousands ' +
+      'separators (1200 shows as 1,200.00), negatives go red and parenthesised ' +
+      'by colour rather than sign, and the last row is treated as a total: ' +
+      'bolder with a rule above it. Wrong for counts, percentages, ids or ' +
+      'year columns, which it will pad to two decimals.',
+    css: `@layer house {
+  table { font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; border-collapse: collapse; width: 100%; }
+  td { --cssv-format: "useGrouping: true, minimumFractionDigits: 2, maximumFractionDigits: 2"; }
+  th, td { padding: var(--cell-pad, 5px) 12px; text-align: left; }
+  td.number, th.number { text-align: right; font-variant-numeric: tabular-nums; }
+  td.negative { color: #b3261e; }
+  td.positive { color: #146c43; }
+  tbody tr:last-child td { font-weight: 650; border-top: 2px solid currentColor; }
+}`,
+  },
+  {
+    name: 'board',
+    description:
+      'A departures-board look for a status or monitoring display read from a ' +
+      'distance or on a wall: large type, dimmed uppercase headers, monospace ' +
+      'figures, numbers grouped without decimals (1200 shows as 1,200), and ' +
+      'sign colour on numbers so a negative row shouts. Not for dense analysis ' +
+      'or long text columns.',
+    css: `@layer house {
+  table { font: 20px/1.35 ui-sans-serif, system-ui, sans-serif; border-collapse: collapse; width: 100%; }
+  td { --cssv-format: "useGrouping: true, maximumFractionDigits: 0"; }
+  th, td { padding: var(--cell-pad, 10px) 16px; text-align: left; border-bottom: 1px solid color-mix(in srgb, currentColor 18%, transparent); }
+  thead th { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; opacity: .55; }
+  td.number, th.number { text-align: right; font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  td.negative { color: #b3261e; }
+  td.positive { color: #146c43; }
+}`,
+  },
+];
+
+/**
+ * Seed the House Styles. INSERT OR IGNORE on the name, and nothing else: a
+ * release that adds styles adds only the missing names, and a style the user
+ * edited is never overwritten, because the engine did not create that row in
+ * this boot.
+ */
+export async function seedHouseStyles(sqlite3, db) {
+  for (const style of HOUSE_STYLES) {
+    await execParams(sqlite3, db,
+      `INSERT OR IGNORE INTO artifact_styles (name, description, css) VALUES (?, ?, ?)`,
+      [style.name, style.description, style.css]);
+  }
+}
+
+/**
+ * T40a boot migration: seed the Style Library, and convert the grid era's
+ * `dashboard_cards` rows into artifacts.
+ *
+ * Idempotent, and quiet about it. Both writes land on capture-captured tables,
+ * so they run with capture suppressed: the alternative is boot inventing
+ * changesets that no turn performed, which the rewind ring would then offer to
+ * undo. That is `suppress_capture` (schema.js capture guard), NOT
+ * `suppress_cascade` — the latter only gates the agent_think cascade and would
+ * capture every row anyway. The previous flag value is restored rather than
+ * cleared, so this is safe to call while a rewind replay is suppressing.
+ *
+ * The card conversion is one-shot per database, recorded in system_config, so a
+ * boot never re-converts. An imported pre-T40 cartridge carries the cards and
+ * not the flag, which is what makes it show artifacts instead of an empty
+ * canvas. Layout columns are discarded on purpose: an artifact has no grid
+ * position.
+ */
+export async function migrateArtifactsTable(sqlite3, db) {
+  const rows = await queryAll(sqlite3, db,
+    `SELECT value FROM session_context WHERE key = 'suppress_capture'`);
+  const prior = rows.length ? rows[0][0] : '0';
+
+  await setSuppressCapture(sqlite3, db, true);
+  try {
+    await seedHouseStyles(sqlite3, db);
+
+    const done = await queryAll(sqlite3, db,
+      `SELECT value FROM system_config WHERE key = 'artifacts_migrated_from_cards'`);
+    if (done.length && done[0][0] === '1') return;
+
+    const cards = await queryAll(sqlite3, db,
+      `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'dashboard_cards'`);
+    if (cards.length && cards[0][0] > 0) {
+      // execParams returns nothing, so the count is measured, not assumed.
+      const countArtifacts = async () =>
+        Number((await queryAll(sqlite3, db, `SELECT COUNT(*) FROM artifacts`))[0]?.[0] ?? 0);
+      const before = await countArtifacts();
+
+      // A card with no title has no name to inherit, and an artifact is
+      // addressed by name — skip it rather than mint an untitled one.
+      await execParams(sqlite3, db, `
+        INSERT INTO artifacts (name, sql, kind)
+        SELECT TRIM(title), sql, 'cssv' FROM dashboard_cards
+        WHERE sql IS NOT NULL AND TRIM(sql) != ''
+          AND title IS NOT NULL AND TRIM(title) != ''
+      `);
+
+      const converted = (await countArtifacts()) - before;
+      // Silent when there is nothing to report: this runs on every boot that
+      // predates the flag, and a line about converting nothing is noise.
+      if (converted > 0) {
+        console.log(`[schema] T40a: converted ${converted} dashboard_cards row(s) into artifacts`);
+      }
+    }
+    await upsertSystemConfig(sqlite3, db, 'artifacts_migrated_from_cards', '1');
+  } finally {
+    await setSuppressCapture(sqlite3, db, prior === '1');
   }
 }

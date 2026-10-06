@@ -1,0 +1,192 @@
+/**
+ * Ticket 40a — the artifact layer's data half.
+ *
+ * What is actually being asserted, and why each one is here:
+ *
+ *  - Artifacts are DATA, not UI state. That is the whole departure from T11, so
+ *    it is tested as a boundary (not protected, capture triggers attached) and
+ *    behaviourally (a write lands in turn_changesets, i.e. it is rewindable).
+ *  - The boot migration must not stamp changesets. Boot inventing changesets
+ *    that no turn performed is the failure mode `setSuppressCapture` exists to
+ *    prevent — and the map originally prescribed the wrong flag for it.
+ *  - Seeding must be additive. A release that adds styles adds only the missing
+ *    names; a style the user edited is never overwritten.
+ *  - Idempotent boot: three reloads, no duplicated artifacts, no drift.
+ */
+import { test, expect } from '@playwright/test';
+import { bootPage, queryAll, queryValue } from '../helpers.mjs';
+
+const STYLE_NAMES = ['plain', 'report', 'ledger', 'board'];
+
+test.describe('T40a — artifacts and the style library', () => {
+  test('fresh boot: tables exist, styles seeded, artifacts are unprotected data', async ({ page }) => {
+    // Boot reports invariant failures through console.warn; collect them so a
+    // silent regression on the new tables cannot pass the SQL assertions above.
+    const logs = [];
+    page.on('console', (m) => logs.push(`${m.type()}: ${m.text()}`));
+    await bootPage(page);
+
+    const tables = await queryAll(page,
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('artifacts','artifact_styles') ORDER BY name`);
+    expect(tables.flat()).toEqual(['artifact_styles', 'artifacts']);
+
+    const seeded = await queryAll(page, `SELECT name FROM artifact_styles ORDER BY name`);
+    expect(seeded.flat().sort()).toEqual([...STYLE_NAMES].sort());
+
+    // Every seed carries a description — the Style Library is a menu the agent
+    // reads, and a style with no description is a style it cannot choose.
+    const undescribed = await queryValue(page,
+      `SELECT COUNT(*) FROM artifact_styles WHERE TRIM(COALESCE(description,'')) = ''`);
+    expect(undescribed).toBe(0);
+
+    // House styles never select on a column name: they must hold for any answer.
+    const columnBound = await queryAll(page,
+      `SELECT name FROM artifact_styles WHERE css LIKE '%data-col%'`);
+    expect(columnBound, 'a House Style must not bind to a column name').toEqual([]);
+
+    // The boundary itself: artifacts are outside the protected set, cards are not.
+    const boundary = await page.evaluate(async () => {
+      const { isProtectedTable, isProtectedObject } = await import('/src/schema.js');
+      return {
+        artifactsProtected: isProtectedTable('artifacts'),
+        stylesProtected: isProtectedTable('artifact_styles'),
+        cardsProtected: isProtectedTable('dashboard_cards'),
+        artifactsObjectProtected: isProtectedObject('artifacts'),
+      };
+    });
+    expect(boundary).toEqual({
+      artifactsProtected: false,
+      stylesProtected: false,
+      cardsProtected: true,
+      artifactsObjectProtected: false,
+    });
+
+    // ...and the invariant boot asserts: capture triggers on both, none on cards.
+    const triggers = await queryAll(page, `
+      SELECT tbl_name || '.' || name FROM sqlite_master
+      WHERE type = 'trigger' AND name LIKE 'cap_%'
+        AND tbl_name IN ('artifacts','artifact_styles','dashboard_cards')
+      ORDER BY 1`);
+    expect(triggers.flat()).toEqual([
+      'artifact_styles.cap_artifact_styles_del',
+      'artifact_styles.cap_artifact_styles_ins',
+      'artifact_styles.cap_artifact_styles_upd',
+      'artifacts.cap_artifacts_del',
+      'artifacts.cap_artifacts_ins',
+      'artifacts.cap_artifacts_upd',
+    ]);
+
+    // Boot must not have complained about the new tables.
+    const complaints = logs
+      .filter((l) => /^(warn|error):/.test(l))
+      .filter((l) => /invariant violation|artifact/i.test(l));
+    expect(complaints, complaints.join('\n')).toEqual([]);
+  });
+
+  test('an artifact write is captured, so it is rewindable data', async ({ page }) => {
+    await bootPage(page);
+
+    const before = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
+    await page.evaluate(async () => {
+      const { sqlite3, db } = window.__agent;
+      for await (const stmt of sqlite3.statements(db,
+        `INSERT INTO artifacts (name, sql, kind) VALUES ('Probe artifact', 'SELECT 1', 'cssv')`)) {
+        await sqlite3.step(stmt);
+      }
+    });
+    const after = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
+    expect(after).toBeGreaterThan(before);
+
+    const stamped = await queryAll(page, `
+      SELECT table_name, op FROM turn_changesets WHERE table_name = 'artifacts'`);
+    expect(stamped).toEqual([['artifacts', 'I']],
+      "op is the changeset alphabet: I / U / D");
+  });
+
+  test('boot migrates dashboard_cards into artifacts exactly once, stamping no changesets', async ({ page }) => {
+    await bootPage(page);
+
+    // Stage a pre-T40 database: cards present, artifacts absent, no flag.
+    await page.evaluate(async () => {
+      const { sqlite3, db } = window.__agent;
+      const sql = `
+        DELETE FROM artifacts;
+        DELETE FROM turn_changesets;
+        DELETE FROM system_config WHERE key = 'artifacts_migrated_from_cards';
+        DELETE FROM dashboard_cards;
+        INSERT INTO dashboard_cards (title, sql, row, col) VALUES
+          ('Regional revenue', 'SELECT region, revenue FROM sales', 0, 0),
+          ('   ',              'SELECT 1', 1, 1);
+      `;
+      for await (const stmt of sqlite3.statements(db, sql)) await sqlite3.step(stmt);
+    });
+
+    const changesBefore = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await bootPage(page);
+
+    const names = await queryAll(page, `SELECT name FROM artifacts ORDER BY name`);
+    expect(names.flat()).toEqual(['Regional revenue'],
+      'only the titled card converts; layout columns are discarded');
+
+    const changesAfter = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
+    expect(changesAfter, 'boot must not invent changesets no turn performed').toBe(changesBefore);
+
+    const ddlRows = await queryValue(page, `SELECT COUNT(*) FROM turn_ddl_log`);
+    expect(ddlRows).toBe(0);
+
+    // A third boot must not re-convert.
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await bootPage(page);
+    const stillOnce = await queryValue(page, `SELECT COUNT(*) FROM artifacts WHERE name = 'Regional revenue'`);
+    expect(stillOnce).toBe(1);
+  });
+
+  test('style seeding is additive and never overwrites a style the user edited', async ({ page }) => {
+    await bootPage(page);
+
+    await page.evaluate(async () => {
+      const { sqlite3, db } = window.__agent;
+      const sql = `
+        UPDATE artifact_styles SET css = '/* user hand */ table { color: rebeccapurple }' WHERE name = 'ledger';
+        DELETE FROM artifact_styles WHERE name = 'board';
+      `;
+      for await (const stmt of sqlite3.statements(db, sql)) await sqlite3.step(stmt);
+    });
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await bootPage(page);
+
+    const kept = await queryValue(page, `SELECT css FROM artifact_styles WHERE name = 'ledger'`);
+    expect(kept).toContain('user hand');
+
+    const names = await queryAll(page, `SELECT name FROM artifact_styles ORDER BY name`);
+    expect(names.flat().sort()).toEqual([...STYLE_NAMES].sort(),
+      'a deleted style is re-seeded; an edited one is left alone');
+  });
+
+  test('artifacts survive a reload and stay visible as user data', async ({ page }) => {
+    await bootPage(page);
+
+    await page.evaluate(async () => {
+      const { sqlite3, db } = window.__agent;
+      for await (const stmt of sqlite3.statements(db,
+        `INSERT INTO artifacts (name, sql, kind, style, css)
+         VALUES ('Durable', 'SELECT 1 AS one', 'cssv', 'report', 'td { padding: 1px }')`)) {
+        await sqlite3.step(stmt);
+      }
+    });
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await bootPage(page);
+
+    const row = await queryAll(page,
+      `SELECT name, sql, kind, style, css FROM artifacts WHERE name = 'Durable'`);
+    expect(row).toEqual([['Durable', 'SELECT 1 AS one', 'cssv', 'report', 'td { padding: 1px }']]);
+
+    // The explorer's catalog treats it as a user table, not a system object.
+    const catalog = await queryAll(page,
+      `SELECT table_name FROM v_schema_catalog WHERE table_name IN ('artifacts','artifact_styles')`);
+    expect(catalog.flat().sort()).toEqual(['artifact_styles', 'artifacts']);
+  });
+});
