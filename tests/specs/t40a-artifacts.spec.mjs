@@ -190,3 +190,118 @@ test.describe('T40a — artifacts and the style library', () => {
     expect(catalog.flat().sort()).toEqual(['artifact_styles', 'artifacts']);
   });
 });
+
+test.describe('T40a — artifact data access and reactivity', () => {
+  /** Run a body in the page against src/artifacts.js. */
+  const inArtifacts = async (page, fnBody, arg = null) => page.evaluate(
+    async ([src, body, extra]) => {
+      const mod = await import(`${src}?t=${Date.now()}`);
+      // `arg` is the live handle plus anything the test wants in scope, so a
+      // body can just say arg.sqlite3 / arg.db / arg.id.
+      const ctx = { ...window.__agent, ...(extra || {}) };
+      // eslint-disable-next-line no-new-func
+      return new Function('mod', 'arg', `return (async () => { ${body} })()`)(mod, ctx);
+    },
+    ['/src/artifacts.js', fnBody, arg],
+  );
+
+  test('create, patch and delete are ordinary data writes', async ({ page }) => {
+    await bootPage(page);
+
+    const created = await inArtifacts(page, `
+      const a = await mod.createArtifact(arg.sqlite3, arg.db, { name: 'Counts', sql: 'SELECT 1 AS n' });
+      const patched = await mod.updateArtifact(arg.sqlite3, arg.db, a.id, { css: 'td { color: red }' });
+      return { created: patched, list: await mod.listArtifacts(arg.sqlite3, arg.db) };
+    `, null);
+
+    expect(created.created.name).toBe('Counts');
+    expect(created.created.kind).toBe('cssv');
+    expect(created.created.style).toBe('plain');
+    expect(created.created.css).toBe('td { color: red }');
+    // Patching css must not have blanked the SELECT.
+    expect(created.created.sql).toBe('SELECT 1 AS n');
+    expect(created.list.map((a) => a.id)).toEqual([created.created.id]);
+
+    const changesBefore = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
+    await inArtifacts(page, `await mod.deleteArtifact(arg.sqlite3, arg.db, arg.id);`, { id: created.created.id });
+    const gone = await queryValue(page, `SELECT COUNT(*) FROM artifacts WHERE id = ?`, created.created.id);
+    expect(gone).toBe(0);
+    const changesAfter = await queryValue(page, `SELECT COUNT(*) FROM turn_changesets`);
+    expect(changesAfter, 'a user write IS captured — only boot writes are not').toBeGreaterThan(changesBefore);
+  });
+
+  test('style resolution: by reference, defaulted, and honest when missing', async ({ page }) => {
+    await bootPage(page);
+
+    const named = await inArtifacts(page, `
+      return mod.resolveArtifactStyle(arg.sqlite3, arg.db, { style: 'ledger', css: 'td { padding: 1px }' });`);
+    expect(named.houseCss).toContain('--cssv-format');
+    expect(named.missingStyle).toBeNull();
+
+    const defaulted = await inArtifacts(page, `
+      return mod.resolveArtifactStyle(arg.sqlite3, arg.db, { style: null, css: '' });`);
+    expect(defaulted.styleName).toBe('plain');
+    expect(defaulted.houseCss).toContain('table');
+
+    // A style that a rewind or a DELETE removed is a routine state, not an error.
+    const missing = await inArtifacts(page, `
+      return mod.resolveArtifactStyle(arg.sqlite3, arg.db, { style: 'deleted-yesterday', css: '' });`);
+    expect(missing.houseCss).toBe('');
+    expect(missing.missingStyle).toBe('deleted-yesterday');
+
+    const styles = await inArtifacts(page, `return mod.listStyles(arg.sqlite3, arg.db);`);
+    expect(styles.map((s) => s.name)).toEqual([...STYLE_NAMES].sort());
+    expect(styles.every((s) => s.description.length > 20)).toBe(true);
+  });
+
+  test('a data change re-runs exactly the artifacts that depend on it', async ({ page }) => {
+    await bootPage(page);
+
+    const out = await inArtifacts(page, `
+      const { sqlite3, db } = arg;
+      const { execParams } = await import('/src/utils.js');
+      await execParams(sqlite3, db, 'CREATE TABLE IF NOT EXISTS sales (region TEXT, revenue REAL)');
+      await execParams(sqlite3, db, "INSERT INTO sales VALUES ('EMEA', 10), ('APAC', 20)");
+      await execParams(sqlite3, db, 'CREATE VIEW IF NOT EXISTS v_sales AS SELECT region, revenue FROM sales');
+
+      await mod.createArtifact(sqlite3, db, { name: 'On table', sql: 'SELECT region, revenue FROM sales' });
+      await mod.createArtifact(sqlite3, db, { name: 'On view',  sql: 'SELECT region, revenue FROM v_sales' });
+      await mod.createArtifact(sqlite3, db, { name: 'Unrelated', sql: 'SELECT 1 AS one' });
+
+      const artifacts = await mod.listArtifacts(sqlite3, db);
+      const byTable = (await mod.affectedArtifacts(sqlite3, db, artifacts, ['sales'])).map((a) => a.name).sort();
+      const deps = {};
+      for (const a of artifacts) deps[a.name] = [...(await mod.artifactDependencies(sqlite3, db, a))].sort();
+      const run = await mod.runArtifactSql(sqlite3, db, artifacts.find((a) => a.name === 'On table'));
+      return { byTable, deps, run };
+    `, null);
+
+    // The T18 claim: an artifact on a view is re-run when the BASE table moves.
+    expect(out.byTable).toEqual(['On table', 'On view']);
+    expect(out.deps['On view']).toEqual(['sales']);
+    expect(out.deps['Unrelated']).toEqual([]);
+    expect(out.run.columns).toEqual(['region', 'revenue']);
+    expect(out.run.values).toEqual([['EMEA', 10], ['APAC', 20]]);
+    expect(out.run.error).toBeNull();
+  });
+
+  test('the row ceiling reports rather than drops', async ({ page }) => {
+    await bootPage(page);
+
+    const out = await inArtifacts(page, `
+      const { sqlite3, db } = arg;
+      const { execParams } = await import('/src/utils.js');
+      await execParams(sqlite3, db, 'CREATE TABLE IF NOT EXISTS ten (n INTEGER)');
+      await execParams(sqlite3, db, 'DELETE FROM ten');
+      await execParams(sqlite3, db,
+        'INSERT INTO ten (n) WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 10) SELECT i FROM s');
+      const a = { sql: 'SELECT n FROM ten ORDER BY n' };
+      const capped = await mod.runArtifactSql(sqlite3, db, a, { rowCap: 4 });
+      const full = await mod.runArtifactSql(sqlite3, db, a, { rowCap: 5000 });
+      return { capped: capped.values.length, cappedFlag: capped.truncated,
+               full: full.values.length, fullFlag: full.truncated };
+    `, null);
+
+    expect(out).toEqual({ capped: 4, cappedFlag: true, full: 10, fullFlag: false });
+  });
+});

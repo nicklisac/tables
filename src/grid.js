@@ -355,9 +355,11 @@ export async function removeCard(sqlite3, db, id) {
  * on success, or
  *   { columns: [], values: [], truncated: false, ms, error: 'message' }
  * on failure (SQL errors are reported, not thrown — a card shows its error).
- * Rows are capped at CARD_ROW_CAP.
+ * Rows are capped at CARD_ROW_CAP unless a caller passes its own `rowCap`
+ * (an artifact fills a whole pane and is measured differently — see
+ * src/artifact-render.js ARTIFACT_ROW_CEILING).
  */
-export async function runCardSql(sqlite3, db, sql) {
+export async function runCardSql(sqlite3, db, sql, rowCap = CARD_ROW_CAP) {
   const t0 = performance.now();
   try {
     const columns = [];
@@ -369,7 +371,7 @@ export async function runCardSql(sqlite3, db, sql) {
       columns.push(...cols);
       while (await sqlite3.step(stmt) === SQLITE_ROW) {
         values.push(sqlite3.row(stmt));
-        if (values.length >= CARD_ROW_CAP) { truncated = true; break; }
+        if (values.length >= rowCap) { truncated = true; break; }
       }
     }
     return { columns, values, truncated, ms: Math.round(performance.now() - t0), error: null };
