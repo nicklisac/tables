@@ -35,6 +35,8 @@ import {
 import {
   rewindToBeforeScratchpadTurn, getScratchpadChangesetSummary,
 } from './rewind.js';
+import { openArtifactGate, closeArtifactGate } from './artifact-integrity.js';
+import { classifyDdl } from './reference-integrity.js';
 
 const SCRATCH_ROW_CAP = 200; // rows kept per result set (bounds LLM context)
 export { SCRATCH_ROW_CAP };
@@ -135,17 +137,22 @@ export function classifyStatement(sql) {
     if (m) { ddlType = 'create'; target = m[1].toLowerCase(); }
     else if ((m = t.match(/^DROP\s+(TABLE|INDEX|VIEW)\b/i))) { ddlType = 'drop'; target = m[1].toLowerCase(); }
     else if (/^ALTER\s+TABLE\b/i.test(t)) { ddlType = 'alter'; target = 'table'; }
-    // Reversible: CREATE TABLE (inverse = drop) and DROP TABLE (inverse =
-    // pre-image restore). ALTER / other DDL are logged but not auto-reversible.
-    const reversible = (ddlType === 'create' && target === 'table') ||
-                       (ddlType === 'drop' && target === 'table');
+    // What rewind can actually undo. CREATE TABLE inverts to a drop, DROP TABLE
+    // to its pre-image, CREATE VIEW to a drop, and renames / ADD COLUMN to the
+    // opposite rename (src/rewind.js `invertDdl`). Everything else is logged and
+    // warned about, so the confirm must not promise otherwise.
+    const inverseOp = classifyDdl(t)?.op ?? null;
+    const reversible = (ddlType === 'create' && (target === 'table' || target === 'view')) ||
+                       (ddlType === 'drop' && target === 'table') ||
+                       inverseOp === 'rename-table' || inverseOp === 'rename-column' ||
+                       inverseOp === 'add-column';
     return { kind: 'ddl', ddlType, target, reversible };
   }
   return { kind: 'other' };
 }
 
 /** Confirm a write command before it executes (reads skip this). */
-function confirmScratchpadWrite(cls, sql, tableName) {
+function confirmScratchpadWrite(cls, sql, tableName, artifactWarning = '') {
   let what;
   if (cls.kind === 'ddl') {
     const verb = cls.ddlType === 'drop' ? 'DROP' : cls.ddlType === 'alter' ? 'ALTER TABLE' : 'CREATE';
@@ -156,8 +163,11 @@ function confirmScratchpadWrite(cls, sql, tableName) {
   const rev = cls.kind === 'ddl'
     ? (cls.reversible ? ' (rewound-able via ⟲)' : ' — NOT auto-rewound-able')
     : (cls.kind === 'dml' ? ' (rewound-able via ⟲)' : '');
-  return confirm(`Run this write command?\n\n${what}\n${rev}`);
+  // Naming the artifacts a drop will delete, because an artifact is something a
+  // person wrote — and this is the path where DROP TABLE actually executes.
+  return confirm(`Run this write command?\n\n${what}\n${rev}${artifactWarning}`);
 }
+
 
 /** Insert a message row and return its new id (last_insert_rowid()). */
 async function insertMessage(sqlite3, db, sessionId, role, content, inContext) {
@@ -201,9 +211,20 @@ async function execScratchSql(sqlite3, db, sql, turnId, sessionId) {
         throw new Error(cls.reason || `Forbidden statement (${text.split(/\s+/)[0]}) cannot run inside scratchpad.`);
       }
 
+      // The artifact gate opens before the confirm: reading dependents is
+      // harmless, and a drop has to name what it will delete *before* asking.
+      // Safe to query here because the manual nested scope is already open for
+      // this generator (BUG-014), and the old names still resolve.
+      const artifactGate = cls.kind === 'ddl' ? await openArtifactGate(sqlite3, db, text) : null;
+      const doomed = artifactGate?.intent?.op === 'drop' ? artifactGate.plan : null;
+      const artifactWarning = doomed?.length
+        ? `\n\n${doomed.length} artifact${doomed.length === 1 ? '' : 's'} read${doomed.length === 1 ? 's' : ''} it and will be deleted:\n`
+          + doomed.map((p) => `  • ${p.name}`).join('\n')
+        : '';
+
       // Every write command confirms before executing (reads run immediately).
       if (cls.kind !== 'read') {
-        if (!confirmScratchpadWrite(cls, text, tableName)) throw new ScratchpadCancelled(text);
+        if (!confirmScratchpadWrite(cls, text, tableName, artifactWarning)) throw new ScratchpadCancelled(text);
       }
 
       // DDL: log with pre-image BEFORE executing (the drop must see the rows).
@@ -242,6 +263,13 @@ async function execScratchSql(sqlite3, db, sql, turnId, sessionId) {
       // triggers, CREATE TABLE leaves the new table uninstrumented. Re-sweep.
       if (cls.kind === 'ddl') {
         await sweepCaptureTriggers(sqlite3, db);
+      }
+
+      // Artifacts follow the DDL they depend on, inside scratch_sp, so a later
+      // statement failing rolls the rewrite back together with the DDL.
+      if (artifactGate) {
+        const note = await closeArtifactGate(sqlite3, db, artifactGate);
+        if (note) infos.push(`· ${note}`);
       }
     }
   } finally {

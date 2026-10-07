@@ -377,8 +377,16 @@ export async function createViewFromQuery(sqlite3, db, { viewName, querySql }) {
 
 /**
  * Drop a user table or view with DDL logging and trigger sweep.
+ *
+ * `cascade` runs after the DROP and before the commit, so a caller that must
+ * delete dependent rows (T40b: artifacts reading this object) gets them in the
+ * same transaction as the DDL. Passing it switches the drop from autocommit to
+ * `BEGIN IMMEDIATE` … `COMMIT` — transaction rule 2, which reserves savepoints
+ * for nested/`ROLLBACK TO` use and gives a top-level multi-statement op a
+ * write transaction it cannot silently skip. Without `cascade` the drop stays
+ * autocommit, exactly as it was before artifacts.
  */
-export async function dropDatabaseObject(sqlite3, db, { name, type }) {
+export async function dropDatabaseObject(sqlite3, db, { name, type }, { cascade = null } = {}) {
   const validName = validateIdentifier(name, 'Object');
   const objType = String(type || 'table').toLowerCase();
   if (objType !== 'table' && objType !== 'view') {
@@ -408,6 +416,9 @@ export async function dropDatabaseObject(sqlite3, db, { name, type }) {
     if (tRows.length && tRows[0][0]) turnId = Number(tRows[0][0]) || 0;
   } catch { /* defaults */ }
 
+  const atomic = typeof cascade === 'function';
+  if (atomic) await sqlite3.exec(db, 'BEGIN IMMEDIATE;');
+
   try {
     await logDDL(sqlite3, db, {
       turnId,
@@ -430,12 +441,23 @@ export async function dropDatabaseObject(sqlite3, db, { name, type }) {
     } catch { /* ignore */ }
   }
 
-  await sqlite3.exec(db, ddlSql);
-
   try {
-    await sweepCaptureTriggers(sqlite3, db);
+    await sqlite3.exec(db, ddlSql);
+
+    if (atomic) await cascade();
+
+    try {
+      await sweepCaptureTriggers(sqlite3, db);
+    } catch (e) {
+      console.warn('[explorer] sweepCaptureTriggers failed:', e);
+    }
+
+    if (atomic) await sqlite3.exec(db, 'COMMIT;');
   } catch (e) {
-    console.warn('[explorer] sweepCaptureTriggers failed:', e);
+    if (atomic) {
+      try { await sqlite3.exec(db, 'ROLLBACK;'); } catch { /* nothing open */ }
+    }
+    throw e;
   }
 
   return { name: validName, type: objType };
