@@ -45,7 +45,7 @@
  * Exposed on the live handle as `window.__agent.referenceIntegrity` for probes.
  */
 
-import { queryAll, execParams, quoteIdent } from './utils.js';
+import { queryAll, execParams, quoteIdent, stripSqlLiterals } from './utils.js';
 import { isReadOnlySql } from './query-engine.js';
 
 // ── 1. Pure SQL analysis ──────────────────────────────────────────────
@@ -804,6 +804,145 @@ export async function auditAll(sqlite3, db, providers = DEPENDENT_PROVIDERS) {
     }
   }
   return { total: findings.length, broken, findings };
+}
+
+/**
+ * Classify a DDL statement for artifact purposes.
+ *
+ * Returns the operation and the names involved, or null when the statement
+ * cannot affect an artifact. Recognizes the shapes SQLite actually accepts:
+ * `ALTER TABLE t RENAME TO u`, `ALTER TABLE t RENAME [COLUMN] a TO b`,
+ * `DROP TABLE [IF EXISTS] t`, `DROP VIEW [IF EXISTS] v`.
+ *
+ * `RENAME CONSTRAINT` and `DROP COLUMN` are deliberately not rewritten: SQLite
+ * does not let you rename a constraint this way, and dropping a column has no
+ * unambiguous "arrived" name to map a stylesheet onto.
+ */
+export function classifyDdl(sql) {
+  // Comments and string literals go first. `/* DROP TABLE x *\/ SELECT 1` is a
+  // read, and a table named in a string is not a table being dropped; classifying
+  // the raw text would act on both. Quoted identifiers survive this — stripping
+  // keeps `"a;b"` intact — so a name with punctuation still classifies.
+  const text = String(stripSqlLiterals(String(sql ?? '')) ?? '').trim().replace(/\s+/g, ' ');
+  if (!text) return null;
+
+  // One identifier, in each of the four forms SQLite accepts. `[[]` and `[]]`
+  // are how a literal bracket is written inside a regex literal — it keeps this
+  // file free of double-escaping, which is how the first version of this
+  // function broke.
+  const ID = String.raw`(?:"([^"]+)"|` + '`' + String.raw`([^` + '`' + String.raw`]+)` + '`' + String.raw`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_$]*))`;
+  const pick = (m, i) => m[i] ?? m[i + 1] ?? m[i + 2] ?? m[i + 3];
+
+  // A compiled copy per shape, each anchored and whole-string: a statement that
+  // merely *contains* these words must not classify.
+  const RENAME_TABLE = new RegExp('^ALTER\\s+TABLE\\s+' + ID + '\\s+RENAME\\s+TO\\s+' + ID + '\\s*;?$', 'i');
+  const RENAME_COLUMN = new RegExp('^ALTER\\s+TABLE\\s+' + ID + '\\s+RENAME\\s+(?:COLUMN\\s+)?' + ID + '\\s+TO\\s+' + ID + '\\s*;?$', 'i');
+  const DROP = new RegExp('^DROP\\s+(TABLE|VIEW)\\s+(?:IF\\s+EXISTS\\s+)?' + ID + '\\s*;?$', 'i');
+
+  // `RENAME TO u` is tried before `RENAME a TO b`. The column pattern also
+  // matches a table rename, because `TO` reads as an identifier — which would
+  // report a table rename as a column rename and rewrite the wrong things.
+  let m = RENAME_TABLE.exec(text);
+  if (m) {
+    const name = pick(m, 1);
+    return { op: 'rename-table', table: name, from: name, to: pick(m, 5) };
+  }
+
+  m = RENAME_COLUMN.exec(text);
+  if (m) return { op: 'rename-column', table: pick(m, 1), from: pick(m, 5), to: pick(m, 9) };
+
+  // `ADD [COLUMN] c TYPE ...` — the column name is the first token after the
+  // optional COLUMN keyword. Everything after it (type, defaults, constraints)
+  // is irrelevant to inverting the statement.
+  m = new RegExp('^ALTER\\s+TABLE\\s+' + ID + '\\s+ADD\\s+(?:COLUMN\\s+)?' + ID, 'i').exec(text);
+  if (m) {
+    const column = pick(m, 5);
+    // SQLite's ALTER TABLE ADD only takes a column, but a statement written for
+    // another dialect (`ADD CONSTRAINT …`, `ADD PRIMARY KEY …`) would otherwise
+    // be read as a column named CONSTRAINT and inverted into a DROP COLUMN that
+    // destroys a real one. Refuse rather than guess.
+    if (/^(CONSTRAINT|PRIMARY|UNIQUE|CHECK|FOREIGN)$|\(/i.test(column)) return null;
+    return { op: 'add-column', table: pick(m, 1), column };
+  }
+
+  m = DROP.exec(text);
+  if (m) return { op: 'drop', kind: m[1].toUpperCase(), name: pick(m, 2) };
+
+  return null;
+}
+/**
+ * ── The gate used by the DDL execution paths ──────────────────────────
+ *
+ * `open` reads everything that must be read *while the old names still exist*;
+ * `close` writes, and runs only after the DDL statement has stepped
+ * successfully. Split this way so the caller can keep them on either side of the
+ * statement without knowing what each one needs.
+ *
+ * Per statement, not per batch: `ALTER TABLE a RENAME TO b; ALTER TABLE b RENAME
+ * TO c` must land artifacts on `c`. A plan computed for the whole batch up front
+ * would look for names that the first statement has already consumed, find
+ * nothing, and leave every artifact pointing at a table that no longer exists.
+ *
+ * Callers inside a UDF need no `withNestedScope` — `udfDepth` already classifies
+ * their inner queries as nested. Callers on the app event loop (the explorer)
+ * want the opposite, so they call the plan/apply functions directly.
+ */
+export async function openArtifactGate(sqlite3, db, ddlText) {
+  const intent = classifyDdl(ddlText);
+  if (!intent) return null;
+
+  if (intent.op === 'rename-table') {
+    return { intent, plan: await planTableRename(sqlite3, db, intent.from, intent.to) };
+  }
+  if (intent.op === 'rename-column') {
+    // Columns as they are *now* — the "after" reading happens in close().
+    return { intent, baseline: await baselineArtifacts(sqlite3, db) };
+  }
+  if (intent.op === 'drop') {
+    // Dependents while the object still exists to be referenced.
+    return { intent, plan: await planDrop(sqlite3, db, [intent.name]) };
+  }
+  return null;
+}
+
+/**
+ * Apply what `openArtifactGate` prepared, and describe it.
+ *
+ * The description is what the agent's tool result carries. An agent that drops a
+ * table and silently voids three artifacts is behaving worse than one that is
+ * told, so the effect is reported rather than swallowed.
+ */
+export async function closeArtifactGate(sqlite3, db, gate) {
+  if (!gate) return null;
+  const { intent } = gate;
+
+  if (intent.op === 'rename-table') {
+    const rewritten = await applyTableRenames(sqlite3, db, gate.plan);
+    return rewritten
+      ? `Renamed “${intent.from}” to “${intent.to}” in ${rewritten} artifact quer${rewritten === 1 ? 'y' : 'ies'}.`
+      : null;
+  }
+
+  if (intent.op === 'rename-column') {
+    const { rewritten, untouched } = await reconcileColumnRenames(sqlite3, db, gate.baseline);
+    if (!rewritten.length) {
+      const ambiguous = untouched.filter((u) => /not a 1:1 mapping|no longer runs/.test(u.reason));
+      return ambiguous.length
+        ? `Renamed a column on “${intent.table}”; ${ambiguous.length} artifact${ambiguous.length === 1 ? ' styling needs' : ' stylings need'} a look (the pane reports which).`
+        : null;
+    }
+    const detail = rewritten.map((r) => `“${r.name}” (${r.from} → ${r.to})`).join(', ');
+    return `Restyled ${rewritten.length} artifact${rewritten.length === 1 ? '' : 's'} after the column rename: ${detail}.`;
+  }
+
+  if (intent.op === 'drop') {
+    const deleted = await applyDropCascade(sqlite3, db, gate.plan);
+    return deleted
+      ? `Dropped ${intent.kind.toLowerCase()} “${intent.name}”, which deleted ${deleted} dependent artifact${deleted === 1 ? '' : 's'}: ${gate.plan.map((p) => `“${p.name}”`).join(', ')}.`
+      : null;
+  }
+
+  return null;
 }
 
 /**
