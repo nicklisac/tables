@@ -1480,6 +1480,41 @@ export async function ensureCaptureTriggers(sqlite3, db, tableName) {
  * Attach capture triggers to every user data table (idempotent). Called at
  * boot and after any table creation (CSV ingestion, agent DDL).
  */
+/**
+ * Remove one table's capture triggers, by name. Returns whether they were lowered.
+ *
+ * A capture trigger's NAME embeds its table's name (`cap_users_ins`), and SQLite
+ * does not rename a trigger when its table is renamed — the trigger stays
+ * attached, still firing, still stamping `table_name = 'users'` for a table that
+ * no longer exists. A rename that only sweeps afterwards therefore ends up
+ * double-capturing: fresh triggers stamping the new name, stale ones stamping the
+ * dead one. Measured: one INSERT after a rename wrote two rows to
+ * `turn_changesets`, which makes every later rewind of that table replay against
+ * a name that is not there and silently skip.
+ *
+ * Names follow the project's unquoted `cap_<table>_<event>` convention, so a name
+ * that would not parse as an identifier cannot have capture triggers under it
+ * either — it is reported rather than fed to SQLite as a syntax error.
+ */
+export async function dropCaptureTriggers(sqlite3, db, tableName) {
+  if (!tableName) return false;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName)) {
+    console.warn('[capture] not lowering triggers for non-identifier table name:', tableName);
+    return false;
+  }
+  try {
+    await execParams(sqlite3, db, `
+      DROP TRIGGER IF EXISTS cap_${tableName}_ins;
+      DROP TRIGGER IF EXISTS cap_${tableName}_upd;
+      DROP TRIGGER IF EXISTS cap_${tableName}_del;
+    `);
+    return true;
+  } catch (e) {
+    console.warn('[capture] could not lower capture triggers for', tableName, e.message);
+    return false;
+  }
+}
+
 export async function sweepCaptureTriggers(sqlite3, db) {
   const vParents = await getVirtualTableParents(sqlite3, db);
   const tables = await queryAll(sqlite3, db,

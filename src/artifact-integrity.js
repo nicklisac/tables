@@ -50,6 +50,7 @@
 import {
   describeQuery, classifyDdl, planRename, applyRenamePlan, planDelete, applyDeletePlan,
 } from './reference-integrity.js';
+import { dropCaptureTriggers, sweepCaptureTriggers } from './schema.js';
 import { extractStyledColumns, renameStyledColumn, styleDependencySummary } from './artifact-styles.js';
 import { queryAll, execParams } from './utils.js';
 
@@ -288,6 +289,14 @@ export async function closeArtifactGate(sqlite3, db, gate) {
 
   if (intent.op === 'rename-table') {
     await applyRenamePlan(sqlite3, db, gate.plan);
+    // A rename takes the table but not its capture triggers, whose NAMES embed
+    // the old table name and which SQLite leaves attached, firing and stamping
+    // `table_name` for a table that no longer exists. Without this the table is
+    // double-captured from then on, and every later rewind of it silently skips
+    // its own changesets because they are filed under a name nothing has.
+    if (await dropCaptureTriggers(sqlite3, db, intent.from)) {
+      await sweepCaptureTriggers(sqlite3, db);
+    }
     const rewritten = gate.plan.length;
     return rewritten
       ? `Renamed “${intent.from}” to “${intent.to}” in ${rewritten} artifact quer${rewritten === 1 ? 'y' : 'ies'}.`
