@@ -1129,6 +1129,112 @@ graph TD
 
 ---
 
+## Live-Test Ledger — first real session (2026-10-07)
+
+The user drove the app and let Tables (the in-app agent) critique the harness from
+inside it. Both reports are kept here as written evidence, triaged. Nothing below
+is merged into T40b except what is marked **fixed here**.
+
+### Fixed in T40b
+* **The pane did nothing and said nothing.** "The picker was kind of wonky and
+  didn't work sometimes. I had to refresh F5 to get it unstuck." `setBusy` toggled
+  a `.disabled` class that no stylesheet anywhere defined, so the pane kept
+  offering clicks while the agent's cascade held the connection; each one threw
+  `SQLITE_LOCKED` into a handler with no `catch`. Now: controls really disable,
+  `aria-busy` is set, and every SQLite-touching interaction reports in place.
+* **A wide artifact scrolled the whole pane.** The component sizes columns to
+  content and its `.clip` wrapper is renderer-owned — "the page and the file can't
+  style .clip" (`vendor/cssv/src/cssv-table.js:6-7`) — and it declared no overflow,
+  so the overflow escaped to `#artifact-body`, which took the scrollbar. Sideways
+  scrolling panned the artifact's own header and notices out of view, and widening
+  the pane did not help the artifact that needed it. The host now owns its scroll.
+  **True auto-fit is not available**: `.clip` is `width: max-content` by contract
+  and `observedAttributes` is `['src','key','lang']`, with SPEC §7.5 forbidding
+  other attributes. Fitting would mean a fork or an upstream change — see below.
+* **The agent was never told artifacts exist.** T40 shipped agent-writable
+  artifacts and a stylesheet format, and the system prompt did not mention either.
+  See *The agent guessed the format's contract* below.
+
+### The agent guessed the format's contract → **fixed here**
+Tables: *"--cssv-key was never in your system prompt. The direct cause of my first
+artifact rendering colourless: data-key only exists once --cssv-key names the key
+column, and I wrote eight keyed rules without it. Your kind defaults to 'cssv', so
+you ship a format and let me guess its contract."* The prompt now carries the
+edges that bite (`--cssv-key` before `[data-key=…]`, no numeric comparison so
+thresholds need a SQL-computed column, opt-in grouping, selectors must name
+columns the saved query returns, natural column width so a wide artifact scrolls).
+
+Bumping `SYSTEM_PROMPT_VERSION` then exposed a **standing engine bug, larger than
+the prompt text**: D1 refuses to overwrite an identity it cannot prove is the
+engine's own, and `looksStock` compared only against the *current* bundle — so a
+previous bundle always reads as "user edited", gets kept, and gets flagged
+`prompt_customized` (which also changes what a later cartridge import does). A
+version bump could therefore never reach an existing database. Every engine prompt
+improvement since D1 would have shipped to new installs and silently frozen
+everyone else. Fixed with `STOCK_PROMPT_SHA256`: past bundles are digested, so
+"stock" is provable again. Tested both directions.
+
+### Owed tickets
+* **T41 — Tool-surface honesty.** The agent's own top item: *"Tool results are
+  unbounded; `fetch_url` is the only place you capped them. My context is 57K
+  tokens, and 140K characters of it is tool output … Worst moment:
+  `SELECT quote(css) FROM artifacts` — 24 KB of CSS into my context to read what
+  I'd written, because there's no other way to inspect a 9 KB blob. fetch_url gets
+  this exactly right: 8000-char preview, doc_id, and a hint to SUBSTR the rest.
+  That asymmetry — a capped fetch and an uncapped query — is the difference between
+  surviving an hour and drowning in turn two."* Also in scope:
+  * **`REPLACE` no-ops report success.** *"Sixteen `UPDATE artifacts SET css =
+    REPLACE(css, …)` edits, and a needle that misses by one space returns status
+    OK, changes 1 — rows touched, not values changed … Silent and affirmative is
+    the worst failure mode for a harness selling reversibility: the journal records
+    a write that changed nothing."*
+  * **Sibling tool calls cannot see each other's writes.** *"search_documents
+    ('cssv') returned zero three times while I fetched CSSV pages in the same
+    block … I concluded the corpus was empty and re-fetched pages I already had."*
+  * **`validate_artifact`** — the gap the agent named itself: *"I can't see my own
+    output. 9.2 KB of CSS shipped blind; the scrollbar you found was my only visual
+    feedback all session."* The CSSV skill ships a validator for delimiter
+    consistency, mixed-type columns, `[data-col]` names matching no column, and
+    malformed `--cssv-key`/`--cssv-format` — ~40 lines, and `styleProblems()`
+    already does part of it. The agent hand-rolled brace-parity checks with
+    `LENGTH`/`REPLACE` instead: "a funny way to spend four tool calls and a bad
+    one."
+* **T42 — Provenance.** The one Tables insisted is worth a schema change:
+  *"`turn_changesets` has no provenance column … I found rows in my own turn_id
+  that I hadn't issued and concluded the app was writing behind my back. It wasn't
+  — you were poking around."* And the direction that actually bites: *"Your two
+  artifacts are filed under turn_id=110, my turn. Rewind my artifact work and the
+  rollback walks that changeset — so my turn would have deleted your rows … the
+  destructive direction is silent: nothing tells you that rewinding me eats your
+  scratch work."* A `source TEXT` column makes it one query and makes rewind
+  scope-able. **This is a data-loss path, not a nicety**, and T40b's captured
+  artifact writes land directly on it. *"That's a schema change, not a prompt
+  change, which is why it's worth doing."*
+* **T43 — DDL failure honesty.** *"DROP TABLE is a permanent policy refusal in a
+  transient error's costume. Three turns, 14:56 → 15:25, identical database table
+  is locked. Reads retryable, so I retried. Fires after the pre-image snapshot —
+  `turn_ddl_log` holds pre_image for four DROPs that never executed. Defeats
+  `IF EXISTS`, which advertises idempotence. Result: probe_a and zoo_census are
+  residents I created and cannot remove."* Two separate defects: an error that
+  invites retrying a refusal, and a pre-image journaled before the statement is
+  known to have run. Confirmed independently by T40b's own measurement of
+  `SQLITE_LOCKED_TABLE`.
+* **Small batch.** `v_turn_boundaries.total_tokens` is repeated per row so `SUM()`
+  returns 11.3M against a real 57K — rename to `context_tokens` ("I fell for it").
+  FTS `rank` differences in the third decimal are ordering noise at 13 docs — needs
+  a tie-break or a note. `materialize` rejected `_probe_materialize` as "reserved /
+  protected" without naming the underscore, so the agent used the tool zero times.
+  `QUOTE(tablename)` is not valid SQLite and is the obvious thing to reach for.
+  Nothing states the browser/CSS floor, so the agent guessed and shipped
+  `sibling-index()` / `attr()` / `light-dark()` blind.
+
+### What the agent said was working
+*"Querying my own schema and memory is the actual idea, and it holds up.
+v_active_context readable meant I could check what I was holding rather than
+assume. Stable document ids meant a fetched page stayed useful instead of
+evaporating. pre_image on the DDL log is the right instinct even where it
+misfires."*
+
 ## The Next Shelf & Fog of War (Group 3: Post-Core Horizons)
 
 These items sit on the next shelf to be tackled after the core workstation is complete:
