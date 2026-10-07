@@ -154,6 +154,10 @@ export const FIT_LAYER_CSS = `@layer tables-fit {
 /** One observer per rendered slot, dropped with the element it watches. */
 const fitObservers = new WeakMap();
 
+/** Below this, shrinking stops being fitting and starts being a shrug. */
+const FIT_FLOOR_PX = 240;
+const FIT_MAX_TRIES = 3;
+
 /**
  * Tell this artifact how wide it is allowed to be, and keep telling it.
  *
@@ -167,14 +171,58 @@ const fitObservers = new WeakMap();
  * A hidden pane reports 0. Writing that would cap the table at nothing, so it is
  * skipped and the observer's next pass picks up the real width.
  */
-function fitToContainer(host) {
-  const set = () => {
+function fitToContainer(host, scroller) {
+  const write = (px) => host.style.setProperty('--tables-fit-width', `${px}px`);
+  // The overflow shows up on the component element, because that is the box the
+  // stylesheet made scrollable. Measuring the slot around it would report a
+  // perfect fit — a scroll container hides its own overflow from its parent.
+  const measure = () => scroller.scrollWidth - scroller.clientWidth;
+  let settleTimer = null;
+
+  const apply = () => {
     const width = host.clientWidth;
-    if (width > 0) host.style.setProperty('--tables-fit-width', `${width}px`);
+    if (width <= 0) return;
+    write(width);
+
+    // Capping at the container width is right only if the table is the whole
+    // contribution. It is not: the wrapper sizes to max-content, so the
+    // artifact's own margin on the table is ADDED to it. An artifact that paints
+    // a plate with `margin: 12px` therefore overflows by exactly 24px — which is
+    // what a small stray scrollbar at the bottom of a fitted artifact is.
+    //
+    // Measuring the result beats computing it. Reading the artifact's margins from
+    // here would mean reaching through two shadow roots into the component's
+    // internals, and would still miss whatever else an artifact does to its box.
+    // One pass comparing what the box asked for against what it was given closes
+    // the gap for any of it, and if the artifact has a hard floor that refuses to
+    // shrink — a grid column with a 290px minimum, say — the tries run out and it
+    // scrolls, which is what it asked for.
+    let tries = 0;
+    const correct = () => {
+      const over = measure();
+      if (over <= 0 || tries >= FIT_MAX_TRIES) return;
+      const next = width - over;
+      if (next < FIT_FLOOR_PX) { write(width); return; }
+      tries += 1;
+      write(next);
+      requestAnimationFrame(correct);
+    };
+    requestAnimationFrame(correct);
   };
-  set();
+
+  // During a divider drag the observer fires every frame, and `scrollWidth`
+  // forces layout. Set the cap immediately — it is cheap and it is the
+  // approximation a drag needs — and settle the margin correction afterwards.
+  const applyDebounced = () => {
+    const width = host.clientWidth;
+    if (width > 0) write(width);
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(apply, 120);
+  };
+
+  apply();
   if (!fitObservers.has(host) && typeof ResizeObserver === 'function') {
-    const observer = new ResizeObserver(set);
+    const observer = new ResizeObserver(applyDebounced);
     observer.observe(host);
     fitObservers.set(host, observer);
   }
@@ -278,8 +326,11 @@ export async function renderArtifact(host, result, options = {}) {
 
   const table = document.createElement('cssv-table');
   host.append(table);
-  fitToContainer(host);
   await table.update(built.text);
+  // After the update, not before: the element is empty until CSSV has rendered,
+  // so fitting first measures an empty box, finds nothing to correct, and leaves
+  // the artifact overflowing by whatever its own margins are.
+  fitToContainer(host, table);
 
   if (truncated) {
     const foot = document.createElement('div');

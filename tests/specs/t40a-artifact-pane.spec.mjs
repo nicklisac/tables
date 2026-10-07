@@ -450,6 +450,49 @@ test.describe('T40a — the artifact pane', () => {
     expect(await page.locator('#btn-artifact-picker').isEnabled()).toBe(true);
   });
 
+  test('an artifact that paints a plate with its own margins still fits', async ({ page }) => {
+    await bootPage(page);
+    const sql = "SELECT 'North America East' AS region, 'Widget Deluxe Pro' AS product, "
+      + "'2026-Q1' AS quarter, 'a moderately long descriptive remark that has to go somewhere' AS remarks, "
+      + '1 AS a, 2 AS b, 3 AS c, 4 AS d';
+    // The shape an artifact takes when someone builds a card out of the table:
+    // padding and margin on the table itself.
+    await seed(page, 'Plate', sql, 'plain',
+      'table { box-sizing: border-box; width: calc(100% - 24px); min-width: 0;'
+      + ' padding: 16px; margin: 12px; border-radius: 14px; }');
+    // Show THIS one. The pane keeps whatever the previous test selected, and that
+    // artifact opts into scrolling — measuring the wrong slot would fail on
+    // someone else's overflow.
+    const plateId = await queryValue(page, `SELECT id FROM artifacts WHERE name = 'Plate'`);
+    await page.evaluate((id) => window.__agent.artifactPane.showArtifact(id), plateId);
+    await page.waitForTimeout(400);
+
+    const fitted = await page.evaluate(() => {
+      const scroller = document.querySelector('.artifact-slot-body cssv-table');
+      return { over: scroller.scrollWidth - scroller.clientWidth };
+    });
+    // The wrapper sizes to max-content, so the artifact's own margin is ADDED to
+    // the width it was allowed, and capping at the container width overshoots by
+    // exactly that — a stray 24px scrollbar on a plate that set `margin: 12px`.
+    expect(fitted.over, 'the margin is inside the fit, not on top of it').toBe(0);
+
+    // And it stays fitted when the pane changes size.
+    await page.evaluate(() => {
+      document.getElementById('canvas-pane').style.width = '300px';
+    });
+    await page.waitForTimeout(400);
+    const resized = await page.evaluate(() => {
+      const scroller = document.querySelector('.artifact-slot-body cssv-table');
+      return { over: scroller.scrollWidth - scroller.clientWidth, w: scroller.clientWidth };
+    });
+    expect(resized.w).toBeLessThan(420);
+    expect(resized.over, 'a narrower pane re-fits rather than scrolls').toBe(0);
+
+    await page.evaluate(() => {
+      document.getElementById('canvas-pane').style.width = '';
+    });
+  });
+
   test('a wide artifact fits the pane and wraps; scrolling is something it asks for', async ({ page }) => {
     await bootPage(page);
     const wide = "SELECT 'North America East' AS region, 'Widget Deluxe Pro' AS product, "
