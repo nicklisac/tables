@@ -21,6 +21,7 @@ import {
   setSuppressCascade,
   sweepCaptureTriggers,
 } from './schema.js';
+import { classifyDdl } from './reference-integrity.js';
 
 /**
  * Human-readable summary of the changes that would be undone by rewinding to
@@ -74,6 +75,71 @@ async function updateRow(sqlite3, db, tableName, rowid, row) {
     values);
 }
 
+/**
+ * Remove one table's capture triggers.
+ *
+ * A capture trigger is compiled against the table's columns — its body says
+ * `NEW.qty`. SQLite refuses to drop or rename a column that a trigger depends
+ * on, so inverting an `ADD COLUMN` on an instrumented table fails outright
+ * (`error in trigger cap_t_triggers after drop column: no such column: NEW.qty`)
+ * unless the triggers step aside first. `sweepCaptureTriggers` rebuilds them
+ * afterwards from whatever columns the table now has.
+ */
+async function dropCaptureTriggers(sqlite3, db, tableName) {
+  if (!tableName) return false;
+  try {
+    await execParams(sqlite3, db, `
+      DROP TRIGGER IF EXISTS cap_${tableName}_ins;
+      DROP TRIGGER IF EXISTS cap_${tableName}_upd;
+      DROP TRIGGER IF EXISTS cap_${tableName}_del;
+    `);
+    return true;
+  } catch (e) {
+    console.warn('[rewind] could not lower capture triggers for', tableName, e.message);
+    return false;
+  }
+}
+
+/**
+ * The statement that would undo this one, or null when nothing safe does.
+ *
+ * Renames used to be reported as not auto-reversible, which left a hole exactly
+ * where artifacts make it visible: an artifact's SQL is a captured write, so a
+ * rewind reverts it, while the `ALTER` it belonged to did not rewind. The result
+ * was an artifact pointing at a table that had never been created under that
+ * name — the data rewound and the schema not. Reversing the rename closes that.
+ *
+ * `ADD COLUMN` inverts to `DROP COLUMN`, which SQLite can refuse (an indexed or
+ * primary-key column); the caller treats a failure as a warning, not a rollback.
+ */
+function invertDdl(ddlSql, fallbackTable) {
+  const intent = classifyDdl(ddlSql);
+  if (!intent) {
+    // CREATE VIEW is the one shape classifyDdl does not name that is still
+    // trivially reversible: the view did not exist before the turn.
+    if (/^CREATE\s+(?:TEMP(?:ORARY)?\s+)?VIEW\b/i.test(ddlSql || '') && fallbackTable) {
+      return { kind: 'drop-view', sql: `DROP VIEW IF EXISTS ${quoteIdent(fallbackTable)}` };
+    }
+    return null;
+  }
+  if (intent.op === 'rename-table') {
+    return { kind: 'rename-table', back: intent.from, sql: `ALTER TABLE ${quoteIdent(intent.to)} RENAME TO ${quoteIdent(intent.from)}` };
+  }
+  if (intent.op === 'rename-column') {
+    return {
+      kind: 'rename-column', back: intent.from, table: intent.table,
+      sql: `ALTER TABLE ${quoteIdent(intent.table)} RENAME COLUMN ${quoteIdent(intent.to)} TO ${quoteIdent(intent.from)}`,
+    };
+  }
+  if (intent.op === 'add-column') {
+    return {
+      kind: 'drop-column', table: intent.table, back: intent.column,
+      sql: `ALTER TABLE ${quoteIdent(intent.table)} DROP COLUMN ${quoteIdent(intent.column)}`,
+    };
+  }
+  return null;
+}
+
 /** Apply the inverse of a single DDL statement (scaffold — DDL is locked from
  *  the agent in T3; exercised by the !!DDL scratchpad (T9) / T13 tools). */
 async function replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson) {
@@ -99,8 +165,30 @@ async function replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson) {
         }
       }
     }
+  } else if (/^ALTER\s+TABLE\b/i.test(ddlSql || '') || /^CREATE\s+(?:TEMP(?:ORARY)?\s+)?VIEW\b/i.test(ddlSql || '')) {
+    const inverse = invertDdl(ddlSql, tableName);
+    if (!inverse) {
+      console.warn('[rewind] Cannot auto-reverse DDL:', ddlSql);
+    } else {
+      // Lower this table's capture triggers so SQLite will accept the change,
+      // then rebuild them from the resulting columns.
+      const swept = await dropCaptureTriggers(sqlite3, db, inverse.table ?? tableName);
+      try {
+        await execParams(sqlite3, db, inverse.sql);
+      } catch (e) {
+        // An inverse that cannot run (a column SQLite refuses to drop, a name
+        // already taken by something the turn did not create) is reported, not
+        // fatal: a rewind that restores most of the state beats one that aborts
+        // halfway and leaves the savepoint rolled back under the user.
+        console.warn(`[rewind] DDL inverse failed (${inverse.kind}):`, inverse.sql, e.message);
+      }
+      if (swept) {
+        try { await sweepCaptureTriggers(sqlite3, db); }
+        catch (e) { console.warn('[rewind] capture-trigger rebuild failed:', e.message); }
+      }
+    }
   } else {
-    // ALTER TABLE and other DDL are not auto-reversible — surface it.
+    // Everything else is not auto-reversible — surface it rather than pretend.
     console.warn('[rewind] Cannot auto-reverse DDL:', ddlSql);
   }
 }
