@@ -9,7 +9,7 @@
 //     configured state's example chips route through the normal send path.
 import { readFileSync } from 'node:fs';
 import { test, expect } from '@playwright/test';
-import { bootPage, waitAgent, queryAll } from '../helpers.mjs';
+import { bootPage, waitAgent, queryAll, queryValue } from '../helpers.mjs';
 
 const PROMPT_START = 'You are Tables. You live inside a SQLite database in the user\'s browser.';
 const PROMPT_END = 'If asked who you are, answer plainly: "I\'m Tables. I live in the SQLite database in this browser tab."';
@@ -81,11 +81,15 @@ test.describe('T31 — system prompt identity + welcome card', () => {
     // The fake provider makes the LLM call fail, but the user row is inserted
     // BEFORE ask_llm runs, so it persists regardless. Wait for the turn to
     // settle on the DOM (send button re-enabled), never by polling mid-turn.
-    const before = (await queryAll(page, `SELECT COUNT(*) FROM messages WHERE role = 'user'`))[0][0];
+    const userRows = () => queryValue(page, `SELECT COUNT(*) FROM messages WHERE role = 'user'`);
+    const before = await userRows();
     await page.locator('.welcome-chip').first().click();
     await page.waitForSelector('#send-btn:not([disabled])', { timeout: 30_000 });
-    const after = (await queryAll(page, `SELECT COUNT(*) FROM messages WHERE role = 'user'`))[0][0];
-    expect(after).toBe(before + 1);
+    // Polling the ROW, not the turn. Waiting on the button alone raced: the click
+    // handler disables it asynchronously, so under parallel load the selector is
+    // already satisfied when it is first evaluated and the count is read before
+    // the insert lands. That made this test fail in full runs and pass alone.
+    await expect.poll(userRows, { timeout: 15_000 }).toBe(before + 1);
 
     // Tidy up: drop the fake provider so other tests see a fresh profile.
     await page.evaluate(() => localStorage.removeItem('sql-agent-config'));
@@ -98,31 +102,45 @@ test.describe('T31 — system prompt identity + welcome card', () => {
   // use, while flagging them `prompt_customized` and changing what a later
   // cartridge import does to them.
   test('a stock prompt at an older version upgrades; an edited one is never clobbered', async ({ page }) => {
-    const v3 = readFileSync(new URL('../fixtures/system-prompt-v3.txt', import.meta.url), 'utf8');
-
     await bootPage(page);
-    await queryAll(page, `UPDATE system_config SET value = ? WHERE key = 'system_prompt'`, [v3]);
-    await queryAll(page, `UPDATE system_config SET value = '3' WHERE key = 'prompt_version'`);
-    await queryAll(page, `DELETE FROM system_config WHERE key = 'prompt_customized'`);
+    // Read live rather than pinning a number: the point of the migration is that
+    // the version moves, so an assertion hard-coded to one value breaks on every
+    // prompt edit — the same mistake the manifest test was making.
+    const engineVersion = await queryValue(page,
+      `SELECT value FROM system_config WHERE key = 'prompt_version'`);
 
-    await bootPage(page);
+    const plant = async (fixture, version) => {
+      const text = readFileSync(new URL(`../fixtures/${fixture}`, import.meta.url), 'utf8');
+      await queryAll(page, `UPDATE system_config SET value = ? WHERE key = 'system_prompt'`, [text]);
+      await queryAll(page, `UPDATE system_config SET value = ? WHERE key = 'prompt_version'`, [version]);
+      await queryAll(page, `DELETE FROM system_config WHERE key = 'prompt_customized'`);
+      await bootPage(page);
+      return queryAll(page,
+        `SELECT (SELECT value FROM system_config WHERE key='prompt_version'),
+                (SELECT instr(value, '--cssv-key') > 0 FROM system_config WHERE key='system_prompt'),
+                COALESCE((SELECT value FROM system_config WHERE key='prompt_customized'), '')`);
+    };
 
-    const after = await queryAll(page,
-      `SELECT (SELECT value FROM system_config WHERE key='prompt_version'),
-              (SELECT instr(value, '--cssv-key') > 0 FROM system_config WHERE key='system_prompt'),
-              COALESCE((SELECT value FROM system_config WHERE key='prompt_customized'), '')`);
-    expect(after[0][0], 'the version moved').toBe('4');
-    expect(after[0][1], 'provably-stock text was refreshed').toBe(1);
-    // Some builds write the flag as '0' rather than omitting it; either reads as
-    // "not customized". What must not happen is '1'.
-    expect(['', '0'], 'and it was NOT marked customized').toContain(after[0][2]);
+    // Every bundle the engine has shipped must be able to move forward. v4 is the
+    // one sitting in real databases right now, so it is not a hypothetical case.
+    for (const [fixture, version] of [
+      ['system-prompt-v3.txt', '3'],
+      ['system-prompt-v4.txt', '4'],
+    ]) {
+      const after = await plant(fixture, version);
+      expect(after[0][0], `${fixture}: the version moved`).toBe(engineVersion);
+      expect(after[0][1], `${fixture}: provably-stock text was refreshed`).toBe(1);
+      // Some builds write the flag as '0' rather than omitting it; either reads as
+      // "not customized". What must not happen is '1'.
+      expect(['', '0'], `${fixture}: it was NOT marked customized`).toContain(after[0][2]);
+    }
 
     // The other half of D1: something a person actually wrote still survives.
-    const mine = `${v3}\n\nMy own rule: never use semicolons.`;
+    const v4 = readFileSync(new URL('../fixtures/system-prompt-v4.txt', import.meta.url), 'utf8');
+    const mine = `${v4}\n\nMy own rule: never use semicolons.`;
     await queryAll(page, `UPDATE system_config SET value = ? WHERE key = 'system_prompt'`, [mine]);
-    await queryAll(page, `UPDATE system_config SET value = '3' WHERE key = 'prompt_version'`);
+    await queryAll(page, `UPDATE system_config SET value = '4' WHERE key = 'prompt_version'`);
     await queryAll(page, `DELETE FROM system_config WHERE key = 'prompt_customized'`);
-
     await bootPage(page);
 
     const kept = await queryAll(page,

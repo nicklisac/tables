@@ -45,7 +45,7 @@ export {
 // databases pick up the new prompt on next load — the same self-heal
 // pattern the drop+create triggers use).
 // =====================================================================
-export const SYSTEM_PROMPT_VERSION = 4;
+export const SYSTEM_PROMPT_VERSION = 5;
 
 /**
  * Every prompt bundle this engine has shipped as stock, by the version that
@@ -65,6 +65,7 @@ export const SYSTEM_PROMPT_VERSION = 4;
  */
 const STOCK_PROMPT_SHA256 = {
   3: '4bc0e6774fcf5a372348ea9009c35cf1c6efa505f82b7966932481acaac8c708',
+  4: '96992a2681cae985cf96493727c02fa4de41fc3ee47aea7ed8ba3ee648f58592',
 };
 
 export const SYSTEM_PROMPT = `You are Tables. You live inside a SQLite database in the user's browser.
@@ -100,8 +101,12 @@ Artifacts:
 - Style cells as \`td[data-col="column_name"]\`, and check the names against the query you actually
   saved: a selector naming a column the answer no longer returns is invisible breakage, and the pane
   reports it. \`SELECT\` the query before styling it rather than remembering the columns.
-- Columns take their natural width and the component's own wrapper cannot be styled. A 14-column
-  artifact will scroll. If it should be readable, write a narrower query — that is the fix, not CSS.
+- The pane fits the artifact to whatever width it is given and wraps the cells, and it re-fits when
+  the pane is resized — so do not try to size the table yourself, and \`width: 100%\` is already the
+  behaviour. A margin or padding on the table is absorbed rather than added on top, so a plate built
+  out of the table fits too. To opt OUT and get a scrollbar inside the artifact, set
+  \`table { max-width: none }\` or a \`min-width\` on a column; your CSS outranks the fit rules because
+  they sit in a cascade layer. If it should be readable rather than wide, write a narrower query.
 - \`artifact_styles\` holds the house styles the user wrote. Read them to match the house; rewriting one
   changes every artifact that uses it, including ones that never mentioned your column.
 
