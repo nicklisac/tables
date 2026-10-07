@@ -450,32 +450,51 @@ test.describe('T40a — the artifact pane', () => {
     expect(await page.locator('#btn-artifact-picker').isEnabled()).toBe(true);
   });
 
-  test('a wide artifact scrolls itself, not the pane', async ({ page }) => {
+  test('a wide artifact fits the pane and wraps; scrolling is something it asks for', async ({ page }) => {
     await bootPage(page);
-    const sql = 'SELECT 1 AS region, 2 AS product, 3 AS quarter, 4 AS revenue, '
-      + '5 AS units, 6 AS discount, 7 AS channel, 8 AS segment, 9 AS category, '
-      + '10 AS manager, 11 AS territory, 12 AS forecast, '
-      + "printf('%40s', 'a very wide cell indeed') AS remarks";
-    await seed(page, 'Wide', sql);
-    await refresh(page);
+    const wide = "SELECT 'North America East' AS region, 'Widget Deluxe Pro' AS product, "
+      + "'2026-Q1' AS quarter, 'a moderately long descriptive remark that has to go somewhere' AS remarks, "
+      + '1 AS a, 2 AS b, 3 AS c, 4 AS d, 5 AS e, 6 AS f, 7 AS g, 8 AS h';
 
-    const m = await page.evaluate(() => {
+    await seed(page, 'Fits by default', wide);
+    await refresh(page);
+    const fitted = await page.evaluate(() => {
       const host = document.querySelector('.artifact-slot-body cssv-table');
-      const body = document.getElementById('artifact-body');
+      const table = host.shadowRoot.querySelector('.frame').shadowRoot.querySelector('table');
       return {
-        hostOverflowX: getComputedStyle(host).overflowX,
-        hostScrolls: host.scrollWidth > host.clientWidth,
-        paneOverflows: body.scrollWidth > body.clientWidth + 1,
+        hostFits: host.scrollWidth <= host.clientWidth + 1,
+        paneFits: document.getElementById('artifact-body').scrollWidth
+          <= document.getElementById('artifact-body').clientWidth + 1,
+        tableW: table.clientWidth, hostW: host.clientWidth,
+        // Wrapped text is the whole point: the row got taller rather than wider.
+        rowH: table.querySelector('tbody tr').getBoundingClientRect().height,
       };
     });
+    // CSSV sizes its wrapper to the table's natural width and no one else may
+    // restyle it, so fitting is done by capping the table itself — which, unlike a
+    // percentage, a max-content-sizing ancestor does respect.
+    expect(fitted.hostFits, 'the artifact does not overflow its own box').toBe(true);
+    expect(fitted.paneFits, 'and nothing hands a sideways scrollbar to the pane').toBe(true);
+    expect(fitted.tableW).toBeLessThanOrEqual(fitted.hostW + 1);
+    expect(fitted.rowH, 'the long cell wrapped instead of pushing width').toBeGreaterThan(60);
 
-    // The component sizes columns to their content and says so: `.clip` is
-    // renderer-owned and neither the page nor an artifact's CSS may restyle it.
-    // That is fine — but it declared no overflow, so a wide table spilled out of
-    // the artifact and the pane body took the scrollbar. One sideways scroll for
-    // every artifact, and widening the pane did not help the one that needed it.
-    expect(m.hostOverflowX, 'the artifact owns its own scroll').toBe('auto');
-    expect(m.hostScrolls, 'a 13-column table IS wider than the pane').toBe(true);
-    expect(m.paneOverflows, 'and the pane does not scroll sideways on its behalf').toBe(false);
+    // The other half of the default: an artifact can take the scroll back. House
+    // and artifact CSS are unlayered, so they beat the fit layer without a fight.
+    await queryAll(page, `UPDATE artifacts SET css =
+      'table { max-width: none } td[data-col="remarks"], th[data-col="remarks"] { min-width: 30ch }'
+      WHERE name = 'Fits by default'`);
+    await refresh(page);
+    const opted = await page.evaluate(() => {
+      const host = document.querySelector('.artifact-slot-body cssv-table');
+      return {
+        hostScrolls: host.scrollWidth > host.clientWidth + 1,
+        overflowX: getComputedStyle(host).overflowX,
+        paneFits: document.getElementById('artifact-body').scrollWidth
+          <= document.getElementById('artifact-body').clientWidth + 1,
+      };
+    });
+    expect(opted.hostScrolls, 'it asked for width the pane cannot give').toBe(true);
+    expect(opted.overflowX, 'and scrolls inside its own box').toBe('auto');
+    expect(opted.paneFits, 'still never scrolling the pane itself').toBe(true);
   });
 });

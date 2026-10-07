@@ -2615,17 +2615,21 @@ footer {
 .artifact-slot-meta { margin-left: auto; white-space: nowrap; }
 .artifact-slot-body { min-width: 0; }
 
-/* A wide table scrolls inside its own artifact, not across the whole pane.
+/* Where an artifact goes if it asks to be wider than the pane.
  *
- * The vendored component sizes its inner wrapper to `max-content` — deliberate,
- * columns get their natural width — and declares no overflow on the host, so a
- * wide table overflowed visibly and the nearest scrollable ancestor, the pane
- * body, picked up the scrollbar. Every artifact then shared one sideways scroll,
- * and widening the pane did not help the one that actually needed it.
+ * Not the default path: the fit layer in artifact-render.js caps the table to the
+ * container and lets cells wrap, so an artifact normally never overflows. This is
+ * the escape hatch — `table { max-width: none }` or a `min-width` on a column is
+ * an artifact opting into a scrollbar, and the host is the narrowest box that can
+ * own it.
  *
- * The host is the narrowest box that can own that scroll. Its own `:host` rule
- * only sets `display`, and outer-tree rules outrank `:host` for the host element,
- * so this takes effect without editing the vendored file.
+ * Before that, the overflow escaped the artifact entirely and the pane body took
+ * the scrollbar: one sideways scroll shared by every artifact, which panned the
+ * artifact's own header and notices out of view and did not improve when the pane
+ * was widened. The vendored component declares no overflow on its host and
+ * forbids anyone else from styling its wrapper, so the host is where the pane can
+ * draw the line. Outer-tree rules outrank `:host` for the host element, so this
+ * works without touching the vendored file.
  */
 .artifact-slot-body cssv-table {
   max-width: 100%;
