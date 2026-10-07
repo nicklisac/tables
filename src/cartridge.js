@@ -717,7 +717,10 @@ async function buildImportReport(agent, preSwap) {
     ['Sessions', String(await q1('SELECT COUNT(*) FROM sessions') ?? 0)],
     ['Messages', String(await q1('SELECT COUNT(*) FROM messages') ?? 0)],
     ['User data tables', userTables.length ? `${userTables.length} (${userTables.join(', ')})` : '0'],
-    ['Dashboard cards', String(await q1('SELECT COUNT(*) FROM dashboard_cards') ?? 0)],
+    // T40a: the report counts artifacts, which are user data and travel with the
+    // cartridge. It no longer counts `dashboard_cards` — that table is inert and
+    // only survives in cartridges exported before the artifact layer.
+    ['Artifacts', String(await q1('SELECT COUNT(*) FROM artifacts') ?? 0)],
     // D3: the session boot restored via the BUG-017 chain (the cartridge's own
     // pointer, with fallbacks) — read live, post-boot.
     ['Active session', String((await q1(`SELECT value FROM session_context WHERE key = 'active_session_id'`)) ?? 'default')],

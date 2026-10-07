@@ -785,12 +785,16 @@ SCRATCH_ROW_CAP = 200  # rows kept per result set (bounds LLM context, as in T9)
 # Cartridge-owned objects — the boundary from schema.js INTERNAL_TABLES +
 # SYSTEM_VIEWS. DML/DDL on these is refused; reads are allowed (inspecting your
 # own conversation is legitimate).
+# `artifacts` and `artifact_styles` are deliberately absent. They are a person's
+# analysis, not cartridge plumbing, so the console may read, write and alter them
+# (Ticket 40a). `dashboard_cards` stays: old cartridges still carry the table, and
+# the web engine keeps it protected while it sits inert.
 _PROTECTED_OBJECTS = frozenset({
     "messages", "sessions", "session_context", "system_config", "system_files",
     "llm_profiles", "tools", "turn_changesets", "turn_ddl_log", "compactions",
     "tool_approvals", "dashboard_cards", "documents", "documents_fts",
     "v_active_context", "v_schema_catalog", "v_turn_boundaries",
-    "v_tool_call_queries", "v_grid_matrix", "v_session_summary",
+    "v_tool_call_queries", "v_session_summary",
 })
 
 
@@ -1604,7 +1608,7 @@ class Host:
         lines.append(f"  tools         real: {', '.join(real) or '(none)'}")
         if stubs:
             lines.append(f"                  stubbed (v1): {', '.join(stubs)}")
-        lines.append("  dashboard     cards inert (dashboard_html not implemented in v1)")
+        lines.append("  artifacts     in cartridge; rendered by the web engine, not here")
         print("\n".join(lines))
 
     def close(self):

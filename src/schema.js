@@ -814,42 +814,12 @@ FROM visible;
     AND json_type(m.tool_calls) = 'array'
     AND COALESCE(m.rewound, 0) = 0;  -- T3 chat rewind: faithful to the visible transcript
 
--- v_grid_matrix: the grid's cell matrix — 3 cols × N rows (N self-sizes
--- exactly like grid.js computeGridRows: at least 3, plus 3 buffer rows
--- below the lowest occupied row) — LEFT JOINed with dashboard_cards'
--- span extents. One row per cell; card_id NULL = empty slot. Occupancy
--- is an O(1) lookup: SELECT … WHERE row = ? AND col = ?.
+
+-- v_grid_matrix was dropped in T40a along with the 3x3 canvas. It is no longer
+-- in SYSTEM_VIEWS, so an upgraded database that still carries the view would
+-- have the explorer classify it as a *user* view — droppable, and inside T22
+-- reference-integrity scope. Retire it in place, idempotently, for every boot.
 DROP VIEW IF EXISTS v_grid_matrix;
-CREATE VIEW v_grid_matrix AS
-WITH RECURSIVE params AS (
-    -- 2-arg MAX is the scalar form (this build has no GREATEST).
-    SELECT MAX(3, COALESCE(MAX(row + row_span), 0) + 3) AS n_rows
-    FROM dashboard_cards
-),
-rows_axis(n) AS (
-    SELECT 0
-    UNION ALL
-    SELECT n + 1 FROM rows_axis, params WHERE n + 1 < params.n_rows
-),
-cols_axis(n) AS (
-    SELECT 0
-    UNION ALL
-    SELECT n + 1 FROM cols_axis WHERE n + 1 < 3
-)
-SELECT
-    r.n AS row,
-    c.n AS col,
-    dc.id AS card_id,
-    dc.title AS card_title,
-    dc.sql AS card_sql,
-    dc.row_span,
-    dc.col_span
-FROM rows_axis r
-CROSS JOIN cols_axis c
-LEFT JOIN dashboard_cards dc
-    ON dc.row <= r.n AND r.n < dc.row + dc.row_span
-   AND dc.col <= c.n AND c.n < dc.col + dc.col_span
-ORDER BY r.n ASC, c.n ASC;
 
 -- v_session_summary: per-session token + message aggregations (the
 -- session list / token counter's data). Ordered like listSessions
@@ -1309,7 +1279,6 @@ export const SYSTEM_VIEWS = new Set([
   'v_schema_catalog',
   'v_turn_boundaries',
   'v_tool_call_queries',
-  'v_grid_matrix',
   'v_session_summary',
 ]);
 

@@ -12,8 +12,8 @@ import {
   createViewFromQuery, dropDatabaseObject,
 } from './explorer.js';
 import { quoteIdent } from './schema.js';
-import { addCard } from './grid.js';
-import { renderGrid } from './grid-ui.js';
+import { createArtifact, DEFAULT_STYLE } from './artifacts.js';
+import { refreshArtifacts, showArtifact } from './artifact-pane.js';
 import { globalSchemaIndex } from './sql-autocomplete.js';
 import { icon, ICONS } from './icons.js';
 // T26.3: escapeHtml now lives in src/utils.js.
@@ -298,7 +298,7 @@ function createItemElement(item) {
         <span>query</span>
         <span class="btn-bracket">]</span>
       </button>
-      <button type="button" class="btn-action-pin" title="Pin to Dashboard canvas">
+      <button type="button" class="btn-action-pin" title="Show this table as an artifact">
         <span class="btn-bracket">[</span>
         ${ICONS.pin({ size: 11 })}
         <span>pin</span>
@@ -356,19 +356,19 @@ function createItemElement(item) {
     }
   });
 
-  // Action: Pin to Dashboard
+  // Action: Pin — save the table as an artifact and show it
   details.querySelector('.btn-action-pin')?.addEventListener('click', async (e) => {
     e.stopPropagation();
     if (!agent) return;
     const btn = e.currentTarget;
     try {
-      await addCard(agent.sqlite3, agent.db, {
-        title: item.name,
+      const created = await createArtifact(agent.sqlite3, agent.db, {
+        name: item.name,
         sql: `SELECT * FROM ${quoteIdent(item.name)}`,
-        colSpan: 1,
-        rowSpan: 1,
+        style: DEFAULT_STYLE,
+        css: '',
       });
-      await renderGrid();
+      await showArtifact(created.id);
       btn.innerHTML = `${ICONS.check({ size: 12 })} <span>Pinned</span>`;
       setTimeout(() => {
         btn.innerHTML = `${ICONS.pin({ size: 12 })} <span>Pin</span>`;
@@ -387,7 +387,7 @@ function createItemElement(item) {
     try {
       await dropDatabaseObject(agent.sqlite3, agent.db, { name: item.name, type: item.type });
       await renderExplorer();
-      await renderGrid();
+      await refreshArtifacts();
     } catch (err) {
       alert(`Drop failed: ${err.message}`);
     }
@@ -667,7 +667,7 @@ async function onTableCreateSubmit(e) {
     await createTableFromSchema(agent.sqlite3, agent.db, { tableName, columns });
     closeNewTableModal();
     await renderExplorer();
-    await renderGrid();
+    await refreshArtifacts();
   } catch (err) {
     showTableCreateError(err.message);
   }

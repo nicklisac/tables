@@ -55,7 +55,7 @@ let ctx = null;
  * @param {() => Promise<void>} context.renderMessages - full chat re-render (chat-render.js)
  * @param {() => void} context.updateReadyStatus - status-bar/LED refresh (chat-render.js)
  * @param {() => void} context.scrollChatToBottom - chat scroll (chat-render.js)
- * @param {() => Promise<void>} context.flushCards - dashboard card re-run (grid-ui.js)
+ * @param {() => Promise<void>} context.flushArtifacts - artifact re-run (artifact-pane.js)
  */
 export function initScratchpad(context) {
   ctx = context;
@@ -349,7 +349,7 @@ export async function runScratchpad(cmd, rawText) {
     ctx.setLoading(false);
     await ctx.renderMessages();
     // T11: re-run dashboard cards whose data tables changed (committed point).
-    try { await ctx.flushCards(); } catch (e) { console.warn('[main] card flush failed (non-fatal):', e); }
+    try { await ctx.flushArtifacts(); } catch (e) { console.warn('[scratchpad] artifact flush failed (non-fatal):', e); }
     inputEl.disabled = false;
     sendBtn.disabled = false;
     inputEl.focus();

@@ -158,7 +158,7 @@ export function buildCssvDocument({ columns, values, css = '' }) {
  *
  * @param {HTMLElement} host container element
  * @param {{ columns: string[], values: Array<Array<unknown>>, houseCss?: string, css?: string }} result
- *        the shape `runCardSql` already returns, plus the two style layers
+ *        the shape `runQuerySql` already returns, plus the two style layers
  * @param {{ ceiling?: number, emptyMessage?: string }} [options]
  * @returns {Promise<{ table: Element, notices: string[], truncated: boolean }>}
  */
@@ -169,7 +169,13 @@ export async function renderArtifact(host, result, options = {}) {
   const columns = Array.isArray(result?.columns) ? result.columns : [];
   const allRows = Array.isArray(result?.values) ? result.values : [];
   const shown = allRows.slice(0, ceiling);
-  const truncated = allRows.length > shown.length;
+  // Two ways a render is partial. The renderer can slice below the rows it was
+  // handed, or the executor can have stopped early at its own ceiling — in
+  // which case the rows here *look* complete and only `truncated` says they
+  // are not. Ignoring that flag would show a partial result as a whole one.
+  const sliced = allRows.length > shown.length;
+  const engineCapped = !!result?.truncated && !sliced;
+  const truncated = sliced || engineCapped;
 
   host.replaceChildren();
 
@@ -217,7 +223,11 @@ export async function renderArtifact(host, result, options = {}) {
   if (truncated) {
     const foot = document.createElement('div');
     foot.className = 'artifact-truncated';
-    foot.textContent = `showing the first ${shown.length.toLocaleString()} of ${allRows.length.toLocaleString()} rows`;
+    // When the executor stopped early the true total is unknown, and inventing
+    // one ("of 5,000") would be a number the query never returned.
+    foot.textContent = sliced
+      ? `showing the first ${shown.length.toLocaleString()} of ${allRows.length.toLocaleString()} rows`
+      : `showing the first ${shown.length.toLocaleString()} rows — the query returned more than this`;
     host.append(foot);
   }
 

@@ -21,7 +21,6 @@ const VIEWS = [
   'v_schema_catalog',
   'v_turn_boundaries',
   'v_tool_call_queries',
-  'v_grid_matrix',
   'v_session_summary',
 ];
 
@@ -39,7 +38,6 @@ const TOOL_CALLS = JSON.stringify([
     function: { name: 'search_web', arguments: { query: 't264 views probe search' } },
   },
 ]);
-const CARD_TITLE = 'T264 probe card';
 
 // The compaction estimator (compaction.js estTokens): chars÷4 over
 // content + tool_calls + tool_call_id, NULLs contributing 0.
@@ -76,14 +74,8 @@ test.describe('T26.4 — the 5 SQL-native views exist and return correct rows', 
         `INSERT INTO messages (session_id, role, content, tool_calls, prompt_tokens, completion_tokens)
          VALUES ('default', 'assistant', ?, ?, 100, 50)`,
         [ASST_TEXT, TOOL_CALLS]);
-      await queryAll(page,
-        `INSERT INTO dashboard_cards (title, sql, row, col, row_span, col_span)
-         VALUES (?, 'SELECT 1 AS t264_probe_cell', 0, 0, 2, 2)`,
-        [CARD_TITLE]);
-
       const userId = await queryValue(page, `SELECT id FROM messages WHERE content = ?`, [USER_TEXT]);
       const asstId = await queryValue(page, `SELECT id FROM messages WHERE content = ?`, [ASST_TEXT]);
-      const cardId = await queryValue(page, `SELECT id FROM dashboard_cards WHERE title = ?`, [CARD_TITLE]);
       const sysEst = estTokens(
         (await queryValue(page, `SELECT content FROM messages WHERE id = 0 AND session_id = 'default'`)),
         null, null);
@@ -159,18 +151,6 @@ test.describe('T26.4 — the 5 SQL-native views exist and return correct rows', 
       expect(tcq[1][4]).toBe('t264 views probe search');
       expect(String(tcq[1][5]).includes('t264 views probe search'), 'object-form arguments intact').toBe(true);
 
-      // ── v_grid_matrix ──
-      // Card 2×2 at (0,0) → n_rows = GREATEST(3, 2+3) = 5 → 15 cells,
-      // exactly the card's 4 cells occupied.
-      const gm = await queryAll(page,
-        `SELECT row, col, card_id FROM v_grid_matrix ORDER BY row, col`);
-      expect(gm.length).toBe(15);
-      const occupied = gm.filter((r) => r[2] !== null);
-      expect(occupied.length).toBe(4);
-      expect(occupied.every((r) => r[2] === cardId)).toBe(true);
-      expect(occupied.map((r) => `${r[0]},${r[1]}`).sort())
-        .toEqual(['0,0', '0,1', '1,0', '1,1']);
-
       // ── v_session_summary ──
       const ss = await queryAll(page,
         `SELECT session_id, message_count, total_prompt_tokens, total_completion_tokens,
@@ -191,15 +171,12 @@ test.describe('T26.4 — the 5 SQL-native views exist and return correct rows', 
         `SELECT name FROM sqlite_master WHERE type = 'view' AND name IN (${VIEWS.map(() => '?').join(',')})`,
         VIEWS);
       expect(present2.map((r) => r[0]).sort()).toEqual([...VIEWS].sort());
-      expect(await queryValue(page, `SELECT COUNT(*) FROM v_grid_matrix`)).toBe(15);
       expect(await queryValue(page,
         `SELECT total_tokens FROM v_session_summary WHERE session_id = 'default'`)).toBe(150);
     } finally {
-      // Leave the brain clean (fresh context per test, but be explicit).
+      // Leave the database clean (fresh context per test, but be explicit).
       await queryAll(page, `DELETE FROM messages WHERE content IN (?, ?)`,
         [USER_TEXT, ASST_TEXT]).catch(() => {});
-      await queryAll(page, `DELETE FROM dashboard_cards WHERE title = ?`,
-        [CARD_TITLE]).catch(() => {});
       await queryAll(page, [
         `UPDATE session_context SET value = '0' WHERE key = 'suppress_cascade'`,
         `UPDATE session_context SET value = '0' WHERE key = 'suppress_capture'`,

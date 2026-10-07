@@ -6,17 +6,17 @@
  * rewound, exported and explorer-visible without any of this module knowing.
  * There is deliberately no cache and no shadow copy — the row is the artifact.
  *
- * It reuses the half of `src/grid.js` that survived the grid rather than
- * duplicating it: `runCardSql` (its `{ columns, values, truncated, ms, error }`
- * is exactly the renderer's input, now with a caller-supplied row ceiling) and
- * `resolveCardTables` / `affectedCards`, which already expand a view to its base
- * tables and are row-shape-agnostic — they take anything with `.sql`, so an
- * artifact row works unchanged. That reuse is how T18 ("self-rendering reactive
+ * It reuses `src/query-engine.js` rather than duplicating it: `runQuerySql`
+ * (whose `{ columns, values, truncated, ms, error }` is exactly the renderer's
+ * input) and `resolveQueryTables` / `affectedQueries`, which already expand a
+ * view to its base tables and are row-shape-agnostic — they take anything with
+ * `.sql`, so an artifact row works unchanged. That engine is what survived the
+ * 3×3 grid's retirement, and it is how T18 ("self-rendering reactive
  * dashboards") got closed as absorbed: the reactivity is not a new mechanism,
  * it is the one T11 shipped, pointed at artifacts.
  */
 import { queryAll, execParams } from './utils.js';
-import { runCardSql, resolveCardTables, affectedCards } from './grid.js';
+import { runQuerySql, resolveQueryTables, affectedQueries } from './query-engine.js';
 import { ARTIFACT_ROW_CEILING } from './artifact-render.js';
 
 /** Worn when an artifact names no style. Must exist in the Style Library. */
@@ -113,11 +113,11 @@ export async function resolveArtifactStyle(sqlite3, db, artifact) {
 
 /**
  * Run an artifact's SELECT for display. Read-only enforcement and error capture
- * live in `runCardSql`; the row ceiling is the renderer's, and it reports
+ * live in `runQuerySql`; the row ceiling is the renderer's, and it reports
  * truncation so the pane can say so rather than dropping a computed total.
  */
 export async function runArtifactSql(sqlite3, db, artifact, { rowCap = ARTIFACT_ROW_CEILING } = {}) {
-  return runCardSql(sqlite3, db, artifact?.sql ?? '', rowCap);
+  return runQuerySql(sqlite3, db, artifact?.sql ?? '', rowCap);
 }
 
 /**
@@ -125,7 +125,7 @@ export async function runArtifactSql(sqlite3, db, artifact, { rowCap = ARTIFACT_
  * decide which artifacts a data change should re-run.
  */
 export async function artifactDependencies(sqlite3, db, artifact) {
-  return resolveCardTables(sqlite3, db, artifact?.sql ?? '');
+  return resolveQueryTables(sqlite3, db, artifact?.sql ?? '');
 }
 
 /**
@@ -133,5 +133,5 @@ export async function artifactDependencies(sqlite3, db, artifact) {
  * of T18: no new listener, just the T11 expansion pointed at artifacts.
  */
 export async function affectedArtifacts(sqlite3, db, artifacts, changedTables) {
-  return affectedCards(sqlite3, db, artifacts, changedTables);
+  return affectedQueries(sqlite3, db, artifacts, changedTables);
 }
