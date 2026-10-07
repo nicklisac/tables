@@ -34,7 +34,7 @@
  */
 
 // T26.3: shared result codes + query/ident helpers now live in src/utils.js.
-import { SQLITE_ROW, SQLITE_DONE, queryAll, quoteIdent, execParams } from './utils.js';
+import { SQLITE_ROW, SQLITE_DONE, queryAll, quoteIdent, execParams, sha256Hex } from './utils.js';
 import { isProtectedTable, getVirtualTableParents, ENGINE_MIN_VERSION, SYSTEM_PROMPT_VERSION } from './schema.js';
 // T38: the web's provider profile store (localStorage) — the source for the
 // llm_profiles export stamp. Keys are structurally excluded: this module only
@@ -235,15 +235,6 @@ export async function writeManifest(sqlite3, stagingDb) {
   }
 }
 
-/**
- * T37: SHA-256 hex of a UTF-8 string (WebCrypto). The standalone host computes
- * the same digest in Python (hashlib over body.encode('utf-8')) — same bytes,
- * same hash, so the two sides agree without any shared code.
- */
-async function sha256Hex(text) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
-}
 
 // The hash of the host source THIS build ships — the L2 drift anchor (D7):
 // an imported cartridge's embedded host is compared against it. Cached: one
