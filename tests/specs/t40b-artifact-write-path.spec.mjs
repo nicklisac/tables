@@ -364,4 +364,71 @@ test.describe('T40b — artifacts follow the schema they read', () => {
 
     await queryAll(page, `DROP TABLE IF EXISTS t40b_rev`);
   });
+
+  test('a rename leaves one set of capture triggers, not two', async ({ page }) => {
+    await bootFake(page);
+    await runScratchpad(page, '!!CREATE TABLE t40b_cap (a INTEGER)');
+    const names = () => queryAll(page, `
+      SELECT name FROM sqlite_master
+      WHERE type = 'trigger' AND (name LIKE 'cap_t40b_cap%' OR name LIKE 'cap_t40b_cap2%')
+      ORDER BY name`);
+    expect((await names()).flat()).toEqual([
+      'cap_t40b_cap_del', 'cap_t40b_cap_ins', 'cap_t40b_cap_upd',
+    ]);
+
+    // SQLite moves a trigger with its table but does not rename it, so the pair
+    // keeps firing under the dead name and stamps `table_name` for a table that
+    // no longer exists. The fresh set from the sweep fires too: every write is
+    // captured twice, and the stale half is filed where no rewind can find it.
+    await runScratchpad(page, '!!ALTER TABLE t40b_cap RENAME TO t40b_cap2');
+    expect((await names()).flat()).toEqual([
+      'cap_t40b_cap2_del', 'cap_t40b_cap2_ins', 'cap_t40b_cap2_upd',
+    ]);
+
+    await page.evaluate(async () => {
+      const { sqlite3, db } = window.__agent;
+      await sqlite3.exec(db, 'INSERT INTO t40b_cap2 VALUES (7)');
+    });
+    const stamped = await queryAll(page, `
+      SELECT table_name, COUNT(*) FROM turn_changesets
+      WHERE table_name LIKE 't40b_cap%' GROUP BY table_name ORDER BY table_name`);
+    expect(stamped, 'one insert, one changeset, under the name the table has')
+      .toEqual([['t40b_cap2', 1]]);
+
+    await queryAll(page, 'DROP TABLE IF EXISTS t40b_cap2');
+  });
+
+  test('a rename and a write in one command rewind without leaking the row', async ({ page }) => {
+    await bootFake(page);
+    await runScratchpad(page, '!!CREATE TABLE t40b_rw (a INTEGER)');
+
+    // Changesets are filed under the name the table had AFTER the rename, so the
+    // writes have to be undone while that schema is still up. Undoing the rename
+    // first left the DELETE addressed to a table that was no longer there; the
+    // existence check passed it over, and the row survived its own rewind.
+    // The scratchpad confirms each write STATEMENT, so a two-statement command
+    // raises two confirms; arming one handler auto-dismisses the second and the
+    // whole command rolls back as cancelled.
+    const accept = (d) => d.accept();
+    page.on('dialog', accept);
+    try {
+      await page.fill('#user-input', '!!ALTER TABLE t40b_rw RENAME TO t40b_rw2; INSERT INTO t40b_rw2 VALUES (42)');
+      await page.click('#send-btn');
+      await page.waitForSelector('#send-btn:not([disabled])', { timeout: 20_000 });
+    } finally {
+      page.off('dialog', accept);
+    }
+    expect(await queryValue(page, 'SELECT COUNT(*) FROM t40b_rw2')).toBe(1);
+
+    page.once('dialog', (d) => d.accept());
+    await page.locator('.message.user .rewind-btn').last().click();
+    await page.waitForTimeout(1500);
+
+    expect(await queryValue(page, 'SELECT COUNT(*) FROM t40b_rw')).toBe(0);
+    expect((await queryAll(page,
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 't40b_rw%'`)).flat())
+      .toEqual(['t40b_rw']);
+
+    await queryAll(page, 'DROP TABLE IF EXISTS t40b_rw');
+  });
 });
