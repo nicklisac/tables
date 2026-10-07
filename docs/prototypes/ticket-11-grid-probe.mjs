@@ -115,7 +115,11 @@ export async function runT11Probe() {
       await expectReject('bounds-row', () => grid.addCard(sqlite3, db, { title: 'br', sql: 'SELECT 1', row: 3, col: 0, rowSpan: 1, colSpan: 1 }));
       await expectReject('bounds-span', () => grid.addCard(sqlite3, db, { title: 'bs', sql: 'SELECT 1', row: 2, col: 0, rowSpan: 2, colSpan: 1 }));
       await expectReject('dml', () => grid.addCard(sqlite3, db, { title: 'dml', sql: 'DELETE FROM sample_data', rowSpan: 1, colSpan: 1 }));
-      await expectReject('with-insert', () => grid.addCard(sqlite3, db, { title: 'wi', sql: 'WITH x AS (SELECT 1 AS a) INSERT INTO sample_data SELECT * FROM x', rowSpan: 1, colSpan: 1 }));
+      await expectReject('with-insert', () => grid.addCard(sqlite3, db, { title: 'wi', sql: 'WITH x AS (SELECT 1 AS a) INSERT INTO sample_data SELECT * RETIRED (2026-10-06, Ticket 40a): the 3x3 grid it verifies no longer exists —
+ * `src/grid.js` is deleted and chat assets now drop onto the artifact pane. Kept
+ * as the record of how T12 was verified; it will not run as-is.
+ *
+ * FROM x', rowSpan: 1, colSpan: 1 }));
       await expectReject('multi', () => grid.addCard(sqlite3, db, { title: 'm', sql: 'SELECT 1; SELECT 2', rowSpan: 1, colSpan: 1 }));
       if (rejects.length !== 6 || rejects.some(r => r.endsWith('NOT rejected'))) fail('validation', JSON.stringify(rejects));
       R.steps.validation = { ok: true, rejects };
