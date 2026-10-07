@@ -28,6 +28,7 @@ import {
   listStyles, resolveArtifactStyle, runArtifactSql, affectedArtifacts, DEFAULT_STYLE,
 } from './artifacts.js';
 import { renderArtifact } from './artifact-render.js';
+import { styleFindings, summarizeFindings, styleProblems } from './artifact-integrity.js';
 import { materializeToolResult } from './materialize.js';
 
 let agent = null;
@@ -82,9 +83,16 @@ async function saveSelection(id) {
  * win outright rather than race for the middle.
  */
 let renderChain = Promise.resolve();
-function renderPane() {
-  renderChain = renderChain.then(renderPaneNow, renderPaneNow);
+
+/** Queue one render step. Everything that mutates pane state goes through here,
+ *  so a refresh cannot clear the selection in the middle of another render. */
+function queueRender(step) {
+  renderChain = renderChain.then(step, step);
   return renderChain;
+}
+
+function renderPane() {
+  return queueRender(renderPaneNow);
 }
 
 async function renderPaneNow() {
@@ -111,6 +119,8 @@ async function renderPaneNow() {
     return;
   }
 
+  paintHealth(healthReport);
+
   // One container per visible artifact. v1 shows one; combining is a longer list.
   for (const artifact of visible) {
     try {
@@ -125,6 +135,19 @@ async function renderPaneNow() {
       body.append(note);
     }
   }
+}
+
+/**
+ * The pane's single report line. Deliberately quiet: an artifact whose source
+ * went stale is a routine state after a rewind or a rename, not an emergency,
+ * and a modal about it would punish people for having artifacts at all.
+ */
+function paintHealth(report) {
+  const box = el('artifact-health');
+  if (!box) return;
+  const summary = summarizeFindings(report);
+  box.textContent = summary ?? '';
+  box.classList.toggle('hidden', !summary);
 }
 
 async function renderSlot(artifact) {
@@ -156,6 +179,18 @@ async function renderSlot(artifact) {
   if (out.truncated) bits.push('partial');
   meta.textContent = bits.length ? `· ${bits.join(' · ')}` : '';
 
+  // Styling that names a column the answer no longer has is invisible breakage:
+  // the table renders, quietly unstyled. The columns came back with the rows we
+  // just rendered, so this check costs nothing — no second prepare, no re-read.
+  if (!result.error) {
+    for (const problem of styleProblems(resolved.css, result.columns)) {
+      const line = document.createElement('div');
+      line.className = 'artifact-notice';
+      line.textContent = problem;
+      mount.append(line);
+    }
+  }
+
   for (const notice of out.notices) {
     const line = document.createElement('div');
     line.className = 'artifact-notice';
@@ -177,6 +212,16 @@ export async function flushArtifacts() {
   if (!agent || busy || pendingTables.size === 0) return 0;
   const changed = [...pendingTables];
   pendingTables.clear();
+
+  // A change to the artifact tables themselves (a rewind replaying their rows,
+  // an agent writing them with ordinary DML) is not a dependency of anything:
+  // no artifact *reads* `artifacts`. Re-read the pane from scratch instead —
+  // otherwise the screen keeps showing an artifact that no longer exists.
+  if (changed.includes('artifacts') || changed.includes('artifact_styles')) {
+    await refreshArtifacts();
+    return 1;
+  }
+
   const all = await listArtifacts(agent.sqlite3, agent.db);
   const affected = await affectedArtifacts(agent.sqlite3, agent.db, visible.length ? visible : all, changed);
   if (!affected.length) return 0;
@@ -189,11 +234,37 @@ export async function showArtifact(id) {
   await selectArtifact(id);
 }
 
-/** Re-read and re-render everything (explorer DDL, manual refresh). */
-export async function refreshArtifacts() {
+/**
+ * Library-wide health, recomputed only on an explicit refresh (pin, drop,
+ * rewind, DDL, the refresh button) — not on every render. It prepares one
+ * statement per artifact, which is cheap once and wasteful in a render path that
+ * already has the columns in hand.
+ */
+let healthReport = null;
+
+async function recomputeHealth() {
   if (!agent) return;
-  visible = []; // force a re-resolve of the selection
-  await renderPane();
+  try {
+    healthReport = await styleFindings(agent.sqlite3, agent.db);
+  } catch (e) {
+    console.warn('[artifact-pane] health report failed (non-fatal):', e);
+  }
+}
+
+/**
+ * Re-read and re-render everything (explorer DDL, manual refresh, rewind).
+ *
+ * The whole thing is one queued step: dropping the selection is state, and doing
+ * it before awaiting the health report let a second refresh (the event stream
+ * noticing the same DDL) render in between and race the first one's result.
+ */
+export function refreshArtifacts() {
+  if (!agent) return Promise.resolve();
+  return queueRender(async () => {
+    visible = []; // force a re-resolve of the selection
+    await recomputeHealth();
+    await renderPaneNow();
+  });
 }
 
 export function setBusy(on) {
@@ -226,7 +297,8 @@ async function paintPickerList(filter = '') {
     li.tabIndex = 0;
     li.dataset.artifactId = String(artifact.id);
     li.setAttribute('aria-selected', String(visible[0]?.id === artifact.id));
-    li.innerHTML = `<span class="artifact-pick-name">${esc(artifact.name)}</span>`
+    const stale = healthReport?.findings?.some((f) => f.id === artifact.id && !f.ok);
+    li.innerHTML = `<span class="artifact-pick-name">${esc(artifact.name)}${stale ? ' <span class="artifact-pick-flag" title="Needs attention">▲</span>' : ''}</span>`
       + `<span class="artifact-pick-sql">${esc(artifact.sql.replace(/\s+/g, ' ').slice(0, 70))}</span>`;
     li.addEventListener('click', () => selectArtifact(artifact.id));
     li.addEventListener('keydown', (e) => {
@@ -467,7 +539,9 @@ export function initArtifactPane(agentHandle) {
     openPicker(false);
   });
 
-  return renderPane().then(() => paintSource())
+  return recomputeHealth()
+    .then(() => renderPane())
+    .then(() => paintSource())
     .catch((e) => console.warn('[artifact-pane] initial render failed:', e));
 }
 

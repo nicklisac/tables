@@ -1098,8 +1098,12 @@ initChatRender({
   isConfigured: isProviderConfigured,
   isBusy,
   onConfigClick: () => openConfigModal(),
-  onRewindTurn: (id) => rewindToBefore(id),
-  onRewindScratchpad: (id) => rewindToBeforeScratchpad(id),
+  // A rewind rewrites `artifacts` rows (they are captured data), so the pane has
+  // to re-read them. Its dependency-driven refresh cannot notice on its own:
+  // `artifacts` is not a table any artifact *reads*, so the usual
+  // changed-table → affected-artifact match never fires.
+  onRewindTurn: async (id) => { await rewindToBefore(id); await artifactPane.refreshArtifacts(); },
+  onRewindScratchpad: async (id) => { await rewindToBeforeScratchpad(id); await artifactPane.refreshArtifacts(); },
 });
 initRewindUi({
   getAgent: () => agent,

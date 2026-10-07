@@ -2464,6 +2464,17 @@ footer {
 
 .artifact-picker-caret { color: var(--text-muted); flex-shrink: 0; }
 
+.artifact-health {
+  margin: 0.45rem 0.6rem 0;
+  padding: 0.3rem 0.5rem;
+  border-left: 2px solid var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 7%, transparent);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
 .artifact-picker {
   position: absolute;
   top: 3.1rem;
