@@ -375,4 +375,107 @@ test.describe('T40a — the artifact pane', () => {
 
     await queryAll(page, `DROP TABLE t40a_pin_me`);
   });
+
+  // Two live-test findings, one root cause. `setBusy` toggled a `.disabled` class
+  // that no stylesheet rule anywhere defined, so the pane kept offering clicks
+  // while the agent's cascade held the connection. Each of those reads throws
+  // SQLITE_LOCKED, and every handler awaited it with no catch — the rejection
+  // went nowhere. The symptom the user described was "the picker was wonky and
+  // didn't work sometimes; I had to refresh to get it unstuck."
+
+  test('a read that fails says so instead of leaving the pane silent', async ({ page }) => {
+    await bootPage(page);
+    await seed(page, 'Report me', 'SELECT 1 AS one');
+    await refresh(page);
+
+    const outcome = await page.evaluate(async () => {
+      const a = window.__agent;
+      const orig = a.sqlite3.statements.bind(a.sqlite3);
+      let armed = true;
+      a.sqlite3.statements = (db, sql) => {
+        // Specific to the pane's own list query. The health report reads
+        // `FROM artifacts ORDER BY id` too, and swallowing that one instead proves
+        // nothing — its failure is already handled elsewhere.
+        if (armed && /updated_at.*FROM artifacts/.test(String(sql))) {
+          armed = false;
+          throw new Error('SQLITE_LOCKED: database table is locked');
+        }
+        return orig(db, sql);
+      };
+      try {
+        await a.artifactPane.refreshArtifacts();
+        const box = document.getElementById('artifact-health');
+        return { text: box.textContent, hidden: box.classList.contains('hidden') };
+      } finally {
+        a.sqlite3.statements = orig;
+      }
+    });
+
+    expect(outcome.hidden, 'the status line is shown, not hidden').toBe(false);
+    expect(outcome.text, 'it names what failed rather than showing nothing')
+      .toMatch(/Couldn.t load artifacts.*locked/i);
+  });
+
+  test('the pane stops offering clicks it cannot honour while the agent runs', async ({ page }) => {
+    await bootPage(page);
+    await seed(page, 'Busy check', 'SELECT 1 AS one');
+    await refresh(page);
+
+    await page.click('#btn-artifact-picker');
+    await page.waitForSelector('#artifact-list li');
+
+    const controls = await page.evaluate(() => {
+      window.__agent.artifactPane.setBusy(true);
+      return {
+        pickerDisabled: document.getElementById('btn-artifact-picker').disabled,
+        saveDisabled: document.getElementById('btn-artifact-save').disabled,
+        ariaBusy: document.getElementById('canvas-pane').getAttribute('aria-busy'),
+      };
+    });
+    expect(controls.pickerDisabled, 'the picker is not offered mid-turn').toBe(true);
+    expect(controls.saveDisabled).toBe(true);
+    expect(controls.ariaBusy).toBe('true');
+
+    // A click can land between the turn starting and the busy state applying, so
+    // the guard reports rather than doing nothing. Dispatched directly because the
+    // stylesheet already withholds these from the pointer.
+    const said = await page.evaluate(() => {
+      document.querySelector('#artifact-list li')?.click();
+      return new Promise((resolve) => setTimeout(() => resolve(
+        document.getElementById('artifact-health')?.textContent ?? ''), 400));
+    });
+    expect(said).toMatch(/mid-turn/i);
+
+    await page.evaluate(() => window.__agent.artifactPane.setBusy(false));
+    expect(await page.locator('#btn-artifact-picker').isEnabled()).toBe(true);
+  });
+
+  test('a wide artifact scrolls itself, not the pane', async ({ page }) => {
+    await bootPage(page);
+    const sql = 'SELECT 1 AS region, 2 AS product, 3 AS quarter, 4 AS revenue, '
+      + '5 AS units, 6 AS discount, 7 AS channel, 8 AS segment, 9 AS category, '
+      + '10 AS manager, 11 AS territory, 12 AS forecast, '
+      + "printf('%40s', 'a very wide cell indeed') AS remarks";
+    await seed(page, 'Wide', sql);
+    await refresh(page);
+
+    const m = await page.evaluate(() => {
+      const host = document.querySelector('.artifact-slot-body cssv-table');
+      const body = document.getElementById('artifact-body');
+      return {
+        hostOverflowX: getComputedStyle(host).overflowX,
+        hostScrolls: host.scrollWidth > host.clientWidth,
+        paneOverflows: body.scrollWidth > body.clientWidth + 1,
+      };
+    });
+
+    // The component sizes columns to their content and says so: `.clip` is
+    // renderer-owned and neither the page nor an artifact's CSS may restyle it.
+    // That is fine — but it declared no overflow, so a wide table spilled out of
+    // the artifact and the pane body took the scrollbar. One sideways scroll for
+    // every artifact, and widening the pane did not help the one that needed it.
+    expect(m.hostOverflowX, 'the artifact owns its own scroll').toBe('auto');
+    expect(m.hostScrolls, 'a 13-column table IS wider than the pane').toBe(true);
+    expect(m.paneOverflows, 'and the pane does not scroll sideways on its behalf').toBe(false);
+  });
 });

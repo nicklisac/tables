@@ -99,8 +99,17 @@ async function renderPaneNow() {
   const body = el('artifact-body');
   if (!body || !agent) return;
 
-  styles = await listStyles(agent.sqlite3, agent.db);
-  const all = await listArtifacts(agent.sqlite3, agent.db);
+  // These two reads were unguarded. A SQLITE_LOCKED from a turn holding the table
+  // rejected the whole render, the queue swallowed it, and the pane went on
+  // showing whatever was last there — or nothing, if this was the first render
+  // after boot. Reload was the only way out, which is what reloading fixed.
+  const { ok: stylesOk, value: styleRows } = await bgCall('load the style library', sayNews,
+    () => listStyles(agent.sqlite3, agent.db));
+  if (!stylesOk) return;
+  styles = styleRows;
+  const { ok: listOk, value: all } = await bgCall('load artifacts', sayNews,
+    () => listArtifacts(agent.sqlite3, agent.db));
+  if (!listOk) return;
   if (!visible.length || !all.some((a) => a.id === visible[0].id)) await loadSelection(all);
   // Re-read the visible rows rather than trusting the objects we picked up
   // earlier: a save from the source panel changes the very row being rendered,
@@ -148,6 +157,7 @@ function paintHealth(report) {
   const summary = summarizeFindings(report);
   box.textContent = summary ?? '';
   box.classList.toggle('hidden', !summary);
+  box.classList.remove('artifact-health--bad');
 }
 
 async function renderSlot(artifact) {
@@ -267,9 +277,95 @@ export function refreshArtifacts() {
   });
 }
 
+/**
+ * Reflect the agent's turn in the pane.
+ *
+ * This used to toggle a `.disabled` class that no stylesheet rule anywhere
+ * defined — the pane looked idle, kept offering clicks, and each click threw
+ * SQLITE_LOCKED into a handler with no catch. Which is how "the picker was
+ * wonky, I had to refresh to get it unstuck" happened: picking an artifact while
+ * a turn was running was a no-op that reported nothing.
+ */
 export function setBusy(on) {
   busy = !!on;
-  el('canvas-pane')?.classList.toggle('disabled', busy);
+  const pane = el('canvas-pane');
+  pane?.classList.toggle('busy', busy);
+  pane?.setAttribute('aria-busy', String(busy));
+  // Actually disable, not just dim: a control that cannot succeed should not
+  // look like an offer. The reads are still refused by `uiCall` a moment later,
+  // because a click can arrive between the turn starting and this running.
+  for (const id of ['btn-artifact-picker', 'btn-artifact-new', 'btn-artifact-refresh',
+                    'btn-artifact-save', 'btn-artifact-delete']) {
+    const node = el(id);
+    if (node) node.disabled = busy;
+  }
+  if (busy) openPicker(false);
+}
+
+/* ── honest failure ──────────────────────────────────────────────────── */
+
+/**
+ * One place for "this interaction touches SQLite".
+ *
+ * Every pane handler used to await its query with no catch. When the agent's
+ * cascade holds a table, those reads throw SQLITE_LOCKED, and the rejection went
+ * nowhere: the picker would not open, a click on an artifact would not select it,
+ * [save] would not save, and the pane never said a word. Reloading was the only
+ * way back, because the only state that looked wrong was the pane's.
+ *
+ * A refusal you can read beats a no-op you have to diagnose.
+ */
+async function uiCall(where, say, fn) {
+  if (busy) {
+    say('The agent is mid-turn — try again once it finishes.');
+    return { ok: false };
+  }
+  try {
+    return { ok: true, value: await fn() };
+  } catch (e) {
+    console.warn(`[artifact-pane] ${where} failed:`, e);
+    say(`Couldn’t ${where}: ${e?.message ?? e}`);
+    return { ok: false };
+  }
+}
+
+/**
+ * `uiCall` without the busy refusal, for renders the pane starts itself.
+ *
+ * Refusing while the agent runs is about not tempting a person with a click that
+ * cannot land. A refresh the turn itself asked for is different: it should try,
+ * and say so if it could not, rather than silently skip the update it exists to
+ * make.
+ */
+async function bgCall(where, say, fn) {
+  try {
+    return { ok: true, value: await fn() };
+  } catch (e) {
+    console.warn(`[artifact-pane] ${where} failed:`, e);
+    say(`Couldn’t ${where}: ${e?.message ?? e}`);
+    return { ok: false };
+  }
+}
+
+/** One line of news in the pane's status slot. */
+function sayNews(message) {
+  const box = el('artifact-health');
+  if (!box) return;
+  if (!message) { paintHealth(healthReport); return; }
+  box.textContent = message;
+  box.classList.remove('hidden');
+  box.classList.add('artifact-health--bad');
+}
+
+/** The same, inside the picker, where the pane's status line is out of sight. */
+function sayPicker(message) {
+  const list = el('artifact-list');
+  if (!list) return;
+  const li = document.createElement('li');
+  li.className = 'artifact-pick-empty';
+  li.setAttribute('role', 'status');
+  li.textContent = message;
+  list.replaceChildren(li);
 }
 
 /* ── picker ──────────────────────────────────────────────────────────── */
@@ -283,8 +379,9 @@ async function paintPickerList(filter = '') {
   // slower earlier search would paint over the newer one and the list would
   // disagree with the text in the box.
   const token = ++searchToken;
-  const all = await listArtifacts(agent.sqlite3, agent.db);
-  if (token !== searchToken) return;
+  const { ok, value: all } = await uiCall('load artifacts',
+    (m) => token === searchToken && sayPicker(m), () => listArtifacts(agent.sqlite3, agent.db));
+  if (token !== searchToken || !ok) return;
   const needle = filter.trim().toLowerCase();
   const matches = needle
     ? all.filter((a) => a.name.toLowerCase().includes(needle) || a.sql.toLowerCase().includes(needle))
@@ -325,8 +422,9 @@ function openPicker(open) {
 }
 
 async function selectArtifact(id) {
-  const artifact = await getArtifact(agent.sqlite3, agent.db, id);
-  if (!artifact) return;
+  const { ok, value: artifact } = await uiCall('open that artifact', sayNews,
+    () => getArtifact(agent.sqlite3, agent.db, id));
+  if (!ok || !artifact) return;
   visible = [artifact];          // v1; a combined view pushes more than one
   openPicker(false);
   await saveSelection(id);
@@ -365,23 +463,27 @@ async function paintSource() {
 async function saveSource() {
   const a = visible[0];
   if (!a) return;
-  await updateArtifact(agent.sqlite3, agent.db, a.id, {
+  const { ok, value: saved } = await uiCall('save this artifact', sayNews, () => updateArtifact(agent.sqlite3, agent.db, a.id, {
     name: el('artifact-name').value.trim() || a.name,
     sql: el('artifact-sql').value.trim() || a.sql,
     style: el('artifact-style')?.value ?? a.style,
     css: el('artifact-css').value,
-  });
+  }));
+  if (!ok) return;
+  sayNews(null);
   await renderPane();
   await paintSource();
 }
 
 async function newArtifact() {
-  const created = await createArtifact(agent.sqlite3, agent.db, {
+  const { ok, value: created } = await uiCall('create an artifact', sayNews, () => createArtifact(agent.sqlite3, agent.db, {
     name: 'Untitled artifact',
     sql: 'SELECT 1 AS ok',
     style: DEFAULT_STYLE,
     css: '',
-  });
+  }));
+  if (!ok) return;
+  sayNews(null);
   await renderPane();
   await selectArtifact(created.id);
   // Open the source panel first: a collapsed <details> is display:none, and
@@ -397,7 +499,10 @@ async function removeArtifact() {
   const a = visible[0];
   if (!a) return;
   if (!window.confirm(`Delete the artifact “${a.name}”? The tables it reads are untouched.`)) return;
-  await deleteArtifact(agent.sqlite3, agent.db, a.id);
+  const { ok } = await uiCall('delete this artifact', sayNews,
+    () => deleteArtifact(agent.sqlite3, agent.db, a.id));
+  if (!ok) return;
+  sayNews(null);
   visible = [];
   await renderPane();
   await paintSource();
@@ -467,6 +572,7 @@ async function handleDrop(event) {
     }
   } catch (err) {
     console.warn('[artifact-pane] drop failed:', err);
+    sayNews(`Couldn’t make an artifact from that: ${err?.message ?? err}`);
   }
 }
 

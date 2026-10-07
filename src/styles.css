@@ -2464,6 +2464,19 @@ footer {
 
 .artifact-picker-caret { color: var(--text-muted); flex-shrink: 0; }
 
+/* The agent's turn holds the connection. Reads issued now throw SQLITE_LOCKED,
+   so the controls stop looking like offers rather than accepting a click that
+   cannot do anything and reporting nothing when it fails. */
+#canvas-pane.busy .artifact-picker-btn,
+#canvas-pane.busy .btn-sm:disabled {
+  opacity: 0.45;
+  cursor: progress;
+}
+
+#canvas-pane.busy .artifact-picker li { pointer-events: none; opacity: 0.5; }
+
+.artifact-health--bad { color: var(--red); }
+
 .artifact-health {
   margin: 0.45rem 0.6rem 0;
   padding: 0.3rem 0.5rem;
@@ -2601,6 +2614,23 @@ footer {
 
 .artifact-slot-meta { margin-left: auto; white-space: nowrap; }
 .artifact-slot-body { min-width: 0; }
+
+/* A wide table scrolls inside its own artifact, not across the whole pane.
+ *
+ * The vendored component sizes its inner wrapper to `max-content` — deliberate,
+ * columns get their natural width — and declares no overflow on the host, so a
+ * wide table overflowed visibly and the nearest scrollable ancestor, the pane
+ * body, picked up the scrollbar. Every artifact then shared one sideways scroll,
+ * and widening the pane did not help the one that actually needed it.
+ *
+ * The host is the narrowest box that can own that scroll. Its own `:host` rule
+ * only sets `display`, and outer-tree rules outrank `:host` for the host element,
+ * so this takes effect without editing the vendored file.
+ */
+.artifact-slot-body cssv-table {
+  max-width: 100%;
+  overflow-x: auto;
+}
 
 /* A style that no longer exists is reported, not silently unstyled. */
 .artifact-notice {
