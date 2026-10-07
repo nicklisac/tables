@@ -129,6 +129,12 @@ const markerExists = (page) =>
 test.describe('T33b — staged import + engine/cartridge boundary', () => {
   test('_manifest v1 is stamped into every export (frozen shape)', async ({ page }) => {
     await boot(page);
+    // The engine's own version, read live. What is frozen here is the manifest's
+    // SHAPE — its keys and their meanings — not the number, which moves every
+    // time the prompt bundle does. Pinning the literal turned a prompt edit into
+    // a broken cartridge test.
+    const enginePromptVersion = await queryValue(page,
+      `SELECT value FROM system_config WHERE key = 'prompt_version'`);
     const bytes = await exportCurrent(page);
     // node:sqlite .all() yields objects, not [k,v] pairs — map first.
     const manifest = withCartridgeDb(bytes, (db) =>
@@ -146,7 +152,7 @@ test.describe('T33b — staged import + engine/cartridge boundary', () => {
     expect(udfs).not.toContain('execute_sql');
     expect(udfs.sort()).toEqual([...udfs].sort()); // sorted + deduped by construction
     expect(JSON.parse(manifest.optional_features)).toEqual(['dashboard_html']);
-    expect(manifest.prompt_version).toBe('3');
+    expect(manifest.prompt_version).toBe(enginePromptVersion);
   });
 
   test('v0 back-compat: a cartridge without _manifest imports and is noted as pre-manifest', async ({ page }) => {
