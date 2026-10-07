@@ -1148,9 +1148,21 @@ is merged into T40b except what is marked **fixed here**.
   so the overflow escaped to `#artifact-body`, which took the scrollbar. Sideways
   scrolling panned the artifact's own header and notices out of view, and widening
   the pane did not help the artifact that needed it. The host now owns its scroll.
-  **True auto-fit is not available**: `.clip` is `width: max-content` by contract
-  and `observedAttributes` is `['src','key','lang']`, with SPEC §7.5 forbidding
-  other attributes. Fitting would mean a fork or an upstream change — see below.
+  **Fit is now the default, and no vendored file was touched.** The user asked for
+  no horizontal scroll by default, wrap instead, with scroll something the agent
+  opts into. The direct route was closed: `.clip` is `width: max-content` by
+  contract, `observedAttributes` is `['src','key','lang']`, and SPEC §7.5 forbids
+  other attributes — which is why an agent's own width edits had no effect (the
+  rule was unreachable, not wrong). The lever that does exist is the table's own
+  `max-width`, and only in absolute units: the wrapper sizes to max-content, so a
+  percentage is circular and reads as none. A `@layer tables-fit` in the artifact's
+  own stylesheet caps the table at `--tables-fit-width`, a custom property set on
+  the host — custom properties inherit across the shadow boundary, so a resize is
+  one property write rather than a re-render that would re-run the query per pixel
+  of a drag. Being a layer, house and artifact CSS override it unopposed: an
+  artifact takes its scrollbar back with `table { max-width: none }` or a column
+  `min-width`. Measured: a 933px table at a 420px pane becomes 420px with the long
+  cell wrapping (row height 32.5px → 208px).
 * **The agent was never told artifacts exist.** T40 shipped agent-writable
   artifacts and a stylesheet format, and the system prompt did not mention either.
   See *The agent guessed the format's contract* below.
@@ -1219,6 +1231,14 @@ everyone else. Fixed with `STOCK_PROMPT_SHA256`: past bundles are digested, so
   invites retrying a refusal, and a pre-image journaled before the statement is
   known to have run. Confirmed independently by T40b's own measurement of
   `SQLITE_LOCKED_TABLE`.
+* **Pane width — fixed here too.** The user also reported a ceiling: *"there is a
+  maximum size of the artifact pane which is 1/2 the browser width, as far as I can
+  tell. I think it should just automatically fit / be dynamic based on the sidebar
+  size."* `MAX_FRACTION` clamped the canvas at 50% and the explorer at 45% of the
+  window — the same wall on any monitor. The limit is now leftover space, so
+  collapsing the explorer genuinely widens the artifact pane, and the chat keeps a
+  380px floor that nothing else was enforcing (the center pane is `flex: 1;
+  min-width: 0`).
 * **Small batch.** `v_turn_boundaries.total_tokens` is repeated per row so `SUM()`
   returns 11.3M against a real 57K — rename to `context_tokens` ("I fell for it").
   FTS `rank` differences in the third decimal are ordering noise at 13 docs — needs
