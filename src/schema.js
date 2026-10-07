@@ -22,6 +22,7 @@ import {
   execParams,
   queryAll,
   queryValue,
+  sha256Hex,
 } from './utils.js';
 
 export {
@@ -44,7 +45,27 @@ export {
 // databases pick up the new prompt on next load — the same self-heal
 // pattern the drop+create triggers use).
 // =====================================================================
-export const SYSTEM_PROMPT_VERSION = 3;
+export const SYSTEM_PROMPT_VERSION = 4;
+
+/**
+ * Every prompt bundle this engine has shipped as stock, by the version that
+ * introduced it.
+ *
+ * D1 refuses to overwrite an identity it cannot prove is the engine's own.
+ * Comparing only against the CURRENT text means a version bump can never reach a
+ * database that already has a prompt: the stored v3 bundle is not the v4 bundle,
+ * so it reads as "the user edited this", gets kept, and gets flagged
+ * `prompt_customized`. Engine improvements would then ship to new installs only
+ * and quietly freeze every existing one — and the flag also changes what a later
+ * cartridge import does, so the cost is not merely a stale prompt.
+ *
+ * A digest per past bundle makes "stock" provable again without keeping old
+ * prompt text around to serve. Add an entry whenever SYSTEM_PROMPT_VERSION goes
+ * up: sha256 over the exact template-literal body.
+ */
+const STOCK_PROMPT_SHA256 = {
+  3: '4bc0e6774fcf5a372348ea9009c35cf1c6efa505f82b7966932481acaac8c708',
+};
 
 export const SYSTEM_PROMPT = `You are Tables. You live inside a SQLite database in the user's browser.
 The tables are your body: your memory is in \`messages\`, your tools are functions you call,
@@ -65,6 +86,24 @@ How you work:
   \`SELECT SUBSTR(content, 1, 5000) FROM documents WHERE id = 123;\` — so a fetched page you only
   previewed can be read in slices without re-fetching it.
 - Writes are reversible — the user can rewind any turn — but you still only write what the task needs.
+
+Artifacts:
+- An artifact is a saved query plus a stylesheet, shown in the user's right pane. It is data in the
+  \`artifacts\` table (name, sql, style, css) and you write it with ordinary INSERT/UPDATE. It rewinds
+  with your turn and travels in cartridges, so treat it as something the user owns, not as scratch.
+- The stylesheet is CSSV, and its contract has three edges that bite:
+  * \`--cssv-key: column_name\` has to be declared once, on the table scope, before \`[data-key=...]\`
+    means anything. Without it your keyed rules match nothing and the artifact renders colourless.
+  * It cannot compare numbers. A threshold rule needs a column you computed in SQL
+    (\`CASE WHEN revenue > 1000 THEN 'high' END\`), styled by name — not a numeric test in CSS.
+  * Number formatting is opt-in. Raw numbers arrive ungrouped unless you ask.
+- Style cells as \`td[data-col="column_name"]\`, and check the names against the query you actually
+  saved: a selector naming a column the answer no longer returns is invisible breakage, and the pane
+  reports it. \`SELECT\` the query before styling it rather than remembering the columns.
+- Columns take their natural width and the component's own wrapper cannot be styled. A 14-column
+  artifact will scroll. If it should be readable, write a narrower query — that is the fix, not CSS.
+- \`artifact_styles\` holds the house styles the user wrote. Read them to match the house; rewriting one
+  changes every artifact that uses it, including ones that never mentioned your column.
 
 Voice:
 - Talk like a person, not a helpdesk. No "Great question!", no "Certainly!", no "I hope this helps!",
@@ -117,9 +156,14 @@ export async function migrateSystemPrompt(sqlite3, db) {
   if (stored === String(SYSTEM_PROMPT_VERSION)) return;
 
   const storedPrompt = await queryValue(sqlite3, db, `SELECT value FROM system_config WHERE key = 'system_prompt'`);
+  // Provable stock: absent, the seed placeholder, byte-identical to the bundle in
+  // use, or byte-identical to the bundle the STORED version shipped. That last
+  // term is what lets a version bump reach an existing database at all.
+  const expectedStock = STOCK_PROMPT_SHA256[Number(stored)];
   const looksStock = !storedPrompt
     || storedPrompt.includes('Prompt placeholder')
-    || storedPrompt === SYSTEM_PROMPT;
+    || storedPrompt === SYSTEM_PROMPT
+    || (!!expectedStock && await sha256Hex(storedPrompt) === expectedStock);
   if (!looksStock) {
     // Foreign-version prompt that is not provably stock — flag it customized
     // and keep it (never clobber identity we can't prove is the engine's).

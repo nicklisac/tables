@@ -7,6 +7,7 @@
 //     no-op (byte-stable — the prompt is the KV-cache prefix, T2),
 //   - the welcome card speaks in Tables' first person (both states) and the
 //     configured state's example chips route through the normal send path.
+import { readFileSync } from 'node:fs';
 import { test, expect } from '@playwright/test';
 import { bootPage, waitAgent, queryAll } from '../helpers.mjs';
 
@@ -88,5 +89,46 @@ test.describe('T31 — system prompt identity + welcome card', () => {
 
     // Tidy up: drop the fake provider so other tests see a fresh profile.
     await page.evaluate(() => localStorage.removeItem('sql-agent-config'));
+  });
+
+  // A version bump has to reach databases that already exist. D1 keeps any prompt
+  // it cannot prove is the engine's own, and comparing only against the CURRENT
+  // bundle means the previous bundle always looks like a user edit — so an engine
+  // improvement would ship to new installs and freeze every database already in
+  // use, while flagging them `prompt_customized` and changing what a later
+  // cartridge import does to them.
+  test('a stock prompt at an older version upgrades; an edited one is never clobbered', async ({ page }) => {
+    const v3 = readFileSync(new URL('../fixtures/system-prompt-v3.txt', import.meta.url), 'utf8');
+
+    await bootPage(page);
+    await queryAll(page, `UPDATE system_config SET value = ? WHERE key = 'system_prompt'`, [v3]);
+    await queryAll(page, `UPDATE system_config SET value = '3' WHERE key = 'prompt_version'`);
+    await queryAll(page, `DELETE FROM system_config WHERE key = 'prompt_customized'`);
+
+    await bootPage(page);
+
+    const after = await queryAll(page,
+      `SELECT (SELECT value FROM system_config WHERE key='prompt_version'),
+              (SELECT instr(value, '--cssv-key') > 0 FROM system_config WHERE key='system_prompt'),
+              COALESCE((SELECT value FROM system_config WHERE key='prompt_customized'), '')`);
+    expect(after[0][0], 'the version moved').toBe('4');
+    expect(after[0][1], 'provably-stock text was refreshed').toBe(1);
+    // Some builds write the flag as '0' rather than omitting it; either reads as
+    // "not customized". What must not happen is '1'.
+    expect(['', '0'], 'and it was NOT marked customized').toContain(after[0][2]);
+
+    // The other half of D1: something a person actually wrote still survives.
+    const mine = `${v3}\n\nMy own rule: never use semicolons.`;
+    await queryAll(page, `UPDATE system_config SET value = ? WHERE key = 'system_prompt'`, [mine]);
+    await queryAll(page, `UPDATE system_config SET value = '3' WHERE key = 'prompt_version'`);
+    await queryAll(page, `DELETE FROM system_config WHERE key = 'prompt_customized'`);
+
+    await bootPage(page);
+
+    const kept = await queryAll(page,
+      `SELECT (SELECT instr(value, 'never use semicolons') > 0 FROM system_config WHERE key='system_prompt'),
+              COALESCE((SELECT value FROM system_config WHERE key='prompt_customized'), '')`);
+    expect(kept[0][0], 'an edited prompt is kept').toBe(1);
+    expect(kept[0][1], 'and flagged so future builds leave it alone').toBe('1');
   });
 });
