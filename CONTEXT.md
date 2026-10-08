@@ -39,3 +39,7 @@ _Avoid_: template, theme, stock CSS, default styling
 **Style Library**:
 The set of house styles an artifact can wear, each carrying a description of when to use it, so the agent can choose one the way a person reads a menu.
 _Avoid_: style pack, presets, CSS store
+
+**Provenance**:
+Who issued a recorded write — the agent, the person at the keyboard, or the interface on their behalf. A turn says *when*; provenance says *who*, and a rewind only ever undoes the writes of the conversation it is rewinding.
+_Avoid_: author, actor, origin, "made by"

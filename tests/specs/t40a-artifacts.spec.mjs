@@ -97,8 +97,13 @@ test.describe('T40a — artifacts and the style library', () => {
 
     await page.evaluate(async ([turn]) => {
       const { sqlite3, db } = window.__agent;
-      const { setCurrentTurnId } = await import('/src/schema.js');
+      const { setCurrentTurnId, setCurrentSource } = await import('/src/schema.js');
+      // T42: impersonating a turn means claiming its provenance too. A write at
+      // turn 950 whose source is the app's is NOT this turn's to undo, and
+      // rewind.js now declines it — correctly, which is why this fixture has to
+      // say who it is (in a real turn, agent_turn_init says it).
       await setCurrentTurnId(sqlite3, db, turn);
+      await setCurrentSource(sqlite3, db, 'agent');
       for await (const stmt of sqlite3.statements(db,
         `INSERT INTO artifacts (name, sql, kind) VALUES ('Probe artifact', 'SELECT 1', 'cssv')`)) {
         await sqlite3.step(stmt);
@@ -107,10 +112,13 @@ test.describe('T40a — artifacts and the style library', () => {
         `UPDATE artifacts SET name = 'Renamed in the same turn'`)) {
         await sqlite3.step(stmt);
       }
+      await setCurrentSource(sqlite3, db, 'app');
     }, [TURN]);
 
     expect(await queryAll(page, `SELECT table_name, op FROM turn_changesets WHERE table_name = 'artifacts'`))
       .toEqual([['artifacts', 'I'], ['artifacts', 'U']], 'op is the changeset alphabet: I / U / D');
+    expect(await queryAll(page, `SELECT DISTINCT source FROM turn_changesets WHERE table_name = 'artifacts'`))
+      .toEqual([['agent']], 'T42: the write is journaled as the agent\'s');
     expect(await queryValue(page, `SELECT COUNT(*) FROM artifacts WHERE name = 'Renamed in the same turn'`)).toBe(1);
 
     await page.evaluate(async ([turn, sessionId]) => {

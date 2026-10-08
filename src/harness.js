@@ -18,7 +18,7 @@ import { SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE, SQLITE_UTF8, SQLITE_INSERT, 
 import { SQLITE_ROW } from './utils.js';
 import { IDBBatchAtomicVFS } from '../vendor/wa-sqlite-jspi/IDBBatchAtomicVFS.js';
 import { MemoryVFS } from '../vendor/wa-sqlite-jspi/MemoryVFS.js';
-import { SCHEMA_SQL, SYSTEM_PROMPT, migrateSystemPrompt, migrateTurnTables, migrateMessagesTable, migrateDashboardCardsTable, migrateDocumentsTable, migrateToolsTable, migrateArtifactsTable, seedCartridgeId, queryAll, isInternalTable, isProtectedObject, logDDL, sweepCaptureTriggers, extractTargetTables, extractDdlTableName, captureDropPreImage } from './schema.js';
+import { SCHEMA_SQL, SYSTEM_PROMPT, migrateSystemPrompt, migrateTurnTables, migrateMessagesTable, migrateDashboardCardsTable, migrateDocumentsTable, migrateToolsTable, migrateArtifactsTable, seedCartridgeId, clearTurnIdentity, queryAll, isInternalTable, isProtectedObject, logDDL, sweepCaptureTriggers, extractTargetTables, extractDdlTableName, captureDropPreImage } from './schema.js';
 import { runCompaction, queryActiveContextJson, resolveContextWindow } from './compaction.js';
 import { openArtifactGate, closeArtifactGate } from './artifact-integrity.js';
 import { getProvider, defaultMaxTokens } from './llm-provider.js';
@@ -1494,6 +1494,18 @@ export async function bootSqliteAgent(config = {}) {
     await seedCartridgeId(sqlite3, db);
   } catch (e) {
     console.warn('[harness] seedCartridgeId failed (non-fatal):', e.message);
+  }
+
+  // 9c-3. T42: nobody owns this connection while the engine is migrating. A
+  // previous session left an ambient turn id and provenance behind (they used to
+  // outlive the turn), and a write below — a seed fill, a shape migration —
+  // would then be journaled as the agent's inside a real turn, to be undone by a
+  // rewind of it. Runs after SCHEMA_SQL because session_context need not exist
+  // before it; main.js finishes boot by handing the connection back to the app.
+  try {
+    await clearTurnIdentity(sqlite3, db, 'engine');
+  } catch (e) {
+    console.warn('[harness] boot identity reset failed (non-fatal):', e.message);
   }
 
   // 9d. System prompt: install the current SYSTEM_PROMPT (version-gated by

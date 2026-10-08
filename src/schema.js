@@ -45,7 +45,7 @@ export {
 // databases pick up the new prompt on next load — the same self-heal
 // pattern the drop+create triggers use).
 // =====================================================================
-export const SYSTEM_PROMPT_VERSION = 5;
+export const SYSTEM_PROMPT_VERSION = 6;
 
 /**
  * Every prompt bundle this engine has shipped as stock, by the version that
@@ -66,6 +66,7 @@ export const SYSTEM_PROMPT_VERSION = 5;
 const STOCK_PROMPT_SHA256 = {
   3: '4bc0e6774fcf5a372348ea9009c35cf1c6efa505f82b7966932481acaac8c708',
   4: '96992a2681cae985cf96493727c02fa4de41fc3ee47aea7ed8ba3ee648f58592',
+  5: 'c32188b5a7db7d72e6630d91bc32b8b77ffbb5872d3f553ba06ed6c0efcc5e66',
 };
 
 export const SYSTEM_PROMPT = `You are Tables. You live inside a SQLite database in the user's browser.
@@ -87,6 +88,10 @@ How you work:
   \`SELECT SUBSTR(content, 1, 5000) FROM documents WHERE id = 123;\` — so a fetched page you only
   previewed can be read in slices without re-fetching it.
 - Writes are reversible — the user can rewind any turn — but you still only write what the task needs.
+- Every write is journaled in \`turn_changesets\` with who made it: \`source\` is 'agent' for yours,
+  'scratchpad' for the user's own \`!SQL\`, 'app' for what they did in the interface. A turn id says when,
+  not who — a row filed under your turn is not automatically yours, so read its source before you
+  conclude the app is writing behind you. A rewind replays your writes and leaves theirs alone.
 
 Artifacts:
 - An artifact is a saved query plus a stylesheet, shown in the user's right pane. It is data in the
@@ -357,6 +362,15 @@ VALUES ('current_turn_id', '');
 INSERT OR IGNORE INTO session_context (key, value)
 VALUES ('suppress_capture', '0');
 
+-- T42: WHO is writing. Stamped onto every changeset / DDL-log row beside
+-- current_turn_id, which only says WHEN. 'app' is the ambient identity: no
+-- conversation in progress. agent_turn_init flips it to 'agent' for the cascade,
+-- the scratchpad sets 'scratchpad', and the turn wrapper clears it back to 'app'
+-- on RELEASE (see clearTurnIdentity). Without the clear, a UI write made after a
+-- turn inherited that turn's id and was rewound with it (T42 data-loss path).
+INSERT OR IGNORE INTO session_context (key, value)
+VALUES ('current_source', 'app');
+
 -- =====================================================================
 -- 4. Messages (replaces agent_memory)
 -- =====================================================================
@@ -401,6 +415,11 @@ CREATE TABLE IF NOT EXISTS turn_changesets (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     turn_id     INTEGER NOT NULL,
     session_id  TEXT NOT NULL,
+    -- T42: provenance — who issued the write ('agent' | 'scratchpad' | 'app' |
+    -- 'engine' | 'host' | 'unknown'). turn_id answers WHEN; only source answers
+    -- WHO, and the two disagree whenever a write lands while a turn id is still
+    -- ambient. Rewind replays the conversation's own sources and leaves the rest.
+    source      TEXT NOT NULL DEFAULT 'unknown',
     table_name  TEXT NOT NULL,
     op          TEXT NOT NULL CHECK(op IN ('I', 'U', 'D')),  -- Insert / Update / Delete
     rowid       INTEGER,
@@ -424,6 +443,7 @@ CREATE TABLE IF NOT EXISTS turn_ddl_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     turn_id     INTEGER NOT NULL,
     session_id  TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT 'unknown',  -- T42: see turn_changesets.source
     table_name  TEXT,
     ddl_sql     TEXT NOT NULL,
     pre_image   TEXT,   -- JSON: { create_sql, rows }
@@ -1082,6 +1102,11 @@ AFTER INSERT ON messages
 WHEN NEW.role = 'user'
 BEGIN
     UPDATE session_context SET value = CAST(NEW.id AS TEXT) WHERE key = 'current_turn_id';
+    -- T42: the cascade's writes are the agent's, for the whole turn. Seeded
+    -- before the update because a cartridge exported before provenance existed
+    -- has no such row, and a bare UPDATE would silently set nothing.
+    INSERT OR IGNORE INTO session_context (key, value) VALUES ('current_source', 'agent');
+    UPDATE session_context SET value = 'agent' WHERE key = 'current_source';
 END;
 `;
 
@@ -1488,6 +1513,10 @@ export async function ensureCaptureTriggers(sqlite3, db, tableName) {
   const jsonExpr = (qual) =>
     'json_object(' + cols.map(c => `'${c}', ${qual}.${quoteIdent(c)}`).join(', ') + ')';
   const turnId = "CAST(COALESCE((SELECT value FROM session_context WHERE key='current_turn_id'), '0') AS INTEGER)";
+  // T42: provenance rides beside the turn id. Empty string reads as 'unknown'
+  // rather than as some caller's identity — an unattributed write is reported,
+  // not guessed at.
+  const source = "COALESCE(NULLIF((SELECT value FROM session_context WHERE key='current_source'), ''), 'unknown')";
   const sessId = "(SELECT value FROM session_context WHERE key='active_session_id')";
   // Skip capture while the rewind replay (or JS bulk DML) is running.
   const noCapture = "(SELECT COALESCE(value, '0') FROM session_context WHERE key='suppress_capture') != '1'";
@@ -1502,8 +1531,8 @@ export async function ensureCaptureTriggers(sqlite3, db, tableName) {
     CREATE TRIGGER ${insName} AFTER INSERT ON ${t}
     WHEN ${noCapture}
     BEGIN
-      INSERT INTO turn_changesets (turn_id, session_id, table_name, op, rowid, row_after)
-      VALUES (${turnId}, ${sessId}, '${tableName}', 'I', NEW.rowid, ${jsonExpr('NEW')});
+      INSERT INTO turn_changesets (turn_id, session_id, source, table_name, op, rowid, row_after)
+      VALUES (${turnId}, ${sessId}, ${source}, '${tableName}', 'I', NEW.rowid, ${jsonExpr('NEW')});
     END`);
 
   await execParams(sqlite3, db, `DROP TRIGGER IF EXISTS ${updName}`);
@@ -1511,8 +1540,8 @@ export async function ensureCaptureTriggers(sqlite3, db, tableName) {
     CREATE TRIGGER ${updName} AFTER UPDATE ON ${t}
     WHEN ${noCapture}
     BEGIN
-      INSERT INTO turn_changesets (turn_id, session_id, table_name, op, rowid, row_before, row_after)
-      VALUES (${turnId}, ${sessId}, '${tableName}', 'U', OLD.rowid, ${jsonExpr('OLD')}, ${jsonExpr('NEW')});
+      INSERT INTO turn_changesets (turn_id, session_id, source, table_name, op, rowid, row_before, row_after)
+      VALUES (${turnId}, ${sessId}, ${source}, '${tableName}', 'U', OLD.rowid, ${jsonExpr('OLD')}, ${jsonExpr('NEW')});
     END`);
 
   await execParams(sqlite3, db, `DROP TRIGGER IF EXISTS ${delName}`);
@@ -1520,8 +1549,8 @@ export async function ensureCaptureTriggers(sqlite3, db, tableName) {
     CREATE TRIGGER ${delName} AFTER DELETE ON ${t}
     WHEN ${noCapture}
     BEGIN
-      INSERT INTO turn_changesets (turn_id, session_id, table_name, op, rowid, row_before)
-      VALUES (${turnId}, ${sessId}, '${tableName}', 'D', OLD.rowid, ${jsonExpr('OLD')});
+      INSERT INTO turn_changesets (turn_id, session_id, source, table_name, op, rowid, row_before)
+      VALUES (${turnId}, ${sessId}, ${source}, '${tableName}', 'D', OLD.rowid, ${jsonExpr('OLD')});
     END`);
 }
 
@@ -1694,21 +1723,83 @@ export async function setSuppressCapture(sqlite3, db, on) {
     [on ? '1' : '0']);
 }
 
-/** Set the current turn identity (JS sets negative ids for scratchpad writes). */
-export async function setCurrentTurnId(sqlite3, db, turnId) {
+/**
+ * Set the current turn identity (JS sets negative ids for scratchpad writes).
+ *
+ * T42: the optional `source` exists because a turn id without provenance is a
+ * half-truth — the capture triggers stamp both, and a caller that impersonates a
+ * turn (a tool path, a test fixture) without claiming provenance gets whatever
+ * source is ambient, which rewind then treats as somebody else's write.
+ */
+export async function setCurrentTurnId(sqlite3, db, turnId, source = null) {
   await execParams(sqlite3, db,
     `UPDATE session_context SET value = ? WHERE key = 'current_turn_id'`,
     [String(turnId)]);
+  if (source) await setCurrentSource(sqlite3, db, source);
+}
+
+/**
+ * T42: the closed vocabulary of write provenance — who issued a captured write.
+ *   agent      the ReAct cascade (execute_sql, materialize, tool auto-ingest)
+ *   scratchpad a human's !SQL / !!SQL command
+ *   app        the app's own UI flows (artifact pane, explorer, CSV import, pin)
+ *   engine     boot migrations and other engine-owned writes
+ *   host       a standalone host console (host/tables.py) outside its own loop
+ *   unknown    no identity was set — legacy rows, and any write that arrived
+ *              with the ambient source empty
+ */
+export const CHANGESET_SOURCES = Object.freeze(['agent', 'scratchpad', 'app', 'engine', 'host', 'unknown']);
+
+/** Set who the capture triggers should credit (see CHANGESET_SOURCES).
+ *  Upserted: a cartridge whose session_context lacks the key still gets a
+ *  provenance, rather than an UPDATE that matches nothing. */
+export async function setCurrentSource(sqlite3, db, source) {
+  const value = CHANGESET_SOURCES.includes(source) ? source : 'unknown';
+  await execParams(sqlite3, db,
+    `INSERT INTO session_context (key, value) VALUES ('current_source', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    [value]);
+}
+
+/**
+ * T42: end the conversation's claim on the connection's identity.
+ *
+ * The ambient turn identity outliving its turn is the T42 data-loss path: a UI
+ * write made after a turn stamped itself with that turn's id, so rewinding the
+ * agent's turn replayed the human's writes too. turn_id 0 with source 'app' is
+ * the state with no conversation in progress — what a fresh database starts in,
+ * and (per evictChangesets) the sentinel that already means "no turn identity".
+ *
+ * @param {string} [source] who owns writes from here: 'app' in the browser, or
+ *   'engine' while boot migrations run, so a seed write is not filed as the
+ *   agent's inside whatever turn the last session left behind.
+ */
+export async function clearTurnIdentity(sqlite3, db, source = 'app') {
+  await execParams(sqlite3, db,
+    `INSERT INTO session_context (key, value) VALUES ('current_turn_id', '')
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+  await setCurrentSource(sqlite3, db, source);
+}
+
+/** Read the ambient provenance (what the capture triggers would stamp). */
+export async function getCurrentSource(sqlite3, db) {
+  const v = await queryValue(sqlite3, db,
+    `SELECT value FROM session_context WHERE key = 'current_source'`);
+  return v || 'unknown';
 }
 
 /**
  * Log a DDL statement to turn_ddl_log for the current turn, with an optional
  * pre-image ({ create_sql, rows }) so it can be undone on rewind.
+ *
+ * `source` defaults to the ambient provenance so a DDL row and the changeset
+ * rows of the same operation always agree about who issued it.
  */
-export async function logDDL(sqlite3, db, { turnId, sessionId, tableName = null, ddlSql, preImage = null }) {
+export async function logDDL(sqlite3, db, { turnId, sessionId, tableName = null, ddlSql, preImage = null, source = null }) {
+  const src = source || await getCurrentSource(sqlite3, db);
   await execParams(sqlite3, db,
-    `INSERT INTO turn_ddl_log (turn_id, session_id, table_name, ddl_sql, pre_image) VALUES (?, ?, ?, ?, ?)`,
-    [turnId, sessionId, tableName, ddlSql, preImage ? JSON.stringify(preImage) : null]);
+    `INSERT INTO turn_ddl_log (turn_id, session_id, source, table_name, ddl_sql, pre_image) VALUES (?, ?, ?, ?, ?, ?)`,
+    [turnId, sessionId, src, tableName, ddlSql, preImage ? JSON.stringify(preImage) : null]);
 }
 
 /** Best-effort object name from a CREATE/DROP/ALTER statement (null if unparseable).
@@ -1857,6 +1948,21 @@ export async function migrateTurnTables(sqlite3, db) {
     const rows = await queryAll(sqlite3, db, `PRAGMA table_info(${table})`);
     return rows.some(([, name]) => name === col);
   };
+  // T42: provenance. Pre-existing rows cannot be attributed after the fact — the
+  // sign of their turn_id is evidence of intent, not proof of who wrote them
+  // (a stale ambient turn id filed plenty of UI writes under an agent turn), so
+  // they read 'unknown' and rewind treats them as it always did.
+  for (const table of ['turn_changesets', 'turn_ddl_log']) {
+    try {
+      if (!(await hasCol(table, 'source'))) {
+        console.warn(`[schema] ${table}.source missing — adding (T42)`);
+        await execParams(sqlite3, db,
+          `ALTER TABLE ${table} ADD COLUMN source TEXT NOT NULL DEFAULT 'unknown'`);
+      }
+    } catch (e) {
+      console.warn(`[schema] migrateTurnTables(${table}) source failed (non-fatal):`, e.message);
+    }
+  }
   for (const table of ['turn_changesets', 'turn_ddl_log']) {
     try {
       if (!(await hasCol(table, 'seq'))) continue;

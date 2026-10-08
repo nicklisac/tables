@@ -22,36 +22,74 @@ import {
   sweepCaptureTriggers,
   dropCaptureTriggers,
 } from './schema.js';
+import { queryValue } from './utils.js';
 import { classifyDdl } from './reference-integrity.js';
+
+/**
+ * T42: provenance a rewind replays.
+ *
+ * `turn_id` says WHEN a write happened; `source` says WHO wrote it. A rewind
+ * rewinds the conversation, so it undoes the writes the conversation issued:
+ * the agent's, and the human's scratchpad commands after the point (their
+ * bubbles are hidden by the rewind, so their data has to go too). `app`,
+ * `engine` and `host` writes are NOT the conversation's, even when a stale
+ * ambient turn id filed them inside one — undoing those is the T42 data-loss
+ * path ("rewinding me eats your scratch work"), so they are left in place and
+ * named in the confirmation instead.
+ *
+ * `unknown` is journaled provenance (rows written before T42). They keep
+ * today's behavior — silently skipping them would leave a half-rewound
+ * database — but the confirm says so.
+ */
+const REPLAY_SOURCES = ['agent', 'scratchpad', 'unknown'];
+const SOURCE_PH = REPLAY_SOURCES.map(() => '?').join(', ');
+const REPLAY_SOURCE_SQL = `source IN (${SOURCE_PH})`;
+
+/** Sources a rewind deliberately leaves alone. */
+const KEPT_SOURCES = ['app', 'engine', 'host'];
+const KEPT_SOURCE_SQL = `source IN (${KEPT_SOURCES.map(() => '?').join(', ')})`;
+
+const OP_LABEL = { I: 'inserts', U: 'updates', D: 'deletes' };
+
+/** `table N op` phrases for one journal, over a rewind range and source set. */
+async function describeJournal(sqlite3, db, sessionId, rangeSql, rangeParams, sourceSql, sources) {
+  const rows = await queryAll(sqlite3, db, `
+    SELECT table_name, op, COUNT(*) AS n
+    FROM turn_changesets
+    WHERE session_id = ? AND ${rangeSql} AND ${sourceSql}
+    GROUP BY table_name, op
+    ORDER BY table_name, op
+  `, [sessionId, ...rangeParams, ...sources]);
+  const parts = [];
+  for (const [t, op, n] of rows) parts.push(`${n} ${OP_LABEL[op] || op.toLowerCase()} on \`${t}\``);
+  const ddls = await queryValue(sqlite3, db, `
+    SELECT COUNT(*) FROM turn_ddl_log
+    WHERE session_id = ? AND ${rangeSql} AND ${sourceSql}
+  `, [sessionId, ...rangeParams, ...sources]);
+  if (ddls) parts.push(`${ddls} DDL statement${ddls === 1 ? '' : 's'}`);
+  return parts;
+}
 
 /**
  * Human-readable summary of the changes that would be undone by rewinding to
  * before `beforeTurnId` (for the confirmation modal).
+ *
+ * T42: the destructive direction gets said out loud. Writes whose provenance is
+ * not the conversation's are reported as left-behind rather than silently
+ * rolled back with the turn they happen to be filed under.
  */
 export async function getChangesetSummary(sqlite3, db, sessionId, beforeTurnId) {
   // Match the replay scope in rewindToBeforeTurn: real turns at/after the
   // point (turn_id >= N) plus scratchpad commands issued after it
   // (turn_id = -messageId <= -N).
-  const rows = await queryAll(sqlite3, db, `
-    SELECT table_name, op, COUNT(*) AS n
-    FROM turn_changesets
-    WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?)
-    GROUP BY table_name, op
-    ORDER BY table_name, op
-  `, [sessionId, beforeTurnId, -beforeTurnId]);
-  const parts = [];
-  const opLabel = { I: 'inserts', U: 'updates', D: 'deletes' };
-  for (const [t, op, n] of rows) {
-    parts.push(`${n} ${opLabel[op] || op.toLowerCase()} on \`${t}\``);
-  }
-  // DDL is logged separately (turn_ddl_log) — count it so the dialog doesn't
-  // claim "no data changes" for a turn that created/dropped a table.
-  const ddls = await queryAll(sqlite3, db, `
-    SELECT COUNT(*) FROM turn_ddl_log WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?)
-  `, [sessionId, beforeTurnId, -beforeTurnId]);
-  const ddlCount = ddls[0]?.[0] || 0;
-  if (ddlCount) parts.push(`${ddlCount} DDL statement${ddlCount === 1 ? '' : 's'}`);
-  return parts.length ? parts.join(', ') : '(no data changes recorded for these turns)';
+  const range = '(turn_id >= ? OR turn_id <= ?)';
+  const params = [beforeTurnId, -beforeTurnId];
+  const parts = await describeJournal(sqlite3, db, sessionId, range, params, REPLAY_SOURCE_SQL, REPLAY_SOURCES);
+  const kept = await describeJournal(sqlite3, db, sessionId, range, params, KEPT_SOURCE_SQL, KEPT_SOURCES);
+  const text = parts.length ? parts.join(', ') : '(no data changes recorded for these turns)';
+  return kept.length
+    ? `${text}\n\nLeft alone (not the conversation's writes, though they are filed\nunder these turns): ${kept.join(', ')}`
+    : text;
 }
 
 /** Re-insert a row (from a JSON row image) at a specific rowid. */
@@ -206,31 +244,51 @@ async function tableExists(sqlite3, db, tableName) {
  *   - rename + drop + write: undoing the writes and then restoring the dropped
  *     table from its pre-image puts those writes back. The ordering below fixes
  *     rename + write, which is the case people actually hit, and not this one.
+ *
+ * T42 adds a third, and it is reported rather than papered over: a write whose
+ * inverse cannot run because its table is gone (renamed or dropped by a source
+ * this rewind leaves alone) is SKIPPED, and its journal row is left in place —
+ * consuming a journal nothing replayed would erase the only evidence that the
+ * state is half-rewound. The caller reports the count.
+ *
+ * @returns {{changeIds: number[], ddlIds: number[], skipped: Array<{table: string, op: string}>}}
+ *   the journal rows actually replayed (so the caller consumes exactly those)
+ *   and the ones it could not.
  */
 async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
   const ddls = await queryAll(sqlite3, db, `
-    SELECT table_name, ddl_sql, pre_image
+    SELECT id, table_name, ddl_sql, pre_image
     FROM turn_ddl_log
-    WHERE session_id = ? AND turn_id = ?
+    WHERE session_id = ? AND turn_id = ? AND ${REPLAY_SOURCE_SQL}
     ORDER BY id DESC
-  `, [sessionId, turnId]);
+  `, [sessionId, turnId, ...REPLAY_SOURCES]);
+
+  const ddlIds = ddls.map(([id]) => id);
 
   const replayDdl = async () => {
-    for (const [tableName, ddlSql, preImageJson] of ddls) {
+    for (const [, tableName, ddlSql, preImageJson] of ddls) {
       await replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson);
     }
   };
 
   const changes = await queryAll(sqlite3, db, `
-    SELECT op, table_name, rowid, row_before, row_after
+    SELECT id, op, table_name, rowid, row_before, row_after
     FROM turn_changesets
-    WHERE session_id = ? AND turn_id = ?
+    WHERE session_id = ? AND turn_id = ? AND ${REPLAY_SOURCE_SQL}
     ORDER BY id DESC
-  `, [sessionId, turnId]);
+  `, [sessionId, turnId, ...REPLAY_SOURCES]);
+
+  const changeIds = [];
+  const skipped = [];
 
   const replayDml = async () => {
-    for (const [op, tableName, rowid, rowBeforeJson] of changes) {
-      if (!(await tableExists(sqlite3, db, tableName))) continue;
+    for (const [id, op, tableName, rowid, rowBeforeJson] of changes) {
+      if (!(await tableExists(sqlite3, db, tableName))) {
+        // T42: an inverse with no table to run against. Leave the journal.
+        skipped.push({ table: tableName, op });
+        continue;
+      }
+      changeIds.push(id);
       if (op === 'I') {
         await execParams(sqlite3, db,
           `DELETE FROM ${quoteIdent(tableName)} WHERE rowid = ?`, [rowid]);
@@ -261,7 +319,14 @@ async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
   // addressed to a table that no longer existed — skipped by the existence check,
   // so the turn's rows silently survived the rewind — or, for a column rename,
   // thrown on `no such column`, which aborted the whole rewind.
-  const renamed = ddls.some(([, ddlSql]) => {
+  //
+  // T42: the decision reads EVERY rename in the turn, not only the ones this
+  // rewind replays. A rename the rewind leaves alone still renames the table the
+  // changesets are addressed to, so the DML still has to go first.
+  const nameMovers = await queryAll(sqlite3, db, `
+    SELECT ddl_sql FROM turn_ddl_log WHERE session_id = ? AND turn_id = ?
+  `, [sessionId, turnId]);
+  const renamed = nameMovers.some(([ddlSql]) => {
     const op = classifyDdl(ddlSql)?.op;
     return op === 'rename-table' || op === 'rename-column';
   });
@@ -273,6 +338,24 @@ async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
     await replayDdl();
     await replayDml();
   }
+
+  return { changeIds, ddlIds, skipped };
+}
+
+/**
+ * Consume journal rows by id, in chunks (SQLite caps the variables per statement).
+ *
+ * T42: the rewind consumes what it actually replayed rather than everything in
+ * the range, so a write it declined to touch (another author's) or could not
+ * touch (its table is gone) keeps its journal.
+ */
+async function deleteByIds(sqlite3, db, table, ids) {
+  const CHUNK = 400;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    await execParams(sqlite3, db,
+      `DELETE FROM ${table} WHERE id IN (${chunk.map(() => '?').join(', ')})`, chunk);
+  }
 }
 
 /**
@@ -280,6 +363,11 @@ async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
  * started at `beforeTurnId`: undo every real turn with turn_id >= beforeTurnId
  * plus every scratchpad command issued after it, and flag all messages at/after
  * the point (`rewound = 1`) so the chat pane and the agent's context hide them.
+ *
+ * T42: the replay is scoped by provenance, not just by turn id — writes the
+ * conversation did not issue (source `app` / `engine` / `host`) are left in
+ * place even when a stale ambient turn id filed them inside the range, and the
+ * marker row says how many.
  *
  * @returns {number} the number of turns undone.
  */
@@ -289,23 +377,45 @@ export async function rewindToBeforeTurn(sqlite3, db, sessionId, beforeTurnId) {
   // Suppress capture so the undo DML is not recorded as a new turn.
   await setSuppressCapture(sqlite3, db, true);
   try {
+    // What this rewind will NOT touch, so the marker row can say it out loud.
+    const keptWrites = await queryValue(sqlite3, db, `
+      SELECT
+        (SELECT COUNT(*) FROM turn_changesets
+          WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?) AND (${KEPT_SOURCE_SQL}))
+      + (SELECT COUNT(*) FROM turn_ddl_log
+          WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?) AND (${KEPT_SOURCE_SQL}))
+    `, [sessionId, beforeTurnId, -beforeTurnId, ...KEPT_SOURCES,
+        sessionId, beforeTurnId, -beforeTurnId, ...KEPT_SOURCES]);
+
     // Real turns at/after the point (turn_id >= N) PLUS scratchpad commands
     // issued after it (turn_id = -messageId <= -N): their bubbles are hidden
     // by the flag below, so their data must be undone too. Already-consumed
     // turns (a prior rewind) are absent from the logs and thus skipped — no
     // double-undo. Ordered newest message first (real: turn_id DESC;
-    // scratchpad: most negative first).
+    // scratchpad: most negative first). T42: only turns holding a source this
+    // rewind replays; a turn whose only rows are the app's is not a turn of
+    // this conversation and drops out of the list entirely.
     const turns = await queryAll(sqlite3, db, `
       SELECT turn_id FROM (
-        SELECT turn_id FROM turn_changesets WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?)
+        SELECT turn_id FROM turn_changesets
+          WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?) AND ${REPLAY_SOURCE_SQL}
         UNION
-        SELECT turn_id FROM turn_ddl_log WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?)
+        SELECT turn_id FROM turn_ddl_log
+          WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?) AND ${REPLAY_SOURCE_SQL}
       )
       ORDER BY CASE WHEN turn_id > 0 THEN turn_id ELSE -turn_id END DESC
-    `, [sessionId, beforeTurnId, -beforeTurnId, sessionId, beforeTurnId, -beforeTurnId]);
+    `, [sessionId, beforeTurnId, -beforeTurnId, ...REPLAY_SOURCES,
+        sessionId, beforeTurnId, -beforeTurnId, ...REPLAY_SOURCES]);
 
+    const applied = { changes: [], ddl: [] };
+    const skipped = [];
     for (const [turnId] of turns) {
-      await replayTurnInverse(sqlite3, db, sessionId, turnId);
+      const r = await replayTurnInverse(sqlite3, db, sessionId, turnId);
+      // Looped rather than spread: one turn's journal can be tens of thousands of
+      // rows, and push(...hugeArray) overflows the argument list.
+      for (const id of r.changeIds) applied.changes.push(id);
+      for (const id of r.ddlIds) applied.ddl.push(id);
+      for (const s of r.skipped) skipped.push(s);
     }
 
     // T3 chat rewind: flag every row at/after the rewind point so the chat
@@ -324,19 +434,24 @@ export async function rewindToBeforeTurn(sqlite3, db, sessionId, beforeTurnId) {
     try {
       await execParams(sqlite3, db,
         `INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`,
-        [sessionId, `⟲ Database and conversation rewound to before message #${beforeTurnId} (later messages are hidden from the chat and from my context; the audit log is preserved).`]);
+        [sessionId, `⟲ Database and conversation rewound to before message #${beforeTurnId} (later messages are hidden from the chat and from my context; the audit log is preserved).`
+          + (keptWrites
+            ? ` ${keptWrites} write${keptWrites === 1 ? '' : 's'} filed under these turns were not mine or the scratchpad's, so I left them alone.`
+            : '')
+          + (skipped.length
+            ? ` ${skipped.length} change${skipped.length === 1 ? '' : 's'} had no table to undo against (${[...new Set(skipped.map((s) => s.table))].join(', ')}) — the state is partly rewound and the journal still holds them.`
+            : '')]);
     } finally {
       await setSuppressCascade(sqlite3, db, false);
     }
 
     // Consume the rewound changesets (they've been applied in reverse) —
-    // real turns and the scratchpad turns after the point (see above).
-    await execParams(sqlite3, db,
-      `DELETE FROM turn_changesets WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?)`,
-      [sessionId, beforeTurnId, -beforeTurnId]);
-    await execParams(sqlite3, db,
-      `DELETE FROM turn_ddl_log WHERE session_id = ? AND (turn_id >= ? OR turn_id <= ?)`,
-      [sessionId, beforeTurnId, -beforeTurnId]);
+    // real turns and the scratchpad turns after the point (see above). T42:
+    // consume by the ids this replay actually applied, so a write it declined to
+    // touch (another author's) or could not touch (its table is gone) keeps its
+    // journal: still attributable, and evidence that the state is half-rewound.
+    await deleteByIds(sqlite3, db, 'turn_changesets', applied.changes);
+    await deleteByIds(sqlite3, db, 'turn_ddl_log', applied.ddl);
 
     await execParams(sqlite3, db, 'RELEASE rewind_sp');
 
@@ -363,26 +478,20 @@ export async function rewindToBeforeTurn(sqlite3, db, sessionId, beforeTurnId) {
 /**
  * T9: human-readable summary of what a scratchpad rewind (turn_id <= turnId,
  * turnId negative) would undo — for the confirmation modal.
+ *
+ * T42: same provenance split as a real-turn rewind. A stale ambient id could
+ * file a UI write under a scratchpad command too (turn_id <= -N covers it), and
+ * that write is not the command's to undo.
  */
 export async function getScratchpadChangesetSummary(sqlite3, db, sessionId, turnId) {
-  const rows = await queryAll(sqlite3, db, `
-    SELECT table_name, op, COUNT(*) AS n
-    FROM turn_changesets
-    WHERE session_id = ? AND turn_id <= ?
-    GROUP BY table_name, op
-    ORDER BY table_name, op
-  `, [sessionId, turnId]);
-  const parts = [];
-  const opLabel = { I: 'inserts', U: 'updates', D: 'deletes' };
-  for (const [t, op, n] of rows) {
-    parts.push(`${n} ${opLabel[op] || op.toLowerCase()} on \`${t}\``);
-  }
-  const ddls = await queryAll(sqlite3, db, `
-    SELECT COUNT(*) FROM turn_ddl_log WHERE session_id = ? AND turn_id <= ?
-  `, [sessionId, turnId]);
-  const ddlCount = ddls[0]?.[0] || 0;
-  if (ddlCount) parts.push(`${ddlCount} DDL statement${ddlCount === 1 ? '' : 's'}`);
-  return parts.length ? parts.join(', ') : '(no data changes recorded for these commands)';
+  const range = 'turn_id <= ?';
+  const params = [turnId];
+  const parts = await describeJournal(sqlite3, db, sessionId, range, params, REPLAY_SOURCE_SQL, REPLAY_SOURCES);
+  const kept = await describeJournal(sqlite3, db, sessionId, range, params, KEPT_SOURCE_SQL, KEPT_SOURCES);
+  const text = parts.length ? parts.join(', ') : '(no data changes recorded for these commands)';
+  return kept.length
+    ? `${text}\n\nLeft alone (not this command's writes): ${kept.join(', ')}`
+    : text;
 }
 
 /**
@@ -401,16 +510,32 @@ export async function rewindToBeforeScratchpadTurn(sqlite3, db, sessionId, turnI
   try {
     const turns = await queryAll(sqlite3, db, `
       SELECT turn_id FROM (
-        SELECT turn_id FROM turn_changesets WHERE session_id = ? AND turn_id <= ?
+        SELECT turn_id FROM turn_changesets
+          WHERE session_id = ? AND turn_id <= ? AND ${REPLAY_SOURCE_SQL}
         UNION
-        SELECT turn_id FROM turn_ddl_log WHERE session_id = ? AND turn_id <= ?
+        SELECT turn_id FROM turn_ddl_log
+          WHERE session_id = ? AND turn_id <= ? AND ${REPLAY_SOURCE_SQL}
       )
       ORDER BY turn_id ASC
-    `, [sessionId, turnId, sessionId, turnId]);
+    `, [sessionId, turnId, ...REPLAY_SOURCES, sessionId, turnId, ...REPLAY_SOURCES]);
 
+    const applied = { changes: [], ddl: [] };
+    const skipped = [];
     for (const [t] of turns) {
-      await replayTurnInverse(sqlite3, db, sessionId, t);
+      const r = await replayTurnInverse(sqlite3, db, sessionId, t);
+      for (const id of r.changeIds) applied.changes.push(id);
+      for (const id of r.ddlIds) applied.ddl.push(id);
+      for (const s of r.skipped) skipped.push(s);
     }
+
+    // T42: what this scratchpad rewind leaves alone, so the marker can say it.
+    const keptWrites = await queryValue(sqlite3, db, `
+      SELECT
+        (SELECT COUNT(*) FROM turn_changesets
+          WHERE session_id = ? AND turn_id <= ? AND (${KEPT_SOURCE_SQL}))
+      + (SELECT COUNT(*) FROM turn_ddl_log
+          WHERE session_id = ? AND turn_id <= ? AND (${KEPT_SOURCE_SQL}))
+    `, [sessionId, turnId, ...KEPT_SOURCES, sessionId, turnId, ...KEPT_SOURCES]);
 
     // Marker so the agent knows the data changed under it. The marker is
     // in-context (default) — unlike the private scratchpad rows it replaces.
@@ -418,18 +543,21 @@ export async function rewindToBeforeScratchpadTurn(sqlite3, db, sessionId, turnI
     try {
       await execParams(sqlite3, db,
         `INSERT INTO messages (session_id, role, content) VALUES (?, 'assistant', ?)`,
-        [sessionId, `⟲ Database state rewound to before scratchpad command #${-turnId} (data-only; conversation history preserved).`]);
+        [sessionId, `⟲ Database state rewound to before scratchpad command #${-turnId} (data-only; conversation history preserved).`
+          + (keptWrites
+            ? ` ${keptWrites} write${keptWrites === 1 ? '' : 's'} filed under these commands were not the scratchpad's, so I left them alone.`
+            : '')
+          + (skipped.length
+            ? ` ${skipped.length} change${skipped.length === 1 ? '' : 's'} had no table to undo against (${[...new Set(skipped.map((s) => s.table))].join(', ')}) — the state is partly rewound and the journal still holds them.`
+            : '')]);
     } finally {
       await setSuppressCascade(sqlite3, db, false);
     }
 
-    // Consume the rewound changesets (they've been applied in reverse).
-    await execParams(sqlite3, db,
-      `DELETE FROM turn_changesets WHERE session_id = ? AND turn_id <= ?`,
-      [sessionId, turnId]);
-    await execParams(sqlite3, db,
-      `DELETE FROM turn_ddl_log WHERE session_id = ? AND turn_id <= ?`,
-      [sessionId, turnId]);
+    // Consume the rewound changesets — by id, exactly what the replay applied
+    // (see the real-turn path for why a range DELETE is the wrong shape now).
+    await deleteByIds(sqlite3, db, 'turn_changesets', applied.changes);
+    await deleteByIds(sqlite3, db, 'turn_ddl_log', applied.ddl);
 
     await execParams(sqlite3, db, 'RELEASE rewind_sp');
 

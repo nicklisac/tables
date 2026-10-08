@@ -25,7 +25,8 @@
  */
 
 import {
-  setSuppressCascade, setCurrentTurnId, evictChangesets,
+  setSuppressCascade, setCurrentTurnId, setCurrentSource, clearTurnIdentity,
+  evictChangesets,
   logDDL, sweepCaptureTriggers, extractTargetTables, isProtectedObject,
   extractDdlTableName, captureDropPreImage,
 } from './schema.js';
@@ -311,7 +312,9 @@ export async function runScratchpad(cmd, rawText) {
         // 2. Negative turn identity: -M. The agent_turn_init trigger set
         //    current_turn_id = +M on the insert; overwrite BEFORE any DML so
         //    the capture triggers stamp this command's changes with -M.
-        await setCurrentTurnId(sqlite3, db, -M);
+        //    T42: and claim the provenance — this is a human writing, not the
+        //    agent, even though the trigger fired for the same row.
+        await setCurrentTurnId(sqlite3, db, -M, 'scratchpad');
 
         // 3. Execute (confirms may pause here; a cancel throws).
         const { results, infos } = await execScratchSql(sqlite3, db, cmd.sql, -M, ctx.getSessionId());
@@ -375,6 +378,12 @@ export async function runScratchpad(cmd, rawText) {
     statusBar.style.color = '#f85149';
   } finally {
     ctx.setLoading(false);
+    // T42: a scratchpad command ends the conversation's claim on the identity.
+    // Leaving -M ambient would file the next UI write inside this command's
+    // rewind range (turn_id <= -M), which is the same data-loss path the real
+    // turn had.
+    try { await clearTurnIdentity(sqlite3, db); }
+    catch (e) { console.warn('[scratchpad] turn identity reset failed (non-fatal):', e); }
     await ctx.renderMessages();
     // T11: re-run dashboard cards whose data tables changed (committed point).
     try { await ctx.flushArtifacts(); } catch (e) { console.warn('[scratchpad] artifact flush failed (non-fatal):', e); }

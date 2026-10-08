@@ -1151,6 +1151,24 @@ class Host:
         for key in ("suppress_cascade", "suppress_capture"):
             self.conn.execute(
                 "UPDATE session_context SET value='0' WHERE key=?", (key,))
+        # T42: reset the ambient write identity too. A cartridge exported mid-turn
+        # carries a live turn id, and every write this boot makes would then be
+        # filed inside that turn — which the web engine would undo along with it.
+        # The key can be missing on a cartridge exported before provenance existed.
+        self._reset_identity('engine')
+
+    def _reset_identity(self, source='app'):
+        """T42: end the conversation's claim on this connection (web parity:
+        clearTurnIdentity in src/main.js). Writes from here sit at turn_id 0 with
+        no conversation attached — outside every rewind range. Both keys are
+        seeded before they are updated: a foreign or pre-T42 database may not
+        have them, and a bare UPDATE would silently change nothing."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO session_context (key, value) VALUES ('current_turn_id','')")
+        self.conn.execute("UPDATE session_context SET value='' WHERE key='current_turn_id'")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO session_context (key, value) VALUES ('current_source',?)", (source,))
+        self.conn.execute("UPDATE session_context SET value=? WHERE key='current_source'", (source,))
 
     def _load_tools(self):
         rows = self.conn.execute("SELECT schema FROM tools ORDER BY name").fetchall()
@@ -1388,7 +1406,12 @@ class Host:
                 (self.session_id,))
             conn.execute("RELEASE SAVEPOINT turn_sp")
             conn.commit()
-            return self._read_final_answer(before_id)
+            answer = self._read_final_answer(before_id)
+            # T42: the turn stops owning the identity the moment it ends, so a
+            # later console write is not filed inside it.
+            self._reset_identity()
+            conn.commit()
+            return answer
         except Exception as e:
             try:
                 conn.execute("ROLLBACK TO SAVEPOINT turn_sp")
@@ -1408,6 +1431,8 @@ class Host:
                     (self.session_id, "assistant", f"⚠ LLM error: {detail}"))
             finally:
                 conn.execute("UPDATE session_context SET value='0' WHERE key='suppress_cascade'")
+            conn.commit()
+            self._reset_identity()
             conn.commit()
             raise TurnError(detail)
 
@@ -1460,6 +1485,8 @@ class Host:
         finally:
             conn.execute("UPDATE session_context SET value='0' WHERE key='suppress_cascade'")
         conn.commit()
+        self._reset_identity()
+        conn.commit()
         print(f"tables> ⚠ scratchpad error: {err}\n", file=sys.stderr)
 
     def scratchpad(self, raw_text):
@@ -1478,9 +1505,20 @@ class Host:
         try:
             # Suppress the cascade so the user-row insert does NOT fire agent_think.
             conn.execute("UPDATE session_context SET value='1' WHERE key='suppress_cascade'")
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO messages (session_id, role, content, in_context) VALUES (?,?,?,?)",
                 (self.session_id, "user", raw_text, in_context))
+            # T42 (web scratchpad.js parity): claim this command's own identity.
+            # agent_turn_init fired on the row above and stamped +M with
+            # provenance 'agent' — without the override below, console writes
+            # would be journaled as the agent's and rewound by the web engine's
+            # ⟲ on that turn. Negative id + 'scratchpad' is what the web does.
+            conn.execute("INSERT OR IGNORE INTO session_context (key, value) VALUES ('current_turn_id','')")
+            conn.execute("UPDATE session_context SET value=? WHERE key='current_turn_id'",
+                         (str(-int(cur.lastrowid)),))
+            conn.execute(
+                "INSERT OR IGNORE INTO session_context (key, value) VALUES ('current_source','app')")
+            conn.execute("UPDATE session_context SET value='scratchpad' WHERE key='current_source'")
             for stmt in _split_sql_statements(cmd["sql"]):
                 cls = _scratch_classify(stmt)
                 if cls["kind"] == "forbidden":
@@ -1516,6 +1554,8 @@ class Host:
                 conn.execute("ROLLBACK TO SAVEPOINT scratch_sp")
                 conn.execute("RELEASE SAVEPOINT scratch_sp")
                 conn.commit()
+                self._reset_identity()
+                conn.commit()
                 print(f"tables> cancelled — “{cancelled.splitlines()[0][:80]}” was not executed.\n")
                 return False
             envelope = {"scratchpad": True, "sql": cmd["sql"], "bangs": cmd["bangs"],
@@ -1526,6 +1566,8 @@ class Host:
             conn.execute("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id=?",
                          (self.session_id,))
             conn.execute("RELEASE SAVEPOINT scratch_sp")
+            conn.commit()
+            self._reset_identity()
             conn.commit()
         except ScratchpadError as e:
             self._scratch_fail(cmd, raw_text, in_context, str(e))

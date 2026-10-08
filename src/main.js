@@ -12,7 +12,7 @@ import { bootSqliteAgent, beginTurn, requestStop, endTurn, isStopRequested } fro
 import {
   setActiveSession, listSessions,
   sweepCaptureTriggers, repairOrphanedToolCalls, evictChangesets, setSuppressCascade,
-  setSuppressCapture,
+  setSuppressCapture, clearTurnIdentity,
   execParams, queryAll,
   assertProtectedTablesInvariant,
   upsertSystemConfig,
@@ -627,9 +627,13 @@ async function bootAgent() {
 
     // T3: clear any suppression flags left stuck at '1' by a crashed/reloaded
     // tab — a stuck suppress_cascade permanently kills the cascade on reboot.
+    // T42: same for the ambient write identity — a tab reloaded mid-turn leaves
+    // a live turn id behind, and every UI write after that reload would be
+    // filed inside that turn and rewound with it.
     try {
       await setSuppressCascade(agent.sqlite3, agent.db, false);
       await setSuppressCapture(agent.sqlite3, agent.db, false);
+      await clearTurnIdentity(agent.sqlite3, agent.db);
     } catch (e) {
       console.warn('[main] T3 flag reset failed (non-fatal):', e);
     }
@@ -925,6 +929,12 @@ async function sendMessage(text) {
     statusBar.style.color = '#f85149';
   } finally {
     endTurn();
+    // T42: the turn no longer owns the connection's identity. Until the next
+    // user row, writes are the app's ('app', turn_id 0) — outside every rewind
+    // range, so what the human does after this turn cannot be undone by
+    // rewinding this turn.
+    try { await clearTurnIdentity(sqlite3, db); }
+    catch (e) { console.warn('[main] turn identity reset failed (non-fatal):', e); }
     setSendButtonStop(false);
     setLoading(false);
     // Reconcile and finalize state with SQLite database
@@ -1009,6 +1019,9 @@ async function runManualCompaction(instructions) {
     }
   } finally {
     endTurn();
+    // T42: /compact inserts rows too, so it leaves the same identity behind.
+    try { await clearTurnIdentity(sqlite3, db); }
+    catch (e) { console.warn('[main] turn identity reset failed (non-fatal):', e); }
     setSendButtonStop(false);
     setLoading(false);
     await renderMessages();
