@@ -361,6 +361,10 @@
             <ul id="artifact-list" role="listbox" aria-label="Artifacts"></ul>
           </div>
 
+          <!-- Derived, never stored: what stopped being true about these
+               artifacts. Disappears on its own when a rewind fixes the cause. -->
+          <div id="artifact-health" class="artifact-health hidden" role="status"></div>
+
           <div id="artifact-body" class="artifact-body"></div>
 
           <!-- Source stays visible text so an artifact diffs the way a cartridge README does. -->

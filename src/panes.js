@@ -26,7 +26,28 @@ const DEFAULTS = {
 
 const COLLAPSED_WIDTH = 38;
 const MIN = { explorer: 160, canvas: 260 };
-const MAX_FRACTION = { explorer: 0.45, canvas: 0.5 };
+/** Enough chat left to be a chat. The center pane is `flex: 1; min-width: 0`, so
+ *  nothing else stops a dragged pane from swallowing it. */
+const CENTER_MIN = 380;
+const DIVIDERS = 16; // both gutters
+
+/**
+ * How far a pane may be dragged.
+ *
+ * This used to be a fraction of the window — canvas 0.5, explorer 0.45 — which
+ * behaved like an invisible wall: drag the artifact pane and it stopped at half
+ * the screen whether or not the other panes needed that room, on a wide monitor
+ * and a narrow one alike. The real limit is leftover space: what remains once the
+ * other pane is wherever it currently is and the chat keeps its floor. Drag the
+ * explorer away and the artifact pane can suddenly go much wider.
+ */
+function maxFor(key, workstationWidth) {
+  const other = key === 'canvas' ? 'explorer' : 'canvas';
+  const otherWidth = layoutState[`${other}Collapsed`]
+    ? COLLAPSED_WIDTH
+    : layoutState[`${other}Width`];
+  return Math.max(MIN[key], workstationWidth - otherWidth - CENTER_MIN - DIVIDERS);
+}
 
 function loadState() {
   try {
@@ -201,7 +222,7 @@ export function initPaneResizers() {
 
       const onMove = (ev) => {
         const rect = workstation.getBoundingClientRect();
-        const max = rect.width * MAX_FRACTION[key];
+        const max = maxFor(key, rect.width);
         const raw = key === 'explorer'
           ? ev.clientX - rect.left
           : rect.right - ev.clientX;

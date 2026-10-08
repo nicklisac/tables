@@ -20,7 +20,9 @@ import {
   setSuppressCapture,
   setSuppressCascade,
   sweepCaptureTriggers,
+  dropCaptureTriggers,
 } from './schema.js';
+import { classifyDdl } from './reference-integrity.js';
 
 /**
  * Human-readable summary of the changes that would be undone by rewinding to
@@ -74,6 +76,55 @@ async function updateRow(sqlite3, db, tableName, rowid, row) {
     values);
 }
 
+
+
+/**
+ * The statement that would undo this one, or null when nothing safe does.
+ *
+ * Renames used to be reported as not auto-reversible, which left a hole exactly
+ * where artifacts make it visible: an artifact's SQL is a captured write, so a
+ * rewind reverts it, while the `ALTER` it belonged to did not rewind. The result
+ * was an artifact pointing at a table that had never been created under that
+ * name — the data rewound and the schema not. Reversing the rename closes that.
+ *
+ * `ADD COLUMN` inverts to `DROP COLUMN`, which SQLite can refuse (an indexed or
+ * primary-key column); the caller treats a failure as a warning, not a rollback.
+ */
+function invertDdl(ddlSql, fallbackTable) {
+  const intent = classifyDdl(ddlSql);
+  if (!intent) {
+    // CREATE VIEW is the one shape classifyDdl does not name that is still
+    // trivially reversible: the view did not exist before the turn.
+    if (/^CREATE\s+(?:TEMP(?:ORARY)?\s+)?VIEW\b/i.test(ddlSql || '') && fallbackTable) {
+      return { kind: 'drop-view', sql: `DROP VIEW IF EXISTS ${quoteIdent(fallbackTable)}` };
+    }
+    return null;
+  }
+  if (intent.op === 'rename-table') {
+    // `table` is the name the table answers to NOW, which after a rename is the
+    // new one — that is the name whose capture triggers have to step aside. The
+    // logged table name is the old one, and lowering triggers by it would drop
+    // nothing, then rebuild a second set on top of the surviving original pair.
+    return {
+      kind: 'rename-table', back: intent.from, table: intent.to,
+      sql: `ALTER TABLE ${quoteIdent(intent.to)} RENAME TO ${quoteIdent(intent.from)}`,
+    };
+  }
+  if (intent.op === 'rename-column') {
+    return {
+      kind: 'rename-column', back: intent.from, table: intent.table,
+      sql: `ALTER TABLE ${quoteIdent(intent.table)} RENAME COLUMN ${quoteIdent(intent.to)} TO ${quoteIdent(intent.from)}`,
+    };
+  }
+  if (intent.op === 'add-column') {
+    return {
+      kind: 'drop-column', table: intent.table, back: intent.column,
+      sql: `ALTER TABLE ${quoteIdent(intent.table)} DROP COLUMN ${quoteIdent(intent.column)}`,
+    };
+  }
+  return null;
+}
+
 /** Apply the inverse of a single DDL statement (scaffold — DDL is locked from
  *  the agent in T3; exercised by the !!DDL scratchpad (T9) / T13 tools). */
 async function replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson) {
@@ -99,8 +150,30 @@ async function replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson) {
         }
       }
     }
+  } else if (/^ALTER\s+TABLE\b/i.test(ddlSql || '') || /^CREATE\s+(?:TEMP(?:ORARY)?\s+)?VIEW\b/i.test(ddlSql || '')) {
+    const inverse = invertDdl(ddlSql, tableName);
+    if (!inverse) {
+      console.warn('[rewind] Cannot auto-reverse DDL:', ddlSql);
+    } else {
+      // Lower this table's capture triggers so SQLite will accept the change,
+      // then rebuild them from the resulting columns.
+      const swept = await dropCaptureTriggers(sqlite3, db, inverse.table ?? tableName);
+      try {
+        await execParams(sqlite3, db, inverse.sql);
+      } catch (e) {
+        // An inverse that cannot run (a column SQLite refuses to drop, a name
+        // already taken by something the turn did not create) is reported, not
+        // fatal: a rewind that restores most of the state beats one that aborts
+        // halfway and leaves the savepoint rolled back under the user.
+        console.warn(`[rewind] DDL inverse failed (${inverse.kind}):`, inverse.sql, e.message);
+      }
+      if (swept) {
+        try { await sweepCaptureTriggers(sqlite3, db); }
+        catch (e) { console.warn('[rewind] capture-trigger rebuild failed:', e.message); }
+      }
+    }
   } else {
-    // ALTER TABLE and other DDL are not auto-reversible — surface it.
+    // Everything else is not auto-reversible — surface it rather than pretend.
     console.warn('[rewind] Cannot auto-reverse DDL:', ddlSql);
   }
 }
@@ -115,22 +188,24 @@ async function tableExists(sqlite3, db, tableName) {
 /**
  * Apply the inverse of one turn's changes.
  *
- * T9: DDL inverses run FIRST (newest first), DML inverses second — the
- * scratchpad can interleave DML and DDL on the same table in one command
- * (e.g. `!!INSERT INTO t …; DROP TABLE t`). A DROP TABLE pre-image captures
- * the table state AFTER the turn's DML, so replaying DDL first restores the
- * full table and the DML inverse then re-applies cleanly on top of it.
- * (T3 locked DDL from the agent, so real turns have no DDL rows and this
- * order is a no-op for them.)
+ * Both logs are replayed newest-first. Which LOG goes first depends on whether
+ * the turn renamed anything — see the reasoning at the ordering call site below.
+ * No single global order serves both, and the two logs are separate
+ * AUTOINCREMENT sequences, so they cannot be merged back into the turn's real
+ * chronology the way one shared sequence would allow.
  *
  * DML inverses are lenient: if the DDL inverse dropped a table (e.g.
  * `!!CREATE TABLE t; INSERT INTO t …` rewound to "t gone"), the DML op on
  * that missing table is skipped — the DDL pre-image already restored the
  * complete pre-turn state.
  *
- * Known limitation (documented, rare): drop + recreate + write to the SAME
- * table within one command — the DML inverse could hit a rowid that belongs
- * to a restored pre-recreate row.
+ * Known limitations (documented, rare; both are one command touching the same
+ * table two ways):
+ *   - drop + recreate + write: the DML inverse could hit a rowid that belongs to
+ *     a restored pre-recreate row.
+ *   - rename + drop + write: undoing the writes and then restoring the dropped
+ *     table from its pre-image puts those writes back. The ordering below fixes
+ *     rename + write, which is the case people actually hit, and not this one.
  */
 async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
   const ddls = await queryAll(sqlite3, db, `
@@ -140,9 +215,11 @@ async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
     ORDER BY id DESC
   `, [sessionId, turnId]);
 
-  for (const [tableName, ddlSql, preImageJson] of ddls) {
-    await replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson);
-  }
+  const replayDdl = async () => {
+    for (const [tableName, ddlSql, preImageJson] of ddls) {
+      await replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson);
+    }
+  };
 
   const changes = await queryAll(sqlite3, db, `
     SELECT op, table_name, rowid, row_before, row_after
@@ -151,20 +228,50 @@ async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
     ORDER BY id DESC
   `, [sessionId, turnId]);
 
-  for (const [op, tableName, rowid, rowBeforeJson] of changes) {
-    if (!(await tableExists(sqlite3, db, tableName))) continue;
-    if (op === 'I') {
-      await execParams(sqlite3, db,
-        `DELETE FROM ${quoteIdent(tableName)} WHERE rowid = ?`, [rowid]);
-    } else if (op === 'D') {
-      let row = {};
-      try { row = JSON.parse(rowBeforeJson); } catch { /* ignore */ }
-      await reinsertRow(sqlite3, db, tableName, rowid, row);
-    } else if (op === 'U') {
-      let row = {};
-      try { row = JSON.parse(rowBeforeJson); } catch { /* ignore */ }
-      await updateRow(sqlite3, db, tableName, rowid, row);
+  const replayDml = async () => {
+    for (const [op, tableName, rowid, rowBeforeJson] of changes) {
+      if (!(await tableExists(sqlite3, db, tableName))) continue;
+      if (op === 'I') {
+        await execParams(sqlite3, db,
+          `DELETE FROM ${quoteIdent(tableName)} WHERE rowid = ?`, [rowid]);
+      } else if (op === 'D') {
+        let row = {};
+        try { row = JSON.parse(rowBeforeJson); } catch { /* ignore */ }
+        await reinsertRow(sqlite3, db, tableName, rowid, row);
+      } else if (op === 'U') {
+        let row = {};
+        try { row = JSON.parse(rowBeforeJson); } catch { /* ignore */ }
+        await updateRow(sqlite3, db, tableName, rowid, row);
+      }
     }
+  };
+
+  // Which goes first depends on what the DDL did to NAMES, and there is no order
+  // that serves both, because the two logs are separate AUTOINCREMENT sequences
+  // and cannot be merged back into the turn's real chronology.
+  //
+  // DDL first, when nothing was renamed: a `DROP TABLE` pre-image captures the
+  // table as it stood AFTER the turn's writes, so restoring it and then undoing
+  // the writes lands correctly. Undo the writes first and the restore puts them
+  // back.
+  //
+  // DML first, when the turn renamed a table or column: changesets file rows
+  // under the name and columns that existed *after* the rename, so they can only
+  // be reversed while that schema is still up. Renaming back first left them
+  // addressed to a table that no longer existed — skipped by the existence check,
+  // so the turn's rows silently survived the rewind — or, for a column rename,
+  // thrown on `no such column`, which aborted the whole rewind.
+  const renamed = ddls.some(([, ddlSql]) => {
+    const op = classifyDdl(ddlSql)?.op;
+    return op === 'rename-table' || op === 'rename-column';
+  });
+
+  if (renamed) {
+    await replayDml();
+    await replayDdl();
+  } else {
+    await replayDdl();
+    await replayDml();
   }
 }
 

@@ -13,6 +13,7 @@ import {
 } from './explorer.js';
 import { quoteIdent } from './schema.js';
 import { createArtifact, DEFAULT_STYLE } from './artifacts.js';
+import { planDrop, applyDropCascade } from './artifact-integrity.js';
 import { refreshArtifacts, showArtifact } from './artifact-pane.js';
 import { globalSchemaIndex } from './sql-autocomplete.js';
 import { icon, ICONS } from './icons.js';
@@ -382,10 +383,30 @@ function createItemElement(item) {
   details.querySelector('.btn-action-drop')?.addEventListener('click', async (e) => {
     e.stopPropagation();
     if (!agent) return;
-    if (!confirm(`Are you sure you want to drop ${item.type} "${item.name}"?\nThis cannot be undone.`)) return;
+
+    // Read the dependents *before* asking, because the confirm has to name what
+    // it is about to destroy. An artifact is data, so this is not a cosmetic
+    // cleanup the user discovers later — it is a delete of something they wrote.
+    let plan = [];
+    try {
+      plan = await planDrop(agent.sqlite3, agent.db, [item.name]);
+    } catch (err) {
+      console.warn('[explorer] dependent-artifact scan failed:', err);
+    }
+
+    const named = plan.map((p) => `  • ${p.name}`).join('\n');
+    const artifactWarning = plan.length
+      ? `\n\n${plan.length} artifact${plan.length === 1 ? '' : 's'} read${plan.length === 1 ? 's' : ''} it and will be deleted:\n${named}`
+      : '';
+    const message = `Drop ${item.type} "${item.name}"?`
+      + artifactWarning
+      + `\n\nThe rows go with it, and a drop from here keeps no copy of them.`;
+    if (!confirm(message)) return;
 
     try {
-      await dropDatabaseObject(agent.sqlite3, agent.db, { name: item.name, type: item.type });
+      await dropDatabaseObject(agent.sqlite3, agent.db, { name: item.name, type: item.type }, {
+        cascade: () => applyDropCascade(agent.sqlite3, agent.db, plan),
+      });
       await renderExplorer();
       await refreshArtifacts();
     } catch (err) {

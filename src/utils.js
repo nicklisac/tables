@@ -165,6 +165,16 @@ export async function execSqlRaw(sqlite3, db, sql) {
  * @param {Array} [params=[]] - Optional bind parameter array
  * @returns {Promise<Array<Array<*>>>} Array of row arrays
  */
+/**
+ * SHA-256 of a string, hex. Same bytes, same digest as Python's
+ * `hashlib.sha256(body.encode('utf-8'))`, which is how the JS app and the
+ * standalone host agree on a file's identity without sharing any code.
+ */
+export async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 export async function queryAll(sqlite3, db, sql, params = []) {
   const rows = [];
   for await (const stmt of sqlite3.statements(db, sql)) {

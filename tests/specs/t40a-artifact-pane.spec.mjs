@@ -375,4 +375,169 @@ test.describe('T40a — the artifact pane', () => {
 
     await queryAll(page, `DROP TABLE t40a_pin_me`);
   });
+
+  // Two live-test findings, one root cause. `setBusy` toggled a `.disabled` class
+  // that no stylesheet rule anywhere defined, so the pane kept offering clicks
+  // while the agent's cascade held the connection. Each of those reads throws
+  // SQLITE_LOCKED, and every handler awaited it with no catch — the rejection
+  // went nowhere. The symptom the user described was "the picker was wonky and
+  // didn't work sometimes; I had to refresh to get it unstuck."
+
+  test('a read that fails says so instead of leaving the pane silent', async ({ page }) => {
+    await bootPage(page);
+    await seed(page, 'Report me', 'SELECT 1 AS one');
+    await refresh(page);
+
+    const outcome = await page.evaluate(async () => {
+      const a = window.__agent;
+      const orig = a.sqlite3.statements.bind(a.sqlite3);
+      let armed = true;
+      a.sqlite3.statements = (db, sql) => {
+        // Specific to the pane's own list query. The health report reads
+        // `FROM artifacts ORDER BY id` too, and swallowing that one instead proves
+        // nothing — its failure is already handled elsewhere.
+        if (armed && /updated_at.*FROM artifacts/.test(String(sql))) {
+          armed = false;
+          throw new Error('SQLITE_LOCKED: database table is locked');
+        }
+        return orig(db, sql);
+      };
+      try {
+        await a.artifactPane.refreshArtifacts();
+        const box = document.getElementById('artifact-health');
+        return { text: box.textContent, hidden: box.classList.contains('hidden') };
+      } finally {
+        a.sqlite3.statements = orig;
+      }
+    });
+
+    expect(outcome.hidden, 'the status line is shown, not hidden').toBe(false);
+    expect(outcome.text, 'it names what failed rather than showing nothing')
+      .toMatch(/Couldn.t load artifacts.*locked/i);
+  });
+
+  test('the pane stops offering clicks it cannot honour while the agent runs', async ({ page }) => {
+    await bootPage(page);
+    await seed(page, 'Busy check', 'SELECT 1 AS one');
+    await refresh(page);
+
+    await page.click('#btn-artifact-picker');
+    await page.waitForSelector('#artifact-list li');
+
+    const controls = await page.evaluate(() => {
+      window.__agent.artifactPane.setBusy(true);
+      return {
+        pickerDisabled: document.getElementById('btn-artifact-picker').disabled,
+        saveDisabled: document.getElementById('btn-artifact-save').disabled,
+        ariaBusy: document.getElementById('canvas-pane').getAttribute('aria-busy'),
+      };
+    });
+    expect(controls.pickerDisabled, 'the picker is not offered mid-turn').toBe(true);
+    expect(controls.saveDisabled).toBe(true);
+    expect(controls.ariaBusy).toBe('true');
+
+    // A click can land between the turn starting and the busy state applying, so
+    // the guard reports rather than doing nothing. Dispatched directly because the
+    // stylesheet already withholds these from the pointer.
+    const said = await page.evaluate(() => {
+      document.querySelector('#artifact-list li')?.click();
+      return new Promise((resolve) => setTimeout(() => resolve(
+        document.getElementById('artifact-health')?.textContent ?? ''), 400));
+    });
+    expect(said).toMatch(/mid-turn/i);
+
+    await page.evaluate(() => window.__agent.artifactPane.setBusy(false));
+    expect(await page.locator('#btn-artifact-picker').isEnabled()).toBe(true);
+  });
+
+  test('an artifact that paints a plate with its own margins still fits', async ({ page }) => {
+    await bootPage(page);
+    const sql = "SELECT 'North America East' AS region, 'Widget Deluxe Pro' AS product, "
+      + "'2026-Q1' AS quarter, 'a moderately long descriptive remark that has to go somewhere' AS remarks, "
+      + '1 AS a, 2 AS b, 3 AS c, 4 AS d';
+    // The shape an artifact takes when someone builds a card out of the table:
+    // padding and margin on the table itself.
+    await seed(page, 'Plate', sql, 'plain',
+      'table { box-sizing: border-box; width: calc(100% - 24px); min-width: 0;'
+      + ' padding: 16px; margin: 12px; border-radius: 14px; }');
+    // Show THIS one. The pane keeps whatever the previous test selected, and that
+    // artifact opts into scrolling — measuring the wrong slot would fail on
+    // someone else's overflow.
+    const plateId = await queryValue(page, `SELECT id FROM artifacts WHERE name = 'Plate'`);
+    await page.evaluate((id) => window.__agent.artifactPane.showArtifact(id), plateId);
+    await page.waitForTimeout(400);
+
+    const fitted = await page.evaluate(() => {
+      const scroller = document.querySelector('.artifact-slot-body cssv-table');
+      return { over: scroller.scrollWidth - scroller.clientWidth };
+    });
+    // The wrapper sizes to max-content, so the artifact's own margin is ADDED to
+    // the width it was allowed, and capping at the container width overshoots by
+    // exactly that — a stray 24px scrollbar on a plate that set `margin: 12px`.
+    expect(fitted.over, 'the margin is inside the fit, not on top of it').toBe(0);
+
+    // And it stays fitted when the pane changes size.
+    await page.evaluate(() => {
+      document.getElementById('canvas-pane').style.width = '300px';
+    });
+    await page.waitForTimeout(400);
+    const resized = await page.evaluate(() => {
+      const scroller = document.querySelector('.artifact-slot-body cssv-table');
+      return { over: scroller.scrollWidth - scroller.clientWidth, w: scroller.clientWidth };
+    });
+    expect(resized.w).toBeLessThan(420);
+    expect(resized.over, 'a narrower pane re-fits rather than scrolls').toBe(0);
+
+    await page.evaluate(() => {
+      document.getElementById('canvas-pane').style.width = '';
+    });
+  });
+
+  test('a wide artifact fits the pane and wraps; scrolling is something it asks for', async ({ page }) => {
+    await bootPage(page);
+    const wide = "SELECT 'North America East' AS region, 'Widget Deluxe Pro' AS product, "
+      + "'2026-Q1' AS quarter, 'a moderately long descriptive remark that has to go somewhere' AS remarks, "
+      + '1 AS a, 2 AS b, 3 AS c, 4 AS d, 5 AS e, 6 AS f, 7 AS g, 8 AS h';
+
+    await seed(page, 'Fits by default', wide);
+    await refresh(page);
+    const fitted = await page.evaluate(() => {
+      const host = document.querySelector('.artifact-slot-body cssv-table');
+      const table = host.shadowRoot.querySelector('.frame').shadowRoot.querySelector('table');
+      return {
+        hostFits: host.scrollWidth <= host.clientWidth + 1,
+        paneFits: document.getElementById('artifact-body').scrollWidth
+          <= document.getElementById('artifact-body').clientWidth + 1,
+        tableW: table.clientWidth, hostW: host.clientWidth,
+        // Wrapped text is the whole point: the row got taller rather than wider.
+        rowH: table.querySelector('tbody tr').getBoundingClientRect().height,
+      };
+    });
+    // CSSV sizes its wrapper to the table's natural width and no one else may
+    // restyle it, so fitting is done by capping the table itself — which, unlike a
+    // percentage, a max-content-sizing ancestor does respect.
+    expect(fitted.hostFits, 'the artifact does not overflow its own box').toBe(true);
+    expect(fitted.paneFits, 'and nothing hands a sideways scrollbar to the pane').toBe(true);
+    expect(fitted.tableW).toBeLessThanOrEqual(fitted.hostW + 1);
+    expect(fitted.rowH, 'the long cell wrapped instead of pushing width').toBeGreaterThan(60);
+
+    // The other half of the default: an artifact can take the scroll back. House
+    // and artifact CSS are unlayered, so they beat the fit layer without a fight.
+    await queryAll(page, `UPDATE artifacts SET css =
+      'table { max-width: none } td[data-col="remarks"], th[data-col="remarks"] { min-width: 30ch }'
+      WHERE name = 'Fits by default'`);
+    await refresh(page);
+    const opted = await page.evaluate(() => {
+      const host = document.querySelector('.artifact-slot-body cssv-table');
+      return {
+        hostScrolls: host.scrollWidth > host.clientWidth + 1,
+        overflowX: getComputedStyle(host).overflowX,
+        paneFits: document.getElementById('artifact-body').scrollWidth
+          <= document.getElementById('artifact-body').clientWidth + 1,
+      };
+    });
+    expect(opted.hostScrolls, 'it asked for width the pane cannot give').toBe(true);
+    expect(opted.overflowX, 'and scrolls inside its own box').toBe('auto');
+    expect(opted.paneFits, 'still never scrolling the pane itself').toBe(true);
+  });
 });

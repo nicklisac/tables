@@ -355,4 +355,41 @@ test.describe('T40a — artifact data access and reactivity', () => {
 
     expect(out).toEqual({ capped: 4, cappedFlag: true, full: 10, fullFlag: false });
   });
+
+  test('artifacts are unprotected data, and the boot invariant accepts that', async ({ page }) => {
+    await bootPage(page);
+
+    // T22 handed T40 this question explicitly: what does `assertProtectedTablesInvariant`
+    // expect once artifacts are deliberately NOT protected? At boot the call is
+    // wrapped in a catch that logs "non-fatal", so getting it wrong would not break
+    // anything loudly — it would warn into a console nobody reads while every
+    // database drifted without a boundary check. So assert it directly.
+    const out = await page.evaluate(async () => {
+      const { sqlite3, db } = window.__agent;
+      const { assertProtectedTablesInvariant, isProtectedTable } = await import('/src/schema.js');
+      let threw = null;
+      try {
+        await assertProtectedTablesInvariant(sqlite3, db);
+      } catch (e) {
+        threw = e.message;
+      }
+      return {
+        threw,
+        artifactsProtected: isProtectedTable('artifacts'),
+        stylesProtected: isProtectedTable('artifact_styles'),
+      };
+    });
+    const triggers = await queryAll(page, `
+      SELECT tbl_name || ':' || COUNT(*) FROM sqlite_master
+      WHERE type = 'trigger' AND name LIKE 'cap_artifact%' GROUP BY tbl_name`);
+
+    expect(out.threw, 'the invariant holds with artifacts present').toBeNull();
+    // Unprotected is the whole point: they are capture-captured, rewindable,
+    // agent-writable data, not engine scaffolding.
+    expect(out.artifactsProtected).toBe(false);
+    expect(out.stylesProtected).toBe(false);
+    // Three capture triggers each — the invariant's own requirement for a
+    // non-protected table, which is what makes artifacts rewindable at all.
+    expect(triggers.map((r) => r[0]).sort()).toEqual(['artifact_styles:3', 'artifacts:3']);
+  });
 });

@@ -2464,6 +2464,30 @@ footer {
 
 .artifact-picker-caret { color: var(--text-muted); flex-shrink: 0; }
 
+/* The agent's turn holds the connection. Reads issued now throw SQLITE_LOCKED,
+   so the controls stop looking like offers rather than accepting a click that
+   cannot do anything and reporting nothing when it fails. */
+#canvas-pane.busy .artifact-picker-btn,
+#canvas-pane.busy .btn-sm:disabled {
+  opacity: 0.45;
+  cursor: progress;
+}
+
+#canvas-pane.busy .artifact-picker li { pointer-events: none; opacity: 0.5; }
+
+.artifact-health--bad { color: var(--red); }
+
+.artifact-health {
+  margin: 0.45rem 0.6rem 0;
+  padding: 0.3rem 0.5rem;
+  border-left: 2px solid var(--yellow);
+  background: color-mix(in srgb, var(--yellow) 7%, transparent);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
 .artifact-picker {
   position: absolute;
   top: 3.1rem;
@@ -2590,6 +2614,27 @@ footer {
 
 .artifact-slot-meta { margin-left: auto; white-space: nowrap; }
 .artifact-slot-body { min-width: 0; }
+
+/* Where an artifact goes if it asks to be wider than the pane.
+ *
+ * Not the default path: the fit layer in artifact-render.js caps the table to the
+ * container and lets cells wrap, so an artifact normally never overflows. This is
+ * the escape hatch — `table { max-width: none }` or a `min-width` on a column is
+ * an artifact opting into a scrollbar, and the host is the narrowest box that can
+ * own it.
+ *
+ * Before that, the overflow escaped the artifact entirely and the pane body took
+ * the scrollbar: one sideways scroll shared by every artifact, which panned the
+ * artifact's own header and notices out of view and did not improve when the pane
+ * was widened. The vendored component declares no overflow on its host and
+ * forbids anyone else from styling its wrapper, so the host is where the pane can
+ * draw the line. Outer-tree rules outrank `:host` for the host element, so this
+ * works without touching the vendored file.
+ */
+.artifact-slot-body cssv-table {
+  max-width: 100%;
+  overflow-x: auto;
+}
 
 /* A style that no longer exists is reported, not silently unstyled. */
 .artifact-notice {

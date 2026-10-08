@@ -22,6 +22,7 @@ import {
   execParams,
   queryAll,
   queryValue,
+  sha256Hex,
 } from './utils.js';
 
 export {
@@ -44,7 +45,28 @@ export {
 // databases pick up the new prompt on next load — the same self-heal
 // pattern the drop+create triggers use).
 // =====================================================================
-export const SYSTEM_PROMPT_VERSION = 3;
+export const SYSTEM_PROMPT_VERSION = 5;
+
+/**
+ * Every prompt bundle this engine has shipped as stock, by the version that
+ * introduced it.
+ *
+ * D1 refuses to overwrite an identity it cannot prove is the engine's own.
+ * Comparing only against the CURRENT text means a version bump can never reach a
+ * database that already has a prompt: the stored v3 bundle is not the v4 bundle,
+ * so it reads as "the user edited this", gets kept, and gets flagged
+ * `prompt_customized`. Engine improvements would then ship to new installs only
+ * and quietly freeze every existing one — and the flag also changes what a later
+ * cartridge import does, so the cost is not merely a stale prompt.
+ *
+ * A digest per past bundle makes "stock" provable again without keeping old
+ * prompt text around to serve. Add an entry whenever SYSTEM_PROMPT_VERSION goes
+ * up: sha256 over the exact template-literal body.
+ */
+const STOCK_PROMPT_SHA256 = {
+  3: '4bc0e6774fcf5a372348ea9009c35cf1c6efa505f82b7966932481acaac8c708',
+  4: '96992a2681cae985cf96493727c02fa4de41fc3ee47aea7ed8ba3ee648f58592',
+};
 
 export const SYSTEM_PROMPT = `You are Tables. You live inside a SQLite database in the user's browser.
 The tables are your body: your memory is in \`messages\`, your tools are functions you call,
@@ -65,6 +87,28 @@ How you work:
   \`SELECT SUBSTR(content, 1, 5000) FROM documents WHERE id = 123;\` — so a fetched page you only
   previewed can be read in slices without re-fetching it.
 - Writes are reversible — the user can rewind any turn — but you still only write what the task needs.
+
+Artifacts:
+- An artifact is a saved query plus a stylesheet, shown in the user's right pane. It is data in the
+  \`artifacts\` table (name, sql, style, css) and you write it with ordinary INSERT/UPDATE. It rewinds
+  with your turn and travels in cartridges, so treat it as something the user owns, not as scratch.
+- The stylesheet is CSSV, and its contract has three edges that bite:
+  * \`--cssv-key: column_name\` has to be declared once, on the table scope, before \`[data-key=...]\`
+    means anything. Without it your keyed rules match nothing and the artifact renders colourless.
+  * It cannot compare numbers. A threshold rule needs a column you computed in SQL
+    (\`CASE WHEN revenue > 1000 THEN 'high' END\`), styled by name — not a numeric test in CSS.
+  * Number formatting is opt-in. Raw numbers arrive ungrouped unless you ask.
+- Style cells as \`td[data-col="column_name"]\`, and check the names against the query you actually
+  saved: a selector naming a column the answer no longer returns is invisible breakage, and the pane
+  reports it. \`SELECT\` the query before styling it rather than remembering the columns.
+- The pane fits the artifact to whatever width it is given and wraps the cells, and it re-fits when
+  the pane is resized — so do not try to size the table yourself, and \`width: 100%\` is already the
+  behaviour. A margin or padding on the table is absorbed rather than added on top, so a plate built
+  out of the table fits too. To opt OUT and get a scrollbar inside the artifact, set
+  \`table { max-width: none }\` or a \`min-width\` on a column; your CSS outranks the fit rules because
+  they sit in a cascade layer. If it should be readable rather than wide, write a narrower query.
+- \`artifact_styles\` holds the house styles the user wrote. Read them to match the house; rewriting one
+  changes every artifact that uses it, including ones that never mentioned your column.
 
 Voice:
 - Talk like a person, not a helpdesk. No "Great question!", no "Certainly!", no "I hope this helps!",
@@ -117,9 +161,14 @@ export async function migrateSystemPrompt(sqlite3, db) {
   if (stored === String(SYSTEM_PROMPT_VERSION)) return;
 
   const storedPrompt = await queryValue(sqlite3, db, `SELECT value FROM system_config WHERE key = 'system_prompt'`);
+  // Provable stock: absent, the seed placeholder, byte-identical to the bundle in
+  // use, or byte-identical to the bundle the STORED version shipped. That last
+  // term is what lets a version bump reach an existing database at all.
+  const expectedStock = STOCK_PROMPT_SHA256[Number(stored)];
   const looksStock = !storedPrompt
     || storedPrompt.includes('Prompt placeholder')
-    || storedPrompt === SYSTEM_PROMPT;
+    || storedPrompt === SYSTEM_PROMPT
+    || (!!expectedStock && await sha256Hex(storedPrompt) === expectedStock);
   if (!looksStock) {
     // Foreign-version prompt that is not provably stock — flag it customized
     // and keep it (never clobber identity we can't prove is the engine's).
@@ -1480,6 +1529,41 @@ export async function ensureCaptureTriggers(sqlite3, db, tableName) {
  * Attach capture triggers to every user data table (idempotent). Called at
  * boot and after any table creation (CSV ingestion, agent DDL).
  */
+/**
+ * Remove one table's capture triggers, by name. Returns whether they were lowered.
+ *
+ * A capture trigger's NAME embeds its table's name (`cap_users_ins`), and SQLite
+ * does not rename a trigger when its table is renamed — the trigger stays
+ * attached, still firing, still stamping `table_name = 'users'` for a table that
+ * no longer exists. A rename that only sweeps afterwards therefore ends up
+ * double-capturing: fresh triggers stamping the new name, stale ones stamping the
+ * dead one. Measured: one INSERT after a rename wrote two rows to
+ * `turn_changesets`, which makes every later rewind of that table replay against
+ * a name that is not there and silently skip.
+ *
+ * Names follow the project's unquoted `cap_<table>_<event>` convention, so a name
+ * that would not parse as an identifier cannot have capture triggers under it
+ * either — it is reported rather than fed to SQLite as a syntax error.
+ */
+export async function dropCaptureTriggers(sqlite3, db, tableName) {
+  if (!tableName) return false;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName)) {
+    console.warn('[capture] not lowering triggers for non-identifier table name:', tableName);
+    return false;
+  }
+  try {
+    await execParams(sqlite3, db, `
+      DROP TRIGGER IF EXISTS cap_${tableName}_ins;
+      DROP TRIGGER IF EXISTS cap_${tableName}_upd;
+      DROP TRIGGER IF EXISTS cap_${tableName}_del;
+    `);
+    return true;
+  } catch (e) {
+    console.warn('[capture] could not lower capture triggers for', tableName, e.message);
+    return false;
+  }
+}
+
 export async function sweepCaptureTriggers(sqlite3, db) {
   const vParents = await getVirtualTableParents(sqlite3, db);
   const tables = await queryAll(sqlite3, db,

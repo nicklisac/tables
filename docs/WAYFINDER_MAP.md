@@ -1023,10 +1023,24 @@ graph TD
 ### Ticket 40: Artifact Layer — CSSV-Rendered Artifacts Replace the Grid Canvas
 
 * **Label:** `wayfinder:prototype` (HITL)
-* **Status:** 🟡 **IN PROGRESS — split into T40a and T40b (user-approved 2026-10-06).** Branch `t40a-artifact-layer` carries **T40a**; **T40b** takes its own branch when started. Design locked same day (see *Design locked* below); the fog list is resolved.
+* **Status:** 🟡 **IN PROGRESS — T40a complete, T40b built and awaiting live test (2026-10-07).** Branch `t40a-artifact-layer` carries **T40a** (green, pushed, awaiting the user's live pass before merge to `main`); branch `t40b-reference-integrity-write-path` carries **T40b**, branched from T40a because the write path is meaningless without an artifact surface to write to — merging T40a first then rebasing is the intended order.
 * **The split (user decision, 2026-10-06):** the ticket held two different risk profiles, so it was cut along that seam rather than built as one.
   * **T40a — Artifact layer.** Vendor CSSV; `artifacts` + `artifact_styles` with capture triggers; boot migration from `dashboard_cards`; the renderer with sanitise-on-render; the right pane replacing the canvas; `artifactProvider` on the seam; `extractStyledColumns` shipped as a tested pure function with **no wiring**; grid specs retired, artifact specs added. Ends green, with a working artifact viewer and **no DDL-boundary wiring**.
-  * **T40b — Reference-integrity write path.** The stylesheet↔columns check wired to a surface; rename-rewrite / delete-confirm / alter-dry-run on the three DDL boundaries (scratchpad `scratch_sp`, agent `turn_sp`, and the explorer drop, which is autocommit today and needs a savepoint); the save-time refusal; the `auditAll` caller; the CSS rewrite on an unambiguous column rename; the `withNestedScope` deadlock regression test T22 owes.
+  * **T40b — Reference-integrity write path.** The stylesheet↔columns check wired to a surface; rename-rewrite / delete-confirm / alter-dry-run on the three DDL boundaries (scratchpad `scratch_sp`, agent `turn_sp`, and the explorer drop, which is autocommit today and needs a transaction); the save-time refusal; the `auditAll` caller; the CSS rewrite on an unambiguous column rename; the `withNestedScope` deadlock regression test T22 owes.
+
+* **T40b progress (2026-10-07, branch `t40b-reference-integrity-write-path`).** Built and green.
+  * **One gate, three boundaries.** `openArtifactGate()` / `closeArtifactGate()` in `src/artifact-integrity.js` split the work around a DDL statement: *open* reads what can only be read while the old names still resolve, *close* writes, and runs only after the statement has stepped. Wired into the agent's `execute_sql` (`harness.js`), the scratchpad (`scratchpad.js`), and the explorer drop. **Per statement, never per batch** — `ALTER TABLE a RENAME TO b; ALTER TABLE b RENAME TO c` must land artifacts on `c`, and a batch plan computed up front looks for names the first statement already consumed.
+  * **Rename a table** → the provider seam's own `planRename` / `applyRenamePlan` (an earlier draft re-implemented them here; deleted — `DEPENDENT_PROVIDERS` is the one place a kind of saved query registers, and a second planner is a second list to forget).
+  * **Rename a column** → `reconcileColumnRenames` diffs each artifact's output columns before and after via `describeQuery` (prepares, never steps). Exactly one name out and one in ⇒ rewrite the artifact's own CSS with `renameStyledColumn`, byte-for-byte around the edit. Anything else is left alone. A **House Style is never touched**, and the stored text is edited directly — never a CSSOM round-trip.
+  * **Drop** → confirm names the artifacts that will be deleted, then the cascade runs with the DDL in one `BEGIN IMMEDIATE … COMMIT` (transaction rule 2 governs a top-level multi-statement op; the ticket's earlier word "savepoint" described the requirement, not the mechanism). The confirm happens **before** the transaction opens — a write transaction held across a human clicking a dialog is a long-lock hazard.
+  * **Badges are derived, never stored.** `styleFindings` / `styleProblems` recompute dead selectors from the artifact's CSS against its current columns, so a rewind that restores a column clears the badge by itself. The visible artifact's check is free — the pane already has `result.columns` from rendering it; the library-wide report is recomputed only on an explicit refresh, not per render.
+  * **Two findings that changed the design:**
+    1. **The agent cannot `DROP TABLE`** — measured, not assumed. The whole turn is the trigger cascade of one `INSERT`, and SQLite returns `SQLITE_LOCKED_TABLE` for a schema change nested in a suspended write statement. It *can* rename tables, rename columns and drop views. So table drops are exercised on the two paths where they actually execute, and the pre-existing limitation is documented rather than papered over.
+    2. **Rewind reverted artifacts but not the schema.** An artifact's SQL is a captured write, so a rewind undid the rewrite while `ALTER … RENAME` was a no-op-with-warning — leaving an artifact pointing at a table that had never existed under that name. `src/rewind.js` now synthesizes inverses for rename-table, rename-column, add-column and `CREATE VIEW`. Inverting `ADD COLUMN` needs the table's **capture triggers lowered first**: a trigger body says `NEW.qty`, and SQLite refuses to drop a column a trigger depends on (`error in trigger cap_t_ins after drop column: no such column: NEW.qty`). `sweepCaptureTriggers` rebuilds them from the resulting columns.
+  * **Scratchpad confirms now name the artifacts.** The scratchpad is where `DROP TABLE` actually runs for a person, so that is the confirm carrying the weight. Its "rewound-able via ⟲" label is computed from what rewind can truly invert now, rather than claiming ALTER is irreversible.
+  * **T22's owed deadlock test shipped** (`tests/specs/t40b-nested-scope.spec.mjs`): integrity calls issued from inside a live `statements()` generator complete under `withNestedScope`, raced against a timer so a deadlock fails rather than hangs; the second test shows a plain generator does *not* raise nested depth, so the wrapper is what saves it.
+  * **Review found a third thing that changed the design — capture triggers do not follow renames.** Measured: after `ALTER TABLE t RENAME TO u`, six capture triggers sit on `u` — the fresh `cap_u_*` from the sweep plus the original `cap_t_*`, which SQLite moved with the table without renaming. One `INSERT` wrote **two** rows to `turn_changesets`, one stamped `table_name = 't'` for a table that no longer exists. That is not just noise: rewind reverses writes by looking up changesets under the table's name, so from the rename onwards the table's own writes are filed where no rewind can look. Fixed at the DDL boundary (`dropCaptureTriggers` in `schema.js`, called by the gate on rename) rather than in the sweep, which has no way to know the name that just died.
+  * **Rewind ordering is conditional, and it should not be.** `turn_ddl_log` and `turn_changesets` are separate `AUTOINCREMENT` sequences, so a turn's real chronology cannot be reconstructed by merging them — which is why a rename-then-write turn has to replay DML first while a drop-with-pre-image turn has to replay DDL first, and one global order is wrong for one of them. A shared sequence across both logs would settle it properly; that is a schema change, and the residual case (rename + drop + write in one command) is documented rather than fixed. **Not built: a save-time refusal.** The locked sequencing says land the check as a report first and learn whether it cries wolf before promoting it to a refusal. Nothing here refuses a write except the destructive drop confirm.
 * **Question:** What *is* an artifact, and what does the right pane become once artifacts replace the 3×3 card canvas? Covers what an artifact stores, how its appearance is chosen and merged, how the grid era (T11/T12 cards, T18, T22) is retired or absorbed, and how existing Tables databases migrate.
 * **Why now (user framing, 2026-10-06):** "Grid cards were a UI element. Artifacts are closer to whatever would have gone INTO that UI element. It is data. It is what the user put together for themselves — not UI code to configure the macro display of a section of the app."
 
@@ -1114,6 +1128,132 @@ graph TD
 * **Source:** 2026-10-06 design discussion (user) + empirical probes of `@rhpaiva/cssv@0.2.1` (Node core and headless Chromium against the vendored element) + AGY review of the proposal. Glossary terms added to `CONTEXT.md` the same day: **Artifact**, **House Style**, **Style Library**.
 
 ---
+
+## Live-Test Ledger — first real session (2026-10-07)
+
+The user drove the app and let Tables (the in-app agent) critique the harness from
+inside it. Both reports are kept here as written evidence, triaged. Nothing below
+is merged into T40b except what is marked **fixed here**.
+
+### Fixed in T40b
+* **The pane did nothing and said nothing.** "The picker was kind of wonky and
+  didn't work sometimes. I had to refresh F5 to get it unstuck." `setBusy` toggled
+  a `.disabled` class that no stylesheet anywhere defined, so the pane kept
+  offering clicks while the agent's cascade held the connection; each one threw
+  `SQLITE_LOCKED` into a handler with no `catch`. Now: controls really disable,
+  `aria-busy` is set, and every SQLite-touching interaction reports in place.
+* **A wide artifact scrolled the whole pane.** The component sizes columns to
+  content and its `.clip` wrapper is renderer-owned — "the page and the file can't
+  style .clip" (`vendor/cssv/src/cssv-table.js:6-7`) — and it declared no overflow,
+  so the overflow escaped to `#artifact-body`, which took the scrollbar. Sideways
+  scrolling panned the artifact's own header and notices out of view, and widening
+  the pane did not help the artifact that needed it. The host now owns its scroll.
+  **Fit is now the default, and no vendored file was touched.** The user asked for
+  no horizontal scroll by default, wrap instead, with scroll something the agent
+  opts into. The direct route was closed: `.clip` is `width: max-content` by
+  contract, `observedAttributes` is `['src','key','lang']`, and SPEC §7.5 forbids
+  other attributes — which is why an agent's own width edits had no effect (the
+  rule was unreachable, not wrong). The lever that does exist is the table's own
+  `max-width`, and only in absolute units: the wrapper sizes to max-content, so a
+  percentage is circular and reads as none. A `@layer tables-fit` in the artifact's
+  own stylesheet caps the table at `--tables-fit-width`, a custom property set on
+  the host — custom properties inherit across the shadow boundary, so a resize is
+  one property write rather than a re-render that would re-run the query per pixel
+  of a drag. Being a layer, house and artifact CSS override it unopposed: an
+  artifact takes its scrollbar back with `table { max-width: none }` or a column
+  `min-width`. Measured: a 933px table at a 420px pane becomes 420px with the long
+  cell wrapping (row height 32.5px → 208px).
+* **The agent was never told artifacts exist.** T40 shipped agent-writable
+  artifacts and a stylesheet format, and the system prompt did not mention either.
+  See *The agent guessed the format's contract* below.
+
+### The agent guessed the format's contract → **fixed here**
+Tables: *"--cssv-key was never in your system prompt. The direct cause of my first
+artifact rendering colourless: data-key only exists once --cssv-key names the key
+column, and I wrote eight keyed rules without it. Your kind defaults to 'cssv', so
+you ship a format and let me guess its contract."* The prompt now carries the
+edges that bite (`--cssv-key` before `[data-key=…]`, no numeric comparison so
+thresholds need a SQL-computed column, opt-in grouping, selectors must name
+columns the saved query returns, natural column width so a wide artifact scrolls).
+
+Bumping `SYSTEM_PROMPT_VERSION` then exposed a **standing engine bug, larger than
+the prompt text**: D1 refuses to overwrite an identity it cannot prove is the
+engine's own, and `looksStock` compared only against the *current* bundle — so a
+previous bundle always reads as "user edited", gets kept, and gets flagged
+`prompt_customized` (which also changes what a later cartridge import does). A
+version bump could therefore never reach an existing database. Every engine prompt
+improvement since D1 would have shipped to new installs and silently frozen
+everyone else. Fixed with `STOCK_PROMPT_SHA256`: past bundles are digested, so
+"stock" is provable again. Tested both directions.
+
+### Owed tickets
+* **T41 — Tool-surface honesty.** The agent's own top item: *"Tool results are
+  unbounded; `fetch_url` is the only place you capped them. My context is 57K
+  tokens, and 140K characters of it is tool output … Worst moment:
+  `SELECT quote(css) FROM artifacts` — 24 KB of CSS into my context to read what
+  I'd written, because there's no other way to inspect a 9 KB blob. fetch_url gets
+  this exactly right: 8000-char preview, doc_id, and a hint to SUBSTR the rest.
+  That asymmetry — a capped fetch and an uncapped query — is the difference between
+  surviving an hour and drowning in turn two."* Also in scope:
+  * **`REPLACE` no-ops report success.** *"Sixteen `UPDATE artifacts SET css =
+    REPLACE(css, …)` edits, and a needle that misses by one space returns status
+    OK, changes 1 — rows touched, not values changed … Silent and affirmative is
+    the worst failure mode for a harness selling reversibility: the journal records
+    a write that changed nothing."*
+  * **Sibling tool calls cannot see each other's writes.** *"search_documents
+    ('cssv') returned zero three times while I fetched CSSV pages in the same
+    block … I concluded the corpus was empty and re-fetched pages I already had."*
+  * **`validate_artifact`** — the gap the agent named itself: *"I can't see my own
+    output. 9.2 KB of CSS shipped blind; the scrollbar you found was my only visual
+    feedback all session."* The CSSV skill ships a validator for delimiter
+    consistency, mixed-type columns, `[data-col]` names matching no column, and
+    malformed `--cssv-key`/`--cssv-format` — ~40 lines, and `styleProblems()`
+    already does part of it. The agent hand-rolled brace-parity checks with
+    `LENGTH`/`REPLACE` instead: "a funny way to spend four tool calls and a bad
+    one."
+* **T42 — Provenance.** The one Tables insisted is worth a schema change:
+  *"`turn_changesets` has no provenance column … I found rows in my own turn_id
+  that I hadn't issued and concluded the app was writing behind my back. It wasn't
+  — you were poking around."* And the direction that actually bites: *"Your two
+  artifacts are filed under turn_id=110, my turn. Rewind my artifact work and the
+  rollback walks that changeset — so my turn would have deleted your rows … the
+  destructive direction is silent: nothing tells you that rewinding me eats your
+  scratch work."* A `source TEXT` column makes it one query and makes rewind
+  scope-able. **This is a data-loss path, not a nicety**, and T40b's captured
+  artifact writes land directly on it. *"That's a schema change, not a prompt
+  change, which is why it's worth doing."*
+* **T43 — DDL failure honesty.** *"DROP TABLE is a permanent policy refusal in a
+  transient error's costume. Three turns, 14:56 → 15:25, identical database table
+  is locked. Reads retryable, so I retried. Fires after the pre-image snapshot —
+  `turn_ddl_log` holds pre_image for four DROPs that never executed. Defeats
+  `IF EXISTS`, which advertises idempotence. Result: probe_a and zoo_census are
+  residents I created and cannot remove."* Two separate defects: an error that
+  invites retrying a refusal, and a pre-image journaled before the statement is
+  known to have run. Confirmed independently by T40b's own measurement of
+  `SQLITE_LOCKED_TABLE`.
+* **Pane width — fixed here too.** The user also reported a ceiling: *"there is a
+  maximum size of the artifact pane which is 1/2 the browser width, as far as I can
+  tell. I think it should just automatically fit / be dynamic based on the sidebar
+  size."* `MAX_FRACTION` clamped the canvas at 50% and the explorer at 45% of the
+  window — the same wall on any monitor. The limit is now leftover space, so
+  collapsing the explorer genuinely widens the artifact pane, and the chat keeps a
+  380px floor that nothing else was enforcing (the center pane is `flex: 1;
+  min-width: 0`).
+* **Small batch.** `v_turn_boundaries.total_tokens` is repeated per row so `SUM()`
+  returns 11.3M against a real 57K — rename to `context_tokens` ("I fell for it").
+  FTS `rank` differences in the third decimal are ordering noise at 13 docs — needs
+  a tie-break or a note. `materialize` rejected `_probe_materialize` as "reserved /
+  protected" without naming the underscore, so the agent used the tool zero times.
+  `QUOTE(tablename)` is not valid SQLite and is the obvious thing to reach for.
+  Nothing states the browser/CSS floor, so the agent guessed and shipped
+  `sibling-index()` / `attr()` / `light-dark()` blind.
+
+### What the agent said was working
+*"Querying my own schema and memory is the actual idea, and it holds up.
+v_active_context readable meant I could check what I was holding rather than
+assume. Stable document ids meant a fetched page stayed useful instead of
+evaporating. pre_image on the DDL log is the right instinct even where it
+misfires."*
 
 ## The Next Shelf & Fog of War (Group 3: Post-Core Horizons)
 

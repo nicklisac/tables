@@ -125,6 +125,109 @@ export function sanitizeArtifactCss(css) {
  * @param {{ columns: string[], values: Array<Array<unknown>>, css?: string }} input
  * @returns {{ text: string, notices: string[] }}
  */
+/**
+ * The fit layer: an artifact fills the width it is given and wraps, rather than
+ * stretching the pane and handing the scrollbar to something else.
+ *
+ * CSSV sizes its own wrapper to the table's natural width — deliberately, and
+ * neither this file nor an artifact's own stylesheet may restyle that wrapper
+ * (`vendor/cssv/src/cssv-table.js:6-7`, SPEC §7.5 forbids the attributes that
+ * would otherwise control it). What CAN be set from here is the table's maximum
+ * width, and only an absolute one is respected: the wrapper is sizing to
+ * max-content, so a percentage would be circular and treated as none.
+ *
+ * The width travels as a custom property, which inherits across the shadow
+ * boundary. That makes a resize a single property write on the host instead of a
+ * re-render — the alternative would re-run the artifact's query for every pixel
+ * of a divider drag.
+ *
+ * It is a cascade LAYER on purpose. House and artifact CSS are unlayered, so they
+ * override it without a specificity fight: an artifact that wants to scroll takes
+ * it back (`table { max-width: none }`, or `td { min-width: 14ch }`) and gets the
+ * overflow the host already provides. Fit is the default, not a ceiling.
+ */
+export const FIT_LAYER_CSS = `@layer tables-fit {
+  table { max-width: var(--tables-fit-width, none); }
+  th, td { overflow-wrap: anywhere; }
+}`;
+
+/** One observer per rendered slot, dropped with the element it watches. */
+const fitObservers = new WeakMap();
+
+/** Below this, shrinking stops being fitting and starts being a shrug. */
+const FIT_FLOOR_PX = 240;
+const FIT_MAX_TRIES = 3;
+
+/**
+ * Tell this artifact how wide it is allowed to be, and keep telling it.
+ *
+ * `--tables-fit-width` is what the fit layer caps the table with; custom
+ * properties inherit into the component's shadow root, so the table sees it
+ * without anything reaching inside. Watching the host rather than the window is
+ * the point: the pane can be dragged, collapsed, or have another artifact stacked
+ * underneath, and a resize must be one property write — recomputing the fit by
+ * re-rendering would re-run the artifact's query on every pixel of a drag.
+ *
+ * A hidden pane reports 0. Writing that would cap the table at nothing, so it is
+ * skipped and the observer's next pass picks up the real width.
+ */
+function fitToContainer(host, scroller) {
+  const write = (px) => host.style.setProperty('--tables-fit-width', `${px}px`);
+  // The overflow shows up on the component element, because that is the box the
+  // stylesheet made scrollable. Measuring the slot around it would report a
+  // perfect fit — a scroll container hides its own overflow from its parent.
+  const measure = () => scroller.scrollWidth - scroller.clientWidth;
+  let settleTimer = null;
+
+  const apply = () => {
+    const width = host.clientWidth;
+    if (width <= 0) return;
+    write(width);
+
+    // Capping at the container width is right only if the table is the whole
+    // contribution. It is not: the wrapper sizes to max-content, so the
+    // artifact's own margin on the table is ADDED to it. An artifact that paints
+    // a plate with `margin: 12px` therefore overflows by exactly 24px — which is
+    // what a small stray scrollbar at the bottom of a fitted artifact is.
+    //
+    // Measuring the result beats computing it. Reading the artifact's margins from
+    // here would mean reaching through two shadow roots into the component's
+    // internals, and would still miss whatever else an artifact does to its box.
+    // One pass comparing what the box asked for against what it was given closes
+    // the gap for any of it, and if the artifact has a hard floor that refuses to
+    // shrink — a grid column with a 290px minimum, say — the tries run out and it
+    // scrolls, which is what it asked for.
+    let tries = 0;
+    const correct = () => {
+      const over = measure();
+      if (over <= 0 || tries >= FIT_MAX_TRIES) return;
+      const next = width - over;
+      if (next < FIT_FLOOR_PX) { write(width); return; }
+      tries += 1;
+      write(next);
+      requestAnimationFrame(correct);
+    };
+    requestAnimationFrame(correct);
+  };
+
+  // During a divider drag the observer fires every frame, and `scrollWidth`
+  // forces layout. Set the cap immediately — it is cheap and it is the
+  // approximation a drag needs — and settle the margin correction afterwards.
+  const applyDebounced = () => {
+    const width = host.clientWidth;
+    if (width > 0) write(width);
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(apply, 120);
+  };
+
+  apply();
+  if (!fitObservers.has(host) && typeof ResizeObserver === 'function') {
+    const observer = new ResizeObserver(applyDebounced);
+    observer.observe(host);
+    fitObservers.set(host, observer);
+  }
+}
+
 export function buildCssvDocument({ columns, values, css = '' }) {
   const notices = [];
   const cols = Array.isArray(columns) ? columns : [];
@@ -136,6 +239,8 @@ export function buildCssvDocument({ columns, values, css = '' }) {
 
   let styleBlock = String(css ?? '').trim();
   const collision = findFenceCollision(styleBlock);
+  // The fence check runs on what the artifact wrote, before our own layer rides in
+  // front of it — a line that is exactly "---" is the artifact's problem to fix.
   if (collision) {
     notices.push(
       `The stylesheet has a line that is exactly "---" (line ${collision.line}). CSSV finds style ` +
@@ -149,7 +254,10 @@ export function buildCssvDocument({ columns, values, css = '' }) {
   for (const row of rows) lines.push(csvRecord(Array.isArray(row) ? row : [row]));
   const data = lines.join('\n');
 
-  const text = styleBlock ? `---\n${styleBlock}\n---\n${data}` : data;
+  // Always a style section now: the fit layer applies to an artifact with no CSS
+  // of its own just as much as to one with a stylesheet.
+  const styleOut = [FIT_LAYER_CSS, styleBlock].filter(Boolean).join('\n');
+  const text = `---\n${styleOut}\n---\n${data}`;
   return { text, notices };
 }
 
@@ -219,6 +327,10 @@ export async function renderArtifact(host, result, options = {}) {
   const table = document.createElement('cssv-table');
   host.append(table);
   await table.update(built.text);
+  // After the update, not before: the element is empty until CSSV has rendered,
+  // so fitting first measures an empty box, finds nothing to correct, and leaves
+  // the artifact overflowing by whatever its own margins are.
+  fitToContainer(host, table);
 
   if (truncated) {
     const foot = document.createElement('div');

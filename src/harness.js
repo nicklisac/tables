@@ -20,6 +20,7 @@ import { IDBBatchAtomicVFS } from '../vendor/wa-sqlite-jspi/IDBBatchAtomicVFS.js
 import { MemoryVFS } from '../vendor/wa-sqlite-jspi/MemoryVFS.js';
 import { SCHEMA_SQL, SYSTEM_PROMPT, migrateSystemPrompt, migrateTurnTables, migrateMessagesTable, migrateDashboardCardsTable, migrateDocumentsTable, migrateToolsTable, migrateArtifactsTable, seedCartridgeId, queryAll, isInternalTable, isProtectedObject, logDDL, sweepCaptureTriggers, extractTargetTables, extractDdlTableName, captureDropPreImage } from './schema.js';
 import { runCompaction, queryActiveContextJson, resolveContextWindow } from './compaction.js';
+import { openArtifactGate, closeArtifactGate } from './artifact-integrity.js';
 import { getProvider, defaultMaxTokens } from './llm-provider.js';
 import { materializeToolResult } from './materialize.js';
 import { upsertDocument, searchDocuments } from './documents.js';
@@ -993,6 +994,7 @@ export async function bootSqliteAgent(config = {}) {
 
         const rows = [];
         let cols = [];
+        const artifactNotes = [];
         for await (const stmt of sqlite3.statements(db, sql)) {
           // If DDL, log to turn_ddl_log for rewind undo — per statement,
           // BEFORE stepping it, so a DROP TABLE's pre-image is captured while
@@ -1002,6 +1004,7 @@ export async function bootSqliteAgent(config = {}) {
           // [T3 fix: the old code logged the whole string with
           // tableName/preImage null — rewind's inverse replay then ran
           // DROP TABLE IF EXISTS "null" and agent DDL was never undone.]
+          let artifactGate = null;
           if (isDDL) {
             const text = (sqlite3.sql(stmt) || '').trim();
             const w = (text.split(/\s+/)[0] || '').toUpperCase();
@@ -1013,10 +1016,19 @@ export async function bootSqliteAgent(config = {}) {
               }
               await logDDL(sqlite3, db, { turnId, sessionId: sessId, tableName, ddlSql: text, preImage });
             }
+            // T40b: read everything about downstream artifacts that can only be
+            // read while the OLD names still resolve. Applied after the statement
+            // steps, inside the same turn_sp, so a rewrite commits with its DDL
+            // and a DDL that fails leaves artifacts alone.
+            artifactGate = await openArtifactGate(sqlite3, db, text);
           }
           cols = sqlite3.column_names(stmt);
           while (await sqlite3.step(stmt) === SQLITE_ROW) {
             rows.push(sqlite3.row(stmt));
+          }
+          if (artifactGate) {
+            const note = await closeArtifactGate(sqlite3, db, artifactGate);
+            if (note) artifactNotes.push(note);
           }
         }
 
@@ -1035,6 +1047,12 @@ export async function bootSqliteAgent(config = {}) {
             columns: ['status', 'changes'],
             values: [['OK', 1]],
           }];
+        }
+        // Tell the agent what its DDL did to artifacts. An agent that drops a
+        // table and silently voids three artifacts is behaving worse than one
+        // that is told and can offer to rebuild them.
+        if (artifactNotes.length) {
+          result.push({ columns: ['artifact_effects'], values: artifactNotes.map((n) => [n]) });
         }
         agentEventStream.emit('tool_result', {
           tool: 'execute_sql',
