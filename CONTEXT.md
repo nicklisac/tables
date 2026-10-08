@@ -6,7 +6,7 @@ A local-first web SQL agent: the agent lives inside a SQLite database in the use
 
 **Tables**:
 The product and the agent, as a proper noun.
-_Avoid_: brain, assistant, app
+_Avoid_: brain, assistant, app. *Brain* is retired — never in anything a person reads (interface text, chat, cartridges and their READMEs, error messages). It survives in historic documents and older code comments, which are left as written; new prose does not reach for it.
 
 **Tables database**:
 The SQLite database holding all of Tables' state: conversations, user data tables, documents, dashboards, and the agent's identity. Also "Tables' database" when possession reads better.

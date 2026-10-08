@@ -1,9 +1,9 @@
 # Tables Cartridge
 
 This `.sqlite3` file is a **Tables cartridge** — a complete, self-contained
-agent brain exported from the [Tables](https://github.com/nicklisac/tables)
-web app: its data, conversation history, tools, system prompt, and the Python
-host that runs it.
+export from the [Tables](https://github.com/nicklisac/tables) web app: an
+agent's data, conversation history, tools, system prompt, and the Python host
+that runs it.
 
 Project home (source, docs, issues): https://github.com/nicklisac/tables
 

@@ -1,6 +1,10 @@
 /**
  * PROBE — Ticket 12: Dynamic Grid Canvas, Drag-to-Move, Resize & Reflow.
  *
+ * RETIRED (2026-10-06, Ticket 40a): the 3x3 grid it verifies no longer exists —
+ * `src/grid.js` is deleted and chat assets now drop onto the artifact pane. Kept
+ * as the record of how T12 was verified; it will not run as-is.
+ *
  * Verifies:
  *  1. Dynamic row calculation: computeGridRows() with 0 cards, 1 card, multiple cards.
  *  2. Placement validation: bounds, 3-column constraint, positive row indices.

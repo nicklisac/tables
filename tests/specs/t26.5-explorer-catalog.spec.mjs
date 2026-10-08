@@ -16,7 +16,6 @@ const APP_VIEWS = [
   'v_schema_catalog',
   'v_turn_boundaries',
   'v_tool_call_queries',
-  'v_grid_matrix',
   'v_session_summary',
 ];
 

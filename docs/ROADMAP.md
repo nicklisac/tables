@@ -24,7 +24,7 @@
 | **Real-Time Schema & Table Inspector** | Sidebar panel reading `sqlite_master` to display user tables, column types, row counts, and interactive 10-row preview modals. | **4** | **2** |
 | **Dynamic Skills & Rules Table (`agent_skills`)** | Relational skills table dynamically concatenated into the system prompt view when `is_active = 1`. | **4** | **2** |
 | **Durable Semantic Memory (`agent_knowledge`)** | Dedicated table and `remember_fact` tool for persistent user preferences and domain facts that survive chat clearing. | **4** | **2** |
-| **Drag-and-Drop Chat $\rightarrow$ Grid Pinning** | Dragging SQL results from chat onto the 3x3 grid drop-zones, writing `INSERT INTO dashboard_cards`, and rendering live data. | **5** | **2** |
+| **Drag-and-Drop Chat $\rightarrow$ Artifact** | Dragging SQL results from chat onto the artifact pane, which saves the query as an `artifacts` row and renders it. | **5** | **2** |
 
 ---
 
@@ -39,9 +39,9 @@
 | **Step-Level Live Event Streaming** | Using SQLite's native `sqlite3.update_hook()` to render tool queries, actions, and observations live as triggers fire. | **4** | **2** |
 | **Token-by-Token LLM Response Streaming** | Consuming SSE `ReadableStream` chunks in JSPI `ask_llm` and dispatching live typing updates to the DOM while WASM is paused. | **4** | **3** |
 | **Human-in-the-Loop Approval Queue** | Table `tool_approvals` where destructive queries pause until the user clicks an [Approve] button in the UI. | **4** | **2** |
-| **3-Pane Workstation (Explorer / Chat / Grid)** | Full workstation layout: left DB explorer strip, center chat/scratchpad, and right dynamic 3x3 live canvas. | **5** | **2** |
-| **Reactive Dashboard Engine (`dashboard_cards`)** | Storing live SQL, card types (table, chart, KPI, markdown), and cell spans (`row_span`, `col_span`) in SQLite for merged layout rendering. | **5** | **2** |
-| **Self-Rendering Reactive Dashboards** | Allowing the agent to create live interactive charts and graphs by defining `CREATE VIEW` statements. | **4** | **3** |
+| **3-Pane Workstation (Explorer / Chat / Artifacts)** | Full workstation layout: left DB explorer strip, center chat/scratchpad, and right artifact pane. | **5** | **2** |
+| ~~Reactive Dashboard Engine (`dashboard_cards`)~~ | **RETIRED 2026-10-06** — the 3x3 grid and its cell spans are gone; live SQL and appearance now live in `artifacts` (Ticket 40a). | — | — |
+| **Self-Rendering Reactive Artifacts** | The agent defines a `CREATE VIEW`, and an artifact over it re-runs when the base tables change. | **4** | **3** |
 | **Direct Web Fetch Tool (`fetch_url`)** | Async JSPI UDF to fetch public URLs, strip HTML boilerplate, and return readable markdown into `messages`. | **3** | **2** |
 | **"Save Tool Query as View / Export CSV" Action** | Quick action button on SQL tool output bubbles allowing users to save successful queries as permanent database views. | **3** | **1** |
 | **Persona & System Prompt Presets** | Relational `personas` table with a UI selector to switch between "Data Analyst", "Forensic DBA", "Code Reviewer", etc. | **3** | **1** |

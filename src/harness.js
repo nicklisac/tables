@@ -18,7 +18,7 @@ import { SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE, SQLITE_UTF8, SQLITE_INSERT, 
 import { SQLITE_ROW } from './utils.js';
 import { IDBBatchAtomicVFS } from '../vendor/wa-sqlite-jspi/IDBBatchAtomicVFS.js';
 import { MemoryVFS } from '../vendor/wa-sqlite-jspi/MemoryVFS.js';
-import { SCHEMA_SQL, SYSTEM_PROMPT, migrateSystemPrompt, migrateTurnTables, migrateMessagesTable, migrateDashboardCardsTable, migrateDocumentsTable, migrateToolsTable, seedCartridgeId, queryAll, isInternalTable, isProtectedObject, logDDL, sweepCaptureTriggers, extractTargetTables, extractDdlTableName, captureDropPreImage } from './schema.js';
+import { SCHEMA_SQL, SYSTEM_PROMPT, migrateSystemPrompt, migrateTurnTables, migrateMessagesTable, migrateDashboardCardsTable, migrateDocumentsTable, migrateToolsTable, migrateArtifactsTable, seedCartridgeId, queryAll, isInternalTable, isProtectedObject, logDDL, sweepCaptureTriggers, extractTargetTables, extractDdlTableName, captureDropPreImage } from './schema.js';
 import { runCompaction, queryActiveContextJson, resolveContextWindow } from './compaction.js';
 import { getProvider, defaultMaxTokens } from './llm-provider.js';
 import { materializeToolResult } from './materialize.js';
@@ -1520,6 +1520,19 @@ export async function bootSqliteAgent(config = {}) {
     await migrateDashboardCardsTable(sqlite3, db);
   } catch (e) {
     console.warn('[harness] migrateDashboardCardsTable failed (non-fatal):', e.message);
+  }
+
+  // 10d. Migration (T40a): seed the Style Library and convert dashboard_cards
+  // rows into artifacts. MUST run after 10c — it reads from dashboard_cards,
+  // and after SCHEMA_SQL, which creates both sides of the conversion. The
+  // capture triggers sweepCaptureTriggers attaches to the new tables come
+  // later, in main.js boot; that ordering is deliberate, and the migration
+  // suppresses capture anyway so a later release seeding a new style cannot
+  // stamp changesets onto the rewind ring.
+  try {
+    await migrateArtifactsTable(sqlite3, db);
+  } catch (e) {
+    console.warn('[harness] migrateArtifactsTable failed (non-fatal):', e.message);
   }
 
   console.log('[harness] Agent booted (wa-sqlite JSPI). LLM:', endpointUrl || '(none)');

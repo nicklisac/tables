@@ -8,8 +8,12 @@ read-only, in `/tmp`), independent Tech Lead verification of every load-bearing 
 `npm pack` + `grep` against the same tarball, then an adversarial AGY fact-check (Claude
 Sonnet) that re-derived the claims from scratch and tried to break the scan patterns — it
 found four real errors, folded in below. **The map's prior assumption was wrong** — see §3.
-**Status:** Findings final. Not yet vendored: `vendor/cssv/` is still absent from this repo,
-and the T40 rendering probes named in the map are still uncommitted. Vendoring is T40's.
+**Status:** Findings final, with one correction (see the head of §4). **Vendored and
+probed 2026-10-06:** `vendor/cssv/` is pinned (`VENDORED.md` carries version + sha256s),
+the load-bearing claims are re-derived against the vendored copy by
+`docs/prototypes/ticket-40-cssv-probe.mjs`, and the checker this document de-risked
+shipped as `src/artifact-styles.js`, guarded by `tests/probes/t40a-artifact-styles.mjs`
+plus `tests/specs/t40a-artifact-styles.spec.mjs`.
 
 ---
 
@@ -72,6 +76,29 @@ warning. Column-name drift, by contrast, is reported by nobody — `[data-col="r
 matching nothing is silent. That asymmetry is the checker's actual job.
 
 ## 4. How the future linter should scan
+
+> **Correction (2026-10-06, T40a, measured in headless Chromium).** The section
+> below recommends the browser CSS parser partly because it "fails loudly on
+> malformed CSS instead of silently mis-scanning". **That is false.** A
+> constructed stylesheet does not throw on bad CSS — it drops the bad rule, and
+> worse, a malformed rule *eats the rule that follows it*: `td[data-col="bad" {
+> color: red` followed by a valid `td[data-col="good"] { … }` parses to **zero
+> rules**. The parser path alone therefore reports *no dependency* for a
+> stylesheet that has one, which is the exact silent failure this checker exists
+> to prevent. It also does not throw on `@import` (it just drops it). Still use
+> the parser — it handles escapes, comments and case flags correctly — but it
+> cannot be the only reading. `src/artifact-styles.js` runs **both** paths and
+> unions the findings, treating disagreement between them as the detectable
+> signature of CSS that does not parse cleanly. Limit recorded honestly: garbage
+> with nothing after it (`td[data-col="x" { color: red`) is invisible to both
+> readings.
+>
+> Two more findings from the same work, both now covered by
+> `tests/probes/t40a-artifact-styles.mjs`: the text fallback must reject a match
+> that *starts* inside a string literal, or `td { content: "[data-col=ghost]" }`
+> invents a dependency on a column called `ghost`; and a rule walk must recurse
+> into `@layer` / `@media` / `@supports` / `@container`, because our own
+> style-merge design guarantees nested rules.
 
 **Prefer the browser's own CSS parser over regex.** This is a browser app, so the stylesheet
 can be parsed natively:

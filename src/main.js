@@ -24,8 +24,8 @@ import {
 import { rewindToBefore, initRewindUi } from './rewind.js';
 import { initCartridgeUi, enableCartridgeButtons, showStoredImportReport } from './cartridge.js';
 import { initCsvUi } from './csv-ingestion.js';
-import * as gridUi from './grid-ui.js';
-import * as gridEngine from './grid.js';
+import * as queryEngine from './query-engine.js';
+import * as artifactPane from './artifact-pane.js';
 import * as explorerEngine from './explorer.js';
 import * as explorerUi from './explorer-ui.js';
 import * as referenceIntegrity from './reference-integrity.js';
@@ -670,15 +670,14 @@ async function bootAgent() {
     await populateSessionDropdown();
     await renderMessages();
 
-    // T11: 3-pane workstation — render the 3×3 dashboard grid (right pane),
-    // the DB Explorer table list (left pane), and attach the data_change
-    // reactivity stream. Expose the grid engine on the live handle for probes.
+    // T40a: the right pane is the artifact pane. The query engine is on the
+    // live handle too, since artifacts run through it.
     try {
-      window.__agent.grid = gridEngine;
-      window.__agent.gridUi = gridUi;
-      await gridUi.initGridUi(agent);
+      window.__agent.queryEngine = queryEngine;
+      window.__agent.artifactPane = artifactPane;
+      await artifactPane.initArtifactPane(agent);
     } catch (e) {
-      console.warn('[main] T11 grid init failed (non-fatal):', e);
+      console.warn('[main] artifact pane init failed (non-fatal):', e);
     }
 
     // T8: DB Schema Inspector & Explorer
@@ -930,9 +929,9 @@ async function sendMessage(text) {
     setLoading(false);
     // Reconcile and finalize state with SQLite database
     await renderMessages();
-    // T11: re-run dashboard cards whose data tables changed during the turn
-    // (committed point — after RELEASE / ROLLBACK, so rollback is visible).
-    try { await gridUi.flushCards(); } catch (e) { console.warn('[main] card flush failed (non-fatal):', e); }
+    // Re-run artifacts whose data tables moved during the turn (committed
+    // point — after RELEASE / ROLLBACK, so a rollback is visible).
+    try { await artifactPane.flushArtifacts(); } catch (e) { console.warn('[main] artifact flush failed (non-fatal):', e); }
     inputEl.disabled = false;
     sendBtn.disabled = false;
     inputEl.focus();
@@ -1117,7 +1116,7 @@ initScratchpad({
   renderMessages,
   updateReadyStatus,
   scrollChatToBottom,
-  flushCards: () => gridUi.flushCards(),
+  flushArtifacts: () => artifactPane.flushArtifacts(),
 });
 initSessionsUi({
   getAgent: () => agent,

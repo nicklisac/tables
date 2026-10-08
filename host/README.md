@@ -142,9 +142,15 @@ A stubbed tool never breaks the cascade: its error lands as a normal `tool`
 row and the agent sees it and adapts (the same contract the web engine uses
 for failed tools).
 
-**Dashboard cards are inert by design** — the optional `dashboard_html`
-feature is unimplemented in v1. The card rows travel in the cartridge and work
-again when the file is imported back into the web engine.
+**Artifacts travel but do not render here.** An `artifacts` row is a saved
+read-only query plus an appearance, and this host has no renderer for it — the
+rows ride in the cartridge untouched and appear in the web engine's artifact
+pane when the file goes back. The console may read, write and drop them like any
+other user table; they are deliberately not on the protected-object list.
+
+The old `dashboard_cards` table is inert in both directions: no UI writes it
+any more, and it is kept only so cartridges exported before Ticket 40a still
+boot.
 
 ## Error semantics (T3 parity)
 

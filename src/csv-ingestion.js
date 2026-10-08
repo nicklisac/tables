@@ -9,7 +9,7 @@
 import Papa from 'papaparse';
 import { isProtectedTable, ensureCaptureTriggers } from './schema.js';
 import { renderMessages } from './chat-render.js';
-import { flushCards } from './grid-ui.js';
+import { flushArtifacts } from './artifact-pane.js';
 
 /**
  * Escape an identifier (table name or column name) for SQLite using double quotes.
@@ -535,8 +535,8 @@ export function initCsvUi(context) {
       await renderMessages();
     } finally {
       csvCtx.setLoading(false);
-      // T11: re-run dashboard cards whose data tables changed (new/updated table).
-      try { await flushCards(); } catch (e) { console.warn('[main] card flush failed (non-fatal):', e); }
+      // Re-run artifacts whose data tables changed (new/updated table).
+      try { await flushArtifacts(); } catch (e) { console.warn('[csv] artifact flush failed (non-fatal):', e); }
       inputEl.disabled = false;
       sendBtn.disabled = false;
       inputEl.focus();

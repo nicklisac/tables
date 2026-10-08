@@ -310,8 +310,8 @@
 
       <aside id="canvas-pane">
         <!-- Collapsed Vertical Rail (Visible when collapsed) -->
-        <div class="collapsed-rail" id="rail-canvas" title="Expand Dashboard Canvas (Ctrl+J)">
-          <button type="button" class="btn-rail-icon" aria-label="Expand Dashboard Canvas">
+        <div class="collapsed-rail" id="rail-canvas" title="Expand Artifacts (Ctrl+J)">
+          <button type="button" class="btn-rail-icon" aria-label="Expand Artifacts">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <rect x="3" y="3" width="7" height="9" rx="1.5"></rect>
               <rect x="14" y="3" width="7" height="5" rx="1.5"></rect>
@@ -319,25 +319,25 @@
               <rect x="3" y="16" width="7" height="5" rx="1.5"></rect>
             </svg>
           </button>
-          <span class="rail-title">Dashboard</span>
+          <span class="rail-title">Artifacts</span>
         </div>
 
         <div class="pane-full-content">
           <div class="pane-header">
-            <h2>Dashboard</h2>
+            <h2>Artifacts</h2>
             <div class="canvas-actions">
-              <button type="button" id="btn-refresh-all" class="btn-sm btn-subtle" title="Re-run every card">
+              <button type="button" id="btn-artifact-new" class="btn-sm btn-primary-subtle" title="New artifact">
+                <span class="btn-bracket">[</span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="12" y1="5" x2="12" y2="19"></line>
+                  <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg><span>new</span><span class="btn-bracket">]</span>
+              </button>
+              <button type="button" id="btn-artifact-refresh" class="btn-sm btn-subtle" title="Re-run this artifact">
                 <span class="btn-bracket">[</span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
                 </svg><span>refresh</span><span class="btn-bracket">]</span>
               </button>
-              <button type="button" id="btn-add-card" class="btn-sm btn-primary-subtle" title="Add a dashboard card">
-                <span class="btn-bracket">[</span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <line x1="12" y1="5" x2="12" y2="19"></line>
-                  <line x1="5" y1="12" x2="19" y2="12"></line>
-                </svg><span>card</span><span class="btn-bracket">]</span>
-              </button>
-              <button type="button" id="btn-collapse-canvas" class="btn-pane-collapse" title="Collapse Dashboard (Ctrl+J)">
+              <button type="button" id="btn-collapse-canvas" class="btn-pane-collapse" title="Collapse Artifacts (Ctrl+J)">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <rect width="18" height="18" x="3" y="3" rx="2"></rect>
                   <path d="M15 3v18"></path>
@@ -345,70 +345,52 @@
               </button>
             </div>
           </div>
-          <div id="dashboard-grid" class="dashboard-grid" aria-label="3x3 dashboard grid"></div>
+
+          <!-- Artifact picker. One artifact is shown at a time; the pane holds a
+               list internally, so combining them later is a longer list here,
+               not a rewrite. -->
+          <div class="artifact-picker-row">
+            <button type="button" id="btn-artifact-picker" class="artifact-picker-btn" aria-haspopup="listbox" aria-expanded="false">
+              <span class="artifact-picker-label">Choose an artifact</span>
+              <span class="artifact-picker-caret" aria-hidden="true">&#9662;</span>
+            </button>
+          </div>
+
+          <div id="artifact-picker" class="artifact-picker hidden" role="dialog" aria-label="Choose an artifact">
+            <input type="search" id="artifact-search" placeholder="Search by name or SQL" autocomplete="off" aria-label="Search artifacts" />
+            <ul id="artifact-list" role="listbox" aria-label="Artifacts"></ul>
+          </div>
+
+          <div id="artifact-body" class="artifact-body"></div>
+
+          <!-- Source stays visible text so an artifact diffs the way a cartridge README does. -->
+          <details id="artifact-source" class="artifact-source hidden">
+            <summary>Source</summary>
+            <div class="artifact-source-grid">
+              <label for="artifact-name">Name</label>
+              <input type="text" id="artifact-name" maxlength="80" spellcheck="false" />
+
+              <label for="artifact-sql">Query</label>
+              <textarea id="artifact-sql" rows="4" spellcheck="false" placeholder="SELECT ..."></textarea>
+
+              <label for="artifact-style">House style</label>
+              <div class="artifact-style-row">
+                <select id="artifact-style"></select>
+                <div id="artifact-style-missing-note" class="artifact-notice hidden">That style no longer exists; the artifact renders on its own CSS.</div>
+              </div>
+
+              <label for="artifact-css">Own CSS</label>
+              <textarea id="artifact-css" rows="6" spellcheck="false" placeholder="/* layered on top of the house style */"></textarea>
+            </div>
+            <div class="artifact-source-actions">
+              <button type="button" id="btn-artifact-save" class="btn-sm btn-primary-subtle">[save]</button>
+              <button type="button" id="btn-artifact-delete" class="btn-sm btn-subtle">[delete]</button>
+            </div>
+          </details>
         </div>
       </aside>
     </div>
 
-    <!-- Card Add/Edit Dialog -->
-    <div id="card-dialog" class="modal-backdrop hidden">
-      <div class="modal-card">
-        <div class="modal-header">
-          <h3 id="card-dialog-title">New Dashboard Card</h3>
-          <button type="button" class="modal-close-btn" id="card-dialog-close" title="Close dialog">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
-          </button>
-        </div>
-        <form id="card-form">
-          <div class="config-row">
-            <label for="card-title">Title</label>
-            <input type="text" id="card-title" required maxlength="80" placeholder="e.g. Total Active Products" />
-          </div>
-          <div class="config-row">
-            <label for="card-sql">SQL (read-only query)</label>
-            <textarea id="card-sql" rows="4" required placeholder="SELECT COUNT(*) AS total_count FROM sample_data"></textarea>
-            <small class="hint">Cards run live queries — SELECT / WITH / EXPLAIN only, single statement.</small>
-          </div>
-          <div class="config-row hidden" id="card-placement-row">
-            <label>Position (top-left cell)</label>
-            <div class="placement-selects">
-              <select id="card-row" title="Row (0 = top)">
-                <option value="0">row 0</option>
-                <option value="1">row 1</option>
-                <option value="2">row 2</option>
-              </select>
-              <select id="card-col" title="Column (0 = left)">
-                <option value="0">col 0</option>
-                <option value="1">col 1</option>
-                <option value="2">col 2</option>
-              </select>
-            </div>
-          </div>
-          <div class="config-row">
-            <label>Size (merged cell span)</label>
-            <div class="placement-selects">
-              <select id="card-row-span" title="Row span">
-                <option value="1">1 row</option>
-                <option value="2">2 rows</option>
-                <option value="3">3 rows</option>
-              </select>
-              <select id="card-col-span" title="Column span">
-                <option value="1">1 col</option>
-                <option value="2">2 cols</option>
-                <option value="3">3 cols</option>
-              </select>
-            </div>
-          </div>
-          <div id="card-error" class="card-dialog-error hidden"></div>
-          <div class="modal-actions">
-            <button type="button" id="card-cancel" class="btn-secondary">[Cancel]</button>
-            <button type="submit" id="card-submit" class="btn-primary">[Add Card]</button>
-          </div>
-        </form>
-      </div>
     </div>
 
     <!-- Data Preview Modal / Drawer -->
@@ -496,7 +478,7 @@
             <label>Live SQL DDL Preview</label>
             <pre id="table-ddl-preview" class="table-ddl-preview-box"><code>-- Define columns above</code></pre>
           </div>
-          <div id="table-create-error" class="card-dialog-error hidden"></div>
+          <div id="table-create-error" class="dialog-error hidden"></div>
           <div class="modal-actions">
             <button type="button" id="table-create-cancel" class="btn-secondary">[Cancel]</button>
             <button type="submit" id="table-create-submit" class="btn-primary">[Create Table]</button>
@@ -583,7 +565,7 @@
             <textarea id="view-sql-preview" rows="4" required readonly></textarea>
             <small class="hint">Views evaluate live when queried and are saved into the database catalog.</small>
           </div>
-          <div id="view-create-error" class="card-dialog-error hidden"></div>
+          <div id="view-create-error" class="dialog-error hidden"></div>
           <div class="modal-actions">
             <button type="button" id="view-create-cancel" class="btn-secondary">[Cancel]</button>
             <button type="submit" id="view-create-submit" class="btn-primary">[Create View]</button>

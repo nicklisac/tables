@@ -15,7 +15,7 @@ import { getEventStream, settleApproval } from './harness.js';
 import { getProvider } from './llm-provider.js';
 import { globalSchemaIndex } from './sql-autocomplete.js';
 import { renderExplorer, openCreateViewModal } from './explorer-ui.js';
-import { setBusy } from './grid-ui.js';
+import { setBusy } from './artifact-pane.js';
 import { SCRATCH_ROW_CAP } from './scratchpad.js';
 import { ICONS } from './icons.js';
 import { marked } from 'marked';
@@ -170,7 +170,7 @@ function setLoading(on) {
   }
   const newSessionBtn = document.getElementById('btn-new-session');
   if (newSessionBtn) newSessionBtn.disabled = on;
-  // T11: gate the dashboard grid while a turn is in flight — card CRUD issued
+  // T11→T40a: gate the artifact pane while a turn is in flight — a query issued
   // mid-turn would join the turn savepoint and roll back with it on a hard
   // error; data_change re-runs are deferred to the turn-end flush.
   setBusy(on);
@@ -274,7 +274,7 @@ function renderToolContent(content, toolCallId = null, querySql = '') {
     return `
       <div class="draggable-chat-asset" draggable="true" data-asset-type="table" data-tool-call-id="${escapeHtml(toolCallId || '')}" data-sql="${escapeHtml(rawSql)}" data-title="Query Result">
         <div class="chat-asset-actions">
-          <div class="drag-pin-badge" title="Drag to Dashboard to pin as card">
+          <div class="drag-pin-badge" title="Drag to the artifact pane to save this as an artifact">
             <span class="btn-bracket">[</span>
             ${ICONS.gripDots({ size: 11 })}
             <span>drag to dashboard</span>
@@ -300,7 +300,7 @@ function renderToolContent(content, toolCallId = null, querySql = '') {
     return `
       <div class="draggable-chat-asset" draggable="true" data-asset-type="table" data-tool-call-id="${escapeHtml(toolCallId || '')}" data-sql="${escapeHtml(rawSql)}" data-title="Query Result">
         <div class="chat-asset-actions">
-          <div class="drag-pin-badge" title="Drag to Dashboard to pin as card">
+          <div class="drag-pin-badge" title="Drag to the artifact pane to save this as an artifact">
             <span class="btn-bracket">[</span>
             ${ICONS.gripDots({ size: 11 })}
             <span>drag to dashboard</span>
@@ -417,7 +417,7 @@ function renderToolContent(content, toolCallId = null, querySql = '') {
     return `
       <div class="draggable-chat-asset" draggable="true" data-asset-type="table" data-sql="SELECT * FROM &quot;${escapeHtml(parsed.table)}&quot;" data-title="${escapeHtml(parsed.table)}">
         <div class="chat-asset-actions">
-          <div class="drag-pin-badge" title="Drag to Dashboard to pin as card">
+          <div class="drag-pin-badge" title="Drag to the artifact pane to save this as an artifact">
             <span class="btn-bracket">[</span>
             ${ICONS.gripDots({ size: 11 })}
             <span>drag to dashboard</span>
@@ -531,7 +531,7 @@ function renderScratchpadResult(env) {
   const isSelect = /^\s*(SELECT|WITH|EXPLAIN)\b/i.test(env.sql || '');
   let html = `<div class="draggable-chat-asset" draggable="true" data-asset-type="table" data-sql="${escapeHtml(env.sql || '')}" data-title="${escapeHtml(env.sql?.slice(0, 40) || 'Scratchpad Query')}">` +
     `<div class="chat-asset-actions">` +
-    `<div class="drag-pin-badge" title="Drag to Dashboard to pin as card">` +
+    `<div class="drag-pin-badge" title="Drag to the artifact pane to save this as an artifact">` +
     `<span class="btn-bracket">[</span>${ICONS.gripDots({ size: 11 })} <span>drag to dashboard</span><span class="btn-bracket">]</span>` +
     `</div>` +
     (isSelect ? `<button type="button" class="btn-save-view-chat" data-sql="${escapeHtml(env.sql || '')}" title="Save Query as View in database catalog"><span class="btn-bracket">[</span>${ICONS.view({ size: 11 })} <span>save as view</span><span class="btn-bracket">]</span></button>` : '') +
@@ -1194,7 +1194,9 @@ function startEventStreamListener() {
     }
   })();
 
-  // T12: HTML5 drag-and-drop chat assets to dashboard grid
+  // T12 → T40a: dragging a chat asset onto the artifact pane turns it into an
+  // artifact. The payload lost its colSpan/rowSpan with the grid — an artifact
+  // has no position, only a name and a query.
   document.addEventListener('dragstart', (e) => {
     const asset = e.target.closest('.draggable-chat-asset');
     if (!asset) return;
@@ -1203,19 +1205,15 @@ function startEventStreamListener() {
       title: asset.dataset.title || 'Pinned Asset',
       sql: asset.dataset.sql || null,
       toolCallId: asset.dataset.toolCallId || null,
-      colSpan: asset.dataset.assetType === 'table' ? 1 : 2,
-      rowSpan: 1,
     };
     e.dataTransfer.setData('application/json', JSON.stringify(assetData));
     e.dataTransfer.effectAllowed = 'copyMove';
-    document.getElementById('dashboard-grid')?.classList.add('is-dragging');
+    document.getElementById('canvas-pane')?.classList.add('is-dragging');
   });
 
   document.addEventListener('dragend', () => {
-    document.getElementById('dashboard-grid')?.classList.remove('is-dragging');
-    document.querySelectorAll('.grid-cell.drag-target-hover, .grid-cell.drag-target-invalid').forEach(el => {
-      el.classList.remove('drag-target-hover', 'drag-target-invalid');
-    });
+    const pane = document.getElementById('canvas-pane');
+    pane?.classList.remove('is-dragging', 'artifact-drop-target');
   });
 
   // T8: "Save as View" click handler on chat and scratchpad query results

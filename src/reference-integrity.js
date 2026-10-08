@@ -20,7 +20,7 @@
  *      extractor degrades to "the dry-run reports an error", never to silent
  *      corruption. Column names come from the STATEMENT, not the rows, so a
  *      zero-row result still reports what it projects.
- *   3. THE PROVIDER SEAM (`cardProvider`, `DEPENDENT_PROVIDERS`): the hook
+ *   3. THE PROVIDER SEAM (`artifactProvider`, `DEPENDENT_PROVIDERS`): the hook
  *      sites in the DDL paths ask "who references X" and never learn which
  *      table answers. Ticket 40 adds the `artifacts` provider and the hook
  *      sites do not change.
@@ -46,7 +46,7 @@
  */
 
 import { queryAll, execParams, quoteIdent } from './utils.js';
-import { listCards, isReadOnlySql } from './grid.js';
+import { isReadOnlySql } from './query-engine.js';
 
 // ── 1. Pure SQL analysis ──────────────────────────────────────────────
 
@@ -593,7 +593,7 @@ export function renameObjectInSql(sql, fromName, toName) {
  * multi-statement input: it is rejected, not concatenated.
  *
  * Errors are reported, never thrown — a broken saved query is a finding, not
- * an exception in the caller's face. Mirrors `runCardSql`'s contract.
+ * an exception in the caller's face. Mirrors `runQuerySql`'s contract.
  *
  * @param {object} sqlite3
  * @param {number} db
@@ -715,30 +715,39 @@ export async function withNestedScope(agent, fn) {
  */
 
 /**
- * Today's only surface: `dashboard_cards`. Cards are UI state (T11), so
- * rewriting one is not a data write and takes no capture trigger; artifacts
- * (T40) are data, and their provider will differ in that respect — which is
- * the provider's business, not the hook site's.
+ * The surface: `artifacts` (T40a). Two things differ from the retired card
+ * provider, and neither is the hook site's business — that is the point of the
+ * seam. An artifact is *data*, so rewriting one is a captured write and a
+ * rewind can bring the old SQL back; and it is addressed by `name`, which this
+ * adapter presents as `title` so no call site changed when the card era ended.
  */
-export const cardProvider = {
-  id: 'dashboard_cards',
-  noun: 'card',
+export const artifactProvider = {
+  id: 'artifacts',
+  noun: 'artifact',
   async list(sqlite3, db) {
-    const cards = await listCards(sqlite3, db);
-    return cards.map((c) => ({ id: c.id, title: c.title, sql: c.sql }));
+    const rows = await queryAll(sqlite3, db, `SELECT id, name, sql FROM artifacts ORDER BY id`);
+    return rows.map(([id, title, sql]) => ({ id, title, sql }));
   },
   async updateSql(sqlite3, db, id, sql) {
     await execParams(sqlite3, db,
-      `UPDATE dashboard_cards SET sql = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      `UPDATE artifacts SET sql = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [sql, id]);
   },
   async remove(sqlite3, db, id) {
-    await execParams(sqlite3, db, `DELETE FROM dashboard_cards WHERE id = ?`, [id]);
+    await execParams(sqlite3, db, `DELETE FROM artifacts WHERE id = ?`, [id]);
   },
 };
 
-/** Providers the audit and the DDL hooks consult. T40 appends `artifactProvider`. */
-export const DEPENDENT_PROVIDERS = [cardProvider];
+/**
+ * Providers the audit and the DDL hooks consult. `cardProvider` retired with
+ * the grid UI: it wrote `dashboard_cards`, which is inert now.
+ */
+
+/**
+ * Providers the audit and the DDL hooks consult. `cardProvider` retired with the
+ * grid UI: it wrote `dashboard_cards`, which is inert now.
+ */
+export const DEPENDENT_PROVIDERS = [artifactProvider];
 
 /**
  * Every saved query that references any name in `names`.

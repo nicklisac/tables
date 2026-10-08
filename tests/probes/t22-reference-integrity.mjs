@@ -3,7 +3,7 @@
 // Covers the three layers of src/reference-integrity.js against the live
 // build: the pure extractor/rewriter (the traps the ticket names), the
 // dry-run backstop (columns come from the statement, not the rows), and the
-// provider seam over real `dashboard_cards` rows.
+// provider seam over real `artifacts` rows (T40a retired the card provider with the grid).
 //
 // Object rename REWRITES referencing SQL; column rename is DETECTED AND
 // REPORTED (SQLite rewrites dependent view text itself, so there is nothing
@@ -22,7 +22,7 @@ import {
   referencedObjectNames, renameObjectInSql,
   tokenizeSql, classifyQueryError, describeQuery, auditQuery, auditAll,
   findDependents, planRename, applyRenamePlan, planDelete, applyDeletePlan,
-  cardProvider,
+  artifactProvider,
 } from '../../src/reference-integrity.js';
 import { queryAll, execParams, quoteIdent } from '../../src/schema.js';
 
@@ -33,24 +33,23 @@ const Q2 = 't22_quoted_moved';
 
 const step = (ok, detail) => ({ ok, detail });
 
-async function seedCard(sqlite3, db, title, sql) {
+async function seedArtifact(sqlite3, db, name, sql) {
   await execParams(sqlite3, db,
-    `INSERT INTO dashboard_cards (title, sql, row, col, row_span, col_span)
-     VALUES (?, ?, 0, 0, 1, 1)`, [title, sql]);
+    `INSERT INTO artifacts (name, sql, style, css) VALUES (?, ?, 'plain', '')`, [name, sql]);
   const rows = await queryAll(sqlite3, db,
-    `SELECT id FROM dashboard_cards WHERE title = ? ORDER BY id DESC LIMIT 1`, [title]);
+    `SELECT id FROM artifacts WHERE name = ? ORDER BY id DESC LIMIT 1`, [name]);
   return rows[0][0];
 }
 
-async function cardSql(sqlite3, db, id) {
-  const rows = await queryAll(sqlite3, db, `SELECT sql FROM dashboard_cards WHERE id = ?`, [id]);
+async function artifactSql(sqlite3, db, id) {
+  const rows = await queryAll(sqlite3, db, `SELECT sql FROM artifacts WHERE id = ?`, [id]);
   return rows.length ? rows[0][0] : null;
 }
 
 const SCRATCH = [T, T2, 't22 quoted', Q2, 't22_view', 't22_cte_shadow'];
 
 async function cleanup(sqlite3, db) {
-  await queryAll(sqlite3, db, `DELETE FROM dashboard_cards`);
+  await queryAll(sqlite3, db, `DELETE FROM artifacts`);
   const rows = await queryAll(sqlite3, db,
     `SELECT name, type FROM sqlite_master WHERE name IN (${SCRATCH.map(() => '?').join(',')})`,
     SCRATCH);
@@ -203,16 +202,16 @@ export async function runT22Probe(sqlite3, db) {
       gone);
 
     // ── Object rename: rewrite referencing SQL ──────────────────────────
-    const cardId = await seedCard(sqlite3, db, 't22 rename', `SELECT region, amount FROM ${T}`);
+    const artifactId = await seedArtifact(sqlite3, db, 't22 rename', `SELECT region, amount FROM ${T}`);
     const renamePlan = await planRename(sqlite3, db, T, T2);
-    R.steps.planRenameFindsCard = step(
-      renamePlan.length === 1 && renamePlan[0].row.id === cardId && renamePlan[0].changed === 1
+    R.steps.planRenameFindsArtifact = step(
+      renamePlan.length === 1 && renamePlan[0].row.id === artifactId && renamePlan[0].changed === 1
         && renamePlan[0].sql === `SELECT region, amount FROM ${T2}`,
       renamePlan.map((p) => ({ id: p.row.id, sql: p.sql, changed: p.changed })));
 
     await execParams(sqlite3, db, `ALTER TABLE ${T} RENAME TO ${T2}`);
     await applyRenamePlan(sqlite3, db, renamePlan);
-    const afterRename = await cardSql(sqlite3, db, cardId);
+    const afterRename = await artifactSql(sqlite3, db, artifactId);
     const reaudit = await auditQuery(sqlite3, db, afterRename);
     R.steps.renameCommitsRewrittenAndRunnable = step(
       afterRename === `SELECT region, amount FROM ${T2}` && reaudit.ok === true,
@@ -221,29 +220,29 @@ export async function runT22Probe(sqlite3, db) {
     // ── Column rename: detect and warn, rewrite nothing ─────────────────
     // SQLite rewrites dependent VIEW text itself; the saved SELECT simply
     // stops resolving, and the audit must say so instead of corrupting it.
-    const viewId = await seedCard(sqlite3, db, 't22 column', `SELECT region FROM ${T2}`);
-    const before = await cardSql(sqlite3, db, viewId);
+    const viewId = await seedArtifact(sqlite3, db, 't22 column', `SELECT region FROM ${T2}`);
+    const before = await artifactSql(sqlite3, db, viewId);
     await execParams(sqlite3, db, `ALTER TABLE ${T2} RENAME COLUMN region TO territory`);
     const colPlan = await planRename(sqlite3, db, 'region', 'territory');
-    const colAudit = await auditQuery(sqlite3, db, await cardSql(sqlite3, db, viewId));
+    const colAudit = await auditQuery(sqlite3, db, await artifactSql(sqlite3, db, viewId));
     R.steps.columnRenameIsDetectedNotRewritten = step(
-      colPlan.length === 0 && (await cardSql(sqlite3, db, viewId)) === before
+      colPlan.length === 0 && (await artifactSql(sqlite3, db, viewId)) === before
         && colAudit.ok === false && colAudit.errorKind === 'missing-column',
-      { colPlan: colPlan.length, unchanged: (await cardSql(sqlite3, db, viewId)) === before, colAudit });
+      { colPlan: colPlan.length, unchanged: (await artifactSql(sqlite3, db, viewId)) === before, colAudit });
 
     // ── Delete: list the dependents, then cascade ───────────────────────
     const delPlan = await planDelete(sqlite3, db, [T2]);
     R.steps.deletePlanListsDependents = step(
-      delPlan.length === 2 && delPlan.every((d) => d.provider === cardProvider),
+      delPlan.length === 2 && delPlan.every((d) => d.provider === artifactProvider),
       delPlan.map((d) => ({ id: d.row.id, refs: d.references })));
     const removed = await applyDeletePlan(sqlite3, db, delPlan);
-    const remaining = await cardProvider.list(sqlite3, db);
+    const remaining = await artifactProvider.list(sqlite3, db);
     R.steps.deleteCascadeRemovesRows = step(removed === 2 && remaining.length === 0, { removed, remaining: remaining.length });
 
     // ── The read-only report ────────────────────────────────────────────
-    await seedCard(sqlite3, db, 't22 ok', `SELECT territory FROM ${T2}`);
-    await seedCard(sqlite3, db, 't22 missing source', `SELECT * FROM t22_never_existed`);
-    await seedCard(sqlite3, db, 't22 broken sql', `SELECT FROM WHERE`);
+    await seedArtifact(sqlite3, db, 't22 ok', `SELECT territory FROM ${T2}`);
+    await seedArtifact(sqlite3, db, 't22 missing source', `SELECT * FROM t22_never_existed`);
+    await seedArtifact(sqlite3, db, 't22 broken sql', `SELECT FROM WHERE`);
     const report = await auditAll(sqlite3, db);
     R.steps.auditAllTriage = step(
       report.total === 3 && report.broken === 2
@@ -255,11 +254,11 @@ export async function runT22Probe(sqlite3, db) {
     // ── Quoted identifiers, end to end ──────────────────────────────────
     await cleanup(sqlite3, db);
     await execParams(sqlite3, db, `CREATE TABLE ${Q} (region TEXT)`);
-    const qCardId = await seedCard(sqlite3, db, 't22 quoted', `SELECT region FROM ${Q}`);
+    const quotedId = await seedArtifact(sqlite3, db, 't22 quoted', `SELECT region FROM ${Q}`);
     const qPlan = await planRename(sqlite3, db, 't22 quoted', Q2);
     await execParams(sqlite3, db, `ALTER TABLE ${Q} RENAME TO ${Q2}`);
     await applyRenamePlan(sqlite3, db, qPlan);
-    const qSql = await cardSql(sqlite3, db, qCardId);
+    const qSql = await artifactSql(sqlite3, db, quotedId);
     R.steps.quotedIdentifierRename = step(
       qPlan.length === 1 && qSql === `SELECT region FROM ${Q2}` && (await auditQuery(sqlite3, db, qSql)).ok,
       { qSql, planned: qPlan.length });
@@ -267,18 +266,18 @@ export async function runT22Probe(sqlite3, db) {
     // ── A CTE alias shadows a real table of the same name ───────────────
     await cleanup(sqlite3, db);
     await execParams(sqlite3, db, `CREATE TABLE t22_cte_shadow (region TEXT)`);
-    const cteCardId = await seedCard(sqlite3, db, 't22 cte', `WITH t22_cte_shadow AS (SELECT 1 AS region) SELECT * FROM t22_cte_shadow`);
+    const cteId = await seedArtifact(sqlite3, db, 't22 cte', `WITH t22_cte_shadow AS (SELECT 1 AS region) SELECT * FROM t22_cte_shadow`);
     const ctePlan = await planRename(sqlite3, db, 't22_cte_shadow', 't22_cte_shadow_moved');
-    const cteSql = await cardSql(sqlite3, db, cteCardId);
+    const cteSql = await artifactSql(sqlite3, db, cteId);
     R.steps.cteShadowIsNotRewritten = step(
-      ctePlan.length === 0 && (await cardSql(sqlite3, db, cteCardId)) === cteSql,
+      ctePlan.length === 0 && (await artifactSql(sqlite3, db, cteId)) === cteSql,
       { planned: ctePlan.length, cteSql });
 
     // ── A view is a dependency by name (its base tables are T18's business) ─
     await cleanup(sqlite3, db);
     await execParams(sqlite3, db, `CREATE TABLE ${T} (region TEXT, amount REAL)`);
     await execParams(sqlite3, db, `CREATE VIEW t22_view AS SELECT region FROM ${T}`);
-    const viewCardId = await seedCard(sqlite3, db, 't22 on view', `SELECT region FROM t22_view`);
+    const viewCardId = await seedArtifact(sqlite3, db, 't22 on view', `SELECT region FROM t22_view`);
     const vDeps = referencedObjectNames('SELECT region FROM t22_view');
     const vFound = await findDependents(sqlite3, db, ['t22_view']);
     R.steps.viewReferenceIsExtracted = step(
