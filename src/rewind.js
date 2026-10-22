@@ -163,8 +163,16 @@ function invertDdl(ddlSql, fallbackTable) {
   return null;
 }
 
-/** Apply the inverse of a single DDL statement (scaffold — DDL is locked from
- *  the agent in T3; exercised by the !!DDL scratchpad (T9) / T13 tools). */
+/**
+ * Apply the inverse of a single DDL statement (scaffold — DDL is locked from
+ * the agent in T3; exercised by the !!DDL scratchpad (T9) / T13 tools).
+ *
+ * T42: it says whether it actually reversed anything. A journal row is evidence,
+ * and consuming one whose inverse never ran is how a rewind claims to have
+ * restored a schema it left alone.
+ *
+ * @returns {{applied: boolean, table?: string, why?: string}}
+ */
 async function replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson) {
   let preImage = null;
   if (preImageJson) {
@@ -175,45 +183,58 @@ async function replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson) {
   // stores the statement verbatim, so match structurally, not by prefix.
   if (/^CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b/i.test(ddlSql || '')) {
     await execParams(sqlite3, db, `DROP TABLE IF EXISTS ${quoteIdent(tableName)}`);
-  } else if (/^DROP\s+TABLE\b/i.test(ddlSql || '')) {
-    if (preImage && preImage.create_sql) {
-      await execParams(sqlite3, db, preImage.create_sql);
-      if (Array.isArray(preImage.rows) && Array.isArray(preImage.columns) && preImage.rows.length) {
-        const colList = preImage.columns.map(quoteIdent).join(', ');
-        const ph = preImage.columns.map(() => '?').join(', ');
-        for (const row of preImage.rows) {
-          const vals = preImage.columns.map((c) => row[c]);
-          await execParams(sqlite3, db,
-            `INSERT INTO ${quoteIdent(tableName)} (${colList}) VALUES (${ph})`, vals);
-        }
+    return { applied: true };
+  }
+  if (/^DROP\s+TABLE\b/i.test(ddlSql || '')) {
+    if (!(preImage && preImage.create_sql)) {
+      // Nothing was captured to rebuild from — the table stays gone and the
+      // journal stays where an agent (or a person) can see why.
+      console.warn('[rewind] DROP TABLE has no pre-image to restore from:', ddlSql);
+      return { applied: false, table: tableName, why: 'no pre-image to restore from' };
+    }
+    await execParams(sqlite3, db, preImage.create_sql);
+    if (Array.isArray(preImage.rows) && Array.isArray(preImage.columns) && preImage.rows.length) {
+      const colList = preImage.columns.map(quoteIdent).join(', ');
+      const ph = preImage.columns.map(() => '?').join(', ');
+      for (const row of preImage.rows) {
+        const vals = preImage.columns.map((c) => row[c]);
+        await execParams(sqlite3, db,
+          `INSERT INTO ${quoteIdent(tableName)} (${colList}) VALUES (${ph})`, vals);
       }
     }
-  } else if (/^ALTER\s+TABLE\b/i.test(ddlSql || '') || /^CREATE\s+(?:TEMP(?:ORARY)?\s+)?VIEW\b/i.test(ddlSql || '')) {
+    return { applied: true };
+  }
+  if (/^ALTER\s+TABLE\b/i.test(ddlSql || '') || /^CREATE\s+(?:TEMP(?:ORARY)?\s+)?VIEW\b/i.test(ddlSql || '')) {
     const inverse = invertDdl(ddlSql, tableName);
     if (!inverse) {
       console.warn('[rewind] Cannot auto-reverse DDL:', ddlSql);
-    } else {
-      // Lower this table's capture triggers so SQLite will accept the change,
-      // then rebuild them from the resulting columns.
-      const swept = await dropCaptureTriggers(sqlite3, db, inverse.table ?? tableName);
-      try {
-        await execParams(sqlite3, db, inverse.sql);
-      } catch (e) {
-        // An inverse that cannot run (a column SQLite refuses to drop, a name
-        // already taken by something the turn did not create) is reported, not
-        // fatal: a rewind that restores most of the state beats one that aborts
-        // halfway and leaves the savepoint rolled back under the user.
-        console.warn(`[rewind] DDL inverse failed (${inverse.kind}):`, inverse.sql, e.message);
-      }
-      if (swept) {
-        try { await sweepCaptureTriggers(sqlite3, db); }
-        catch (e) { console.warn('[rewind] capture-trigger rebuild failed:', e.message); }
-      }
+      return { applied: false, table: tableName, why: 'nothing safe reverses it' };
     }
-  } else {
-    // Everything else is not auto-reversible — surface it rather than pretend.
-    console.warn('[rewind] Cannot auto-reverse DDL:', ddlSql);
+    // Lower this table's capture triggers so SQLite will accept the change,
+    // then rebuild them from the resulting columns.
+    const swept = await dropCaptureTriggers(sqlite3, db, inverse.table ?? tableName);
+    let applied = true;
+    try {
+      await execParams(sqlite3, db, inverse.sql);
+    } catch (e) {
+      // An inverse that cannot run (a column SQLite refuses to drop, a name
+      // already taken by something the turn did not create) is reported, not
+      // fatal: a rewind that restores most of the state beats one that aborts
+      // halfway and leaves the savepoint rolled back under the user.
+      console.warn(`[rewind] DDL inverse failed (${inverse.kind}):`, inverse.sql, e.message);
+      applied = false;
+    }
+    if (swept) {
+      try { await sweepCaptureTriggers(sqlite3, db); }
+      catch (e) { console.warn('[rewind] capture-trigger rebuild failed:', e.message); }
+    }
+    return applied
+      ? { applied: true }
+      : { applied: false, table: inverse.table ?? tableName, why: 'the reverse statement failed' };
   }
+  // Everything else is not auto-reversible — surface it rather than pretend.
+  console.warn('[rewind] Cannot auto-reverse DDL:', ddlSql);
+  return { applied: false, table: tableName, why: 'nothing safe reverses it' };
 }
 
 /** Does a user table exist? (Lenient DML inverse — see replayTurnInverse.) */
@@ -263,11 +284,15 @@ async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
     ORDER BY id DESC
   `, [sessionId, turnId, ...REPLAY_SOURCES]);
 
-  const ddlIds = ddls.map(([id]) => id);
+  const appliedDdlIds = [];
 
   const replayDdl = async () => {
-    for (const [, tableName, ddlSql, preImageJson] of ddls) {
-      await replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson);
+    for (const [id, tableName, ddlSql, preImageJson] of ddls) {
+      const r = await replayDDLInverse(sqlite3, db, tableName, ddlSql, preImageJson);
+      // T42: a journal row is evidence. Consume it only if the schema actually
+      // moved, so an un-reversed DDL stays in the log and in the report.
+      if (r.applied) appliedDdlIds.push(id);
+      else skipped.push({ table: r.table || tableName || '(unnamed)', why: r.why || 'not reversible' });
     }
   };
 
@@ -280,12 +305,11 @@ async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
 
   const changeIds = [];
   const skipped = [];
-
   const replayDml = async () => {
     for (const [id, op, tableName, rowid, rowBeforeJson] of changes) {
       if (!(await tableExists(sqlite3, db, tableName))) {
         // T42: an inverse with no table to run against. Leave the journal.
-        skipped.push({ table: tableName, op });
+        skipped.push({ table: tableName, why: 'no table to undo against' });
         continue;
       }
       changeIds.push(id);
@@ -339,7 +363,31 @@ async function replayTurnInverse(sqlite3, db, sessionId, turnId) {
     await replayDml();
   }
 
-  return { changeIds, ddlIds, skipped };
+  return { changeIds, ddlIds: appliedDdlIds, skipped };
+}
+
+/**
+ * One clause for the marker row: what this rewind could not undo, and why.
+ * Grouped by reason so a turn that skipped two hundred rows says it once.
+ */
+function describeSkipped(skipped) {
+  if (!skipped.length) return '';
+  const byReason = new Map();
+  for (const s of skipped) {
+    const e = byReason.get(s.why) || new Set();
+    e.add(s.table);
+    byReason.set(s.why, e);
+  }
+  const NAME_CAP = 6;
+  const parts = [...byReason.entries()].map(([why, tables]) => {
+    const list = [...tables];
+    const shown = list.slice(0, NAME_CAP).join(', ')
+      + (list.length > NAME_CAP ? ` +${list.length - NAME_CAP} more` : '');
+    return `${shown} (${why})`;
+  });
+  const n = skipped.length;
+  return ` ${n} change${n === 1 ? '' : 's'} could not be undone — ${parts.join('; ')}.
+    The state is only partly rewound and the journal still holds them.`;
 }
 
 /**
@@ -438,9 +486,7 @@ export async function rewindToBeforeTurn(sqlite3, db, sessionId, beforeTurnId) {
           + (keptWrites
             ? ` ${keptWrites} write${keptWrites === 1 ? '' : 's'} filed under these turns were not mine or the scratchpad's, so I left them alone.`
             : '')
-          + (skipped.length
-            ? ` ${skipped.length} change${skipped.length === 1 ? '' : 's'} had no table to undo against (${[...new Set(skipped.map((s) => s.table))].join(', ')}) — the state is partly rewound and the journal still holds them.`
-            : '')]);
+          + describeSkipped(skipped)]);
     } finally {
       await setSuppressCascade(sqlite3, db, false);
     }
@@ -547,9 +593,7 @@ export async function rewindToBeforeScratchpadTurn(sqlite3, db, sessionId, turnI
           + (keptWrites
             ? ` ${keptWrites} write${keptWrites === 1 ? '' : 's'} filed under these commands were not the scratchpad's, so I left them alone.`
             : '')
-          + (skipped.length
-            ? ` ${skipped.length} change${skipped.length === 1 ? '' : 's'} had no table to undo against (${[...new Set(skipped.map((s) => s.table))].join(', ')}) — the state is partly rewound and the journal still holds them.`
-            : '')]);
+          + describeSkipped(skipped)]);
     } finally {
       await setSuppressCascade(sqlite3, db, false);
     }
