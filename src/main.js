@@ -387,16 +387,31 @@ function archTheme() {
   return (document.documentElement.getAttribute('data-theme') || 'dark');
 }
 
+// Deep link: /#how-it-works opens the explorer on load, so the [?] page is
+// shareable ("send people right there"). The hash tracks the modal both ways:
+// opening sets it, closing clears it, and a back/forward hashchange follows.
+// The standalone /architecture.html (what the iframe loads) is itself a valid
+// link target for anyone who wants the page outside the app shell.
+const ARCH_HASH = '#how-it-works';
+function syncArchHash(open) {
+  try {
+    if (open && location.hash !== ARCH_HASH) history.pushState(null, '', ARCH_HASH);
+    else if (!open && location.hash === ARCH_HASH) history.pushState(null, '', location.pathname + location.search);
+  } catch (e) { /* file:// or a hostile origin: the modal still works */ }
+}
+
 function openArchModal() {
   if (archIframe) archIframe.src = '/architecture.html?theme=' + archTheme();
   if (archModal) archModal.classList.remove('hidden');
   if (btnArchitecture) btnArchitecture.classList.add('is-active');
+  syncArchHash(true);
 }
 
 function closeArchModal() {
   if (archModal) archModal.classList.add('hidden');
   if (btnArchitecture) btnArchitecture.classList.remove('is-active');
   if (archIframe) archIframe.src = '';
+  syncArchHash(false);
 }
 
 if (btnArchitecture) {
@@ -405,6 +420,17 @@ if (btnArchitecture) {
     else openArchModal();
   });
 }
+
+window.addEventListener('hashchange', () => {
+  const isOpen = archModal && !archModal.classList.contains('hidden');
+  if (location.hash === ARCH_HASH && !isOpen) openArchModal();
+  else if (location.hash !== ARCH_HASH && isOpen) closeArchModal();
+});
+if (location.hash === ARCH_HASH) {
+  // Let bootAgent's first render happen, then open over it.
+  addEventListener('load', () => openArchModal(), { once: true });
+}
+
 if (archCloseBtn) archCloseBtn.addEventListener('click', closeArchModal);
 if (archModal) {
   archModal.addEventListener('click', (e) => {

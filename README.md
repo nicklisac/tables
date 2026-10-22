@@ -2,9 +2,9 @@
 
 Tables is a browser-based AI agent harness. It runs on SQLite compiled to WebAssembly with JavaScript Promise Integration (JSPI), executing its core loop through SQLite triggers, views, and asynchronous user-defined functions (UDFs).
 
-Instead of orchestrating the conversation entirely in JavaScript, the conversation history, tool calls, dashboard state, and execution loop live inside the SQLite database itself.
+Instead of orchestrating the conversation entirely in JavaScript, the conversation history, tool calls, artifacts, and execution loop live inside the SQLite database itself.
 
-> 🔍 **Want to see how it works?** Open the interactive architecture explorer — a guided, step-by-step tour of the trigger cascade, every table and view, time travel, and the JSPI stack. In the app, click the **[?]** button in the header.
+> 🔍 **Want to see how it works?** Open the interactive architecture explorer — a guided, step-by-step tour of the trigger cascade, every table and view, time travel, and the JSPI stack. In the app, click the **[?]** button in the header — or share the deep link: **`…/#how-it-works`** (on the live site: <https://tables.nicholaslisac.com/#how-it-works>). The explorer also serves standalone at **`/architecture.html`**.
 
 ---
 
@@ -72,23 +72,26 @@ The workspace has three resizable panes:
   - `!!SELECT ...` / `!!DML`: Executes SQL privately without adding the output to the agent's context (`in_context = 0`).
 - Schema-aware autocomplete for table names, column names, and SQL keywords.
 
-### 3. Reactive Canvas Grid (Right)
-- A 3x3 dashboard grid backed by the `dashboard_cards` table.
-- Each card stores a SQL query, position (`row`, `col`), and dimensions (`row_span`, `col_span`).
-- Drag table results from chat directly onto grid cells to create live cards.
-- Cards re-run their queries when underlying tables update.
+### 3. Artifacts Pane (Right)
+- Shows one **artifact** at a time: a saved read-only SELECT plus an appearance, rendered as a live table from the `artifacts` table.
+- A searchable picker switches between artifacts; a health banner names any artifact broken by a schema change and clears itself when a rewind fixes the cause.
+- Drag a query result from chat onto the pane, or press **Pin** in the explorer, to save it as an artifact.
+- Artifacts re-run their queries when underlying tables change, and they are ordinary data: rewound with the database and exported in cartridges.
 
 ---
 
 ## Features
+
+### Artifacts and the Style Library
+An artifact is one read-only SELECT plus an appearance — a pointer and a look, never the data. Rendering re-queries live, so the numbers exist once, in your tables. Artifacts wear a **House Style** from the **Style Library** (`artifact_styles`), a named menu of styles the agent can read and pick from, plus an optional CSS layer of their own. Unlike the retired grid (`dashboard_cards`, still in the schema as inert UI state), artifacts are user data: captured for rewind, writable by the agent with ordinary SQL, visible in the explorer, and portable in cartridges.
 
 ### Direct Tool-Output Materialization (`materialize`)
 The `materialize` tool converts raw JSON from prior search or fetch tool outputs into permanent SQLite tables using `json_each()`. It infers column types (`INTEGER`, `REAL`, `TEXT`) and creates a structured table without re-transcribing data through the LLM.
 
 ### Rolling State Rewind and Savepoints
 - Turns run within an atomic `SAVEPOINT turn_sp`.
-- Triggers log row-level pre/post images in `turn_changesets` and schema modifications in `turn_ddl_log` (retaining up to 20 turns).
-- Clicking the rewind button (`⟲`) on a message restores data and schema state to that specific turn while keeping conversation history intact.
+- Triggers log row-level pre/post images in `turn_changesets` and schema modifications in `turn_ddl_log` (retaining up to 20 turns). Each journaled write carries a `source` — `agent`, `scratchpad`, `app`, `engine`, `host`, or `unknown` — so *who* made it is recorded beside *when*.
+- Clicking the rewind button (`⟲`) on a message replays the inverse of that conversation's own writes (agent + scratchpad, plus pre-provenance `unknown` rows) and hides the rewound chat rows; the `messages` table itself is never deleted from. Writes made by the interface or the engine are left alone, and the confirm dialog names them before anything happens.
 
 ### Interval Context Compaction
 - Compaction runs when token usage approaches the model context window (or via `/compact`).
@@ -101,14 +104,16 @@ The `materialize` tool converts raw JSON from prior search or fetch tool outputs
 - Automatically handles table name collisions with system tables.
 
 ### Cartridge Export and Import (`.sqlite3`)
-- Export the current database state (data, sessions, messages, and dashboard cards) as a binary `.sqlite3` file using `sqlite3.serialize()`.
-- Import existing cartridges to resume work or export `.sql` text dumps.
+- Export the current database state (data, sessions, messages, artifacts, and the standalone Python host) as a binary `.sqlite3` file using `sqlite3.serialize()`.
+- Import existing cartridges to resume work or export `.sql` text dumps. The exported file carries its own host — see `host/README.md` for running a cartridge on any laptop with Python 3.
 
 ### Protected Tables and Views
 System objects are protected from DDL and DML (except `system_config`, which the app itself updates) to prevent accidental corruption, while standard queries remain allowed.
 
-- **Internal tables**: `system_config`, `tools`, `messages`, `sessions`, `session_context`, `turn_changesets`, `turn_ddl_log`, `compactions`, `tool_approvals`, `dashboard_cards`, `documents`, `documents_fts`
-- **System views**: `v_active_context`, `v_schema_catalog`, `v_turn_boundaries`, `v_tool_call_queries`, `v_grid_matrix`, `v_session_summary`
+- **Internal tables**: `system_config`, `system_files`, `llm_profiles`, `tools`, `messages`, `sessions`, `session_context`, `turn_changesets`, `turn_ddl_log`, `compactions`, `tool_approvals`, `dashboard_cards` (retired grid era, inert), `documents`, `documents_fts`
+- **System views**: `v_active_context`, `v_schema_catalog`, `v_turn_boundaries`, `v_tool_call_queries`, `v_session_summary`
+
+Artifacts (`artifacts`, `artifact_styles`) are deliberately **not** protected — they are user data, so the agent can write them with ordinary SQL and a rewind reverts them.
 
 The boundary check (`isProtectedObject` in `src/schema.js`) applies to both the agent's `execute_sql` tool and the direct SQL console, so neither path can drop or modify objects the app owns.
 
@@ -153,12 +158,11 @@ Playwright guardrails harness: persistence (the IDB-dump no-op-commit discrimina
 
 ## LLM Configuration
 
-Open the **Settings** modal in the top-right corner to configure provider settings:
+Open the **Settings** modal in the top-right corner to configure provider settings. Saved provider profiles are the single source of truth; there is no default model — if no model is configured, the app warns at boot rather than silently picking one.
 
-- **Google Gemini**: Set your Gemini API key (default model: `gemini-2.5-flash`).
-- **OpenAI**: Set your OpenAI API key and model name.
-- **Local Endpoints (Ollama / LM Studio)**: Point the base URL to your local server (for example, `http://localhost:11434/v1` for Ollama).
-- **OpenRouter**: Set your OpenRouter API key and model string.
+- **Google Gemini**: Set your Gemini API key and model name (for example, `gemini-2.5-flash`).
+- **OpenAI / Anthropic**: Set your API key and model name.
+- **OpenAI-compatible endpoints (Ollama / LM Studio / Groq / Mistral / OpenRouter)**: Point the base URL at your server (for example, `http://localhost:11434/v1` for Ollama); base URLs are auto-healed to `/v1/chat/completions`.
 
 ---
 
@@ -170,8 +174,9 @@ Open the **Settings** modal in the top-right corner to configure provider settin
 | `!!SQL` | Execute private SQL directly without adding to agent context. |
 | `/compact` | Trigger manual context compaction. |
 | `/compact [notes]` | Trigger context compaction with custom summary guidance. |
-| **Double-click divider** | Reset pane widths to defaults (250px left, 440px right). |
-| `⟲` icon | Rewind database state to that turn. |
+| **Double-click divider** | Reset that pane to its default width and open it if collapsed. |
+| `Ctrl/Cmd+B` / `Ctrl/Cmd+J` | Collapse or expand the explorer / artifacts pane. |
+| `⟲` icon | Rewind the conversation's writes to that turn. |
 | **Stop button** | Abort current generation or tool execution. |
 
 ---
@@ -194,16 +199,32 @@ tables/
 │   ├── sessions-ui.js        # Session list: create, rename, delete, switch
 │   ├── explorer.js           # Database catalog introspection
 │   ├── explorer-ui.js        # Schema explorer UI and preview modals
-│   ├── grid.js               # Dashboard grid logic and cell spanning
-│   ├── grid-ui.js            # Grid rendering and drag-drop handlers
+│   ├── query-engine.js       # Read-only query execution and dependency resolution
+│   ├── artifacts.js          # Artifact data access (create / update / delete / run)
+│   ├── artifact-pane.js      # Right-pane artifact picker, health banner, editor
+│   ├── artifact-render.js    # CSSV document builder and sanitizer
+│   ├── artifact-styles.js    # House Style seeds and stylesheet assembly
+│   ├── artifact-integrity.js # Artifact-aware rename/delete cascade
+│   ├── reference-integrity.js# Reference-integrity analysis and dry-run
+│   ├── chat-render.js        # Chat pane rendering, tool chips, drag assets
+│   ├── llm-provider.js       # Provider registry and LLM request framing
+│   ├── provider-store.js     # Saved provider profiles (localStorage)
+│   ├── search-store.js       # Web search API key (localStorage)
 │   ├── sql-autocomplete.js   # SQL autocomplete and editor popover
-│   ├── panes.js              # Resizable pane dividers
+│   ├── panes.js              # Resizable panes, collapse shortcuts
 │   ├── icons.js              # Zero-dependency SVG icon set
 │   ├── utils.js              # Shared string, SQL, and SQLite execution helpers
 │   ├── main.js               # Application startup and event handling
 │   └── styles.css            # Styles
 ├── vendor/
-│   └── wa-sqlite-jspi/       # JSPI-enabled SQLite WASM build (see its README for the local patch)
+│   ├── wa-sqlite-jspi/       # JSPI-enabled SQLite WASM build (see its README for the local patch)
+│   └── cssv/                 # Vendored CSSV table renderer (see SPEC.md / VENDORED.md)
+├── api/
+│   └── ...                   # Same-origin fetch/search proxy endpoints (hosted deploy)
+├── host/
+│   ├── tables.py             # Standalone stdlib-only Python cartridge host
+│   ├── cartridge-readme.md   # README stamped into every exported cartridge
+│   └── README.md             # Host usage docs
 ├── tests/
 │   ├── specs/                # Playwright guardrails suites (npm test)
 │   ├── probes/               # Headless probe scripts
